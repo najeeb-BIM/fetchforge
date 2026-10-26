@@ -15,8 +15,15 @@ cargo --version; node --version; npm --version
 cargo build --release -p fetchforge-engine -p fetchforge-bridge
 cargo test
 # Tauri app (needs WebView2; see docs/BUILD.md if this step fails).
+# P07 (final round): --no-bundle skips Tauri's own bundling step even
+# though tauri.conf.json has bundle.active=true. Tauri's own NSIS bundle
+# would NOT contain the bridge binary, and a bundle failure would fail
+# this script before the custom NSIS installer (the real deliverable,
+# which does include the bridge) is produced. Only the custom installer
+# and the portable zip are uploaded by the workflow; Tauri's bundle is
+# never used. NOT VERIFIED until a Windows build runs.
 Push-Location apps/desktop/src-tauri
-cargo tauri build
+cargo tauri build --no-bundle
 if ($LASTEXITCODE -ne 0) { throw "Tauri build failed" }
 Pop-Location
 # Stage installer inputs (staged copies only; source manifests are never overwritten).

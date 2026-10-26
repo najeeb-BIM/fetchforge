@@ -260,6 +260,9 @@ fn main() {
     let dir = data_dir();
     let _ = std::fs::create_dir_all(&dir);
     let mut store = Store::load(dir.join("downloads.json"));
+    if let Some(w) = &store.load_warning {
+        eprintln!("FetchForge WARNING: {w}");
+    }
     store.recover_interrupted();
     let _ = store.save();
     let state = Arc::new(State {

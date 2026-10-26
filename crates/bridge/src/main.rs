@@ -129,6 +129,9 @@ impl App {
         let settings = load_settings(&data_dir);
         let token = load_or_create_token(&data_dir);
         let mut store = Store::load(data_dir.join("downloads.json"));
+        if let Some(w) = &store.load_warning {
+            eprintln!("FetchForge WARNING: {w}");
+        }
         store.recover_interrupted();
         let _ = store.save();
         Arc::new(Self {

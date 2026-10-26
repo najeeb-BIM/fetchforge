@@ -18,6 +18,57 @@ pub struct Probe {
     pub accept_ranges: bool,
     pub filename: Option<String>,
     pub content_type: Option<String>,
+    /// F06: ETag / Last-Modified from the probe, for resume checks.
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+/// F06: metadata saved next to the .part file so a later resume can
+/// tell whether the server file changed since the download started.
+/// The sidecar is deleted on success; a stale sidecar is overwritten
+/// on a fresh start, so it can never resurrect an old ETag.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ResumeMeta {
+    url: String,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    total: Option<u64>,
+}
+
+fn sidecar_path(part_path: &Path) -> PathBuf {
+    part_path.with_file_name(format!(
+        "{}.meta",
+        part_path.file_name().unwrap_or_default().to_string_lossy()
+    ))
+}
+
+fn write_sidecar(part_path: &Path, probe: &Probe) {
+    let meta = ResumeMeta {
+        url: probe.final_url.clone(),
+        etag: probe.etag.clone(),
+        last_modified: probe.last_modified.clone(),
+        total: probe.content_length,
+    };
+    if let Ok(s) = serde_json::to_string(&meta) {
+        let _ = std::fs::write(sidecar_path(part_path), s);
+    }
+}
+
+fn resume_meta_changed(old: &ResumeMeta, probe: &Probe) -> bool {
+    // Only treat a change as a mismatch when BOTH old and new values
+    // are present and differ. Servers that do not send ETag or
+    // Last-Modified consistently fall back to size-only resume, as before.
+    if let (Some(o), Some(n)) = (&old.etag, &probe.etag) {
+        if o != n {
+            return true;
+        }
+    }
+    if let (Some(o), Some(n)) = (&old.last_modified, &probe.last_modified) {
+        if o != n {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -137,12 +188,24 @@ fn probe_from_response(resp: reqwest::blocking::Response) -> Probe {
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let last_modified = resp
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     Probe {
         final_url,
         content_length: length,
         accept_ranges: ranges,
         filename,
         content_type,
+        etag,
+        last_modified,
     }
 }
 
@@ -260,7 +323,29 @@ pub fn download(
     };
 
     let total = probe.content_length;
-    let existing = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+    let mut existing = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+    // F06: if the server file changed since the .part was written,
+    // never resume into a mixed file. Restart from 0 with a clear log
+    // message (the bridge log is where the user sees it; progress
+    // resetting to 0 is the visible UI signal).
+    if existing > 0 {
+        let sidecar = sidecar_path(&part_path);
+        if let Ok(s) = std::fs::read_to_string(&sidecar) {
+            if let Ok(old) = serde_json::from_str::<ResumeMeta>(&s) {
+                if resume_meta_changed(&old, &probe) {
+                    eprintln!("FetchForge: file changed on the server (ETag/Last-Modified no longer match). Restarting this download from the beginning instead of resuming, so the finished file will not mix old and new data.");
+                    let _ = std::fs::remove_file(&part_path);
+                    let _ = std::fs::remove_file(&sidecar);
+                    existing = 0;
+                }
+            }
+        }
+        if existing > 0 {
+            write_sidecar(&part_path, &probe);
+        }
+    } else {
+        write_sidecar(&part_path, &probe);
+    }
     let resumable = probe.accept_ranges && total.is_some_and(|t| existing > 0 && existing < t);
 
     // Segmented path: only for a FRESH download, when the server really
@@ -276,7 +361,7 @@ pub fn download(
         && existing == 0;
     if use_segments {
         let total = total.unwrap();
-        return download_segmented(
+        let r = download_segmented(
             opts,
             &probe,
             &final_path,
@@ -286,14 +371,20 @@ pub fn download(
             paused,
             cancelled,
         );
+        if r.is_ok() {
+            let _ = std::fs::remove_file(sidecar_path(&part_path));
+        }
+        return r;
     }
 
     if existing > 0 && !resumable {
         // Stale partial from a non-resumable server: restart honestly.
         let _ = std::fs::remove_file(&part_path);
+        let _ = std::fs::remove_file(sidecar_path(&part_path));
+        write_sidecar(&part_path, &probe);
     }
     let start_from = if resumable { existing } else { 0 };
-    download_single(
+    let r = download_single(
         opts,
         &probe,
         &final_path,
@@ -302,7 +393,11 @@ pub fn download(
         progress,
         paused,
         cancelled,
-    )
+    );
+    if r.is_ok() {
+        let _ = std::fs::remove_file(sidecar_path(&part_path));
+    }
+    r
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -357,6 +452,13 @@ fn download_single_attempt(
     let mut req = c.get(&probe.final_url);
     if downloaded > 0 {
         req = req.header(RANGE, format!("bytes={downloaded}-"));
+        // F06: If-Range lets the server itself refuse a resume when
+        // the file changed (it returns 200 full, not 206 partial).
+        if let Some(etag) = &probe.etag {
+            req = req.header("If-Range", etag.clone());
+        } else if let Some(lm) = &probe.last_modified {
+            req = req.header("If-Range", lm.clone());
+        }
     }
     if let Some(r) = &opts.referer {
         req = req.header("Referer", r.clone());
@@ -369,7 +471,10 @@ fn download_single_attempt(
         return Err(StopOrError::Error(http_error(status)));
     }
     if downloaded > 0 && status != 206 {
-        // Server ignored Range: restart from zero rather than corrupting.
+        // Server ignored Range or rejected If-Range: the file changed
+        // or ranges are not honoured. Restart from zero rather than
+        // corrupting, with a clear message in the log.
+        eprintln!("FetchForge: server did not honour the resume (HTTP {status}); restarting this download from the beginning instead of resuming.");
         let _ = std::fs::remove_file(part_path);
         return download_single_attempt(
             opts, probe, final_path, part_path, 0, progress, paused, cancelled,

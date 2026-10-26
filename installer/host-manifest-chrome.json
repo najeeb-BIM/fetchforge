@@ -1,0 +1,1 @@
+{"allowed_origins":["chrome-extension://__EXTENSION_ID__/"],"description":"FetchForge native messaging host","name":"com.fetchforge.bridge","path":"__BRIDGE_EXE_PATH__","type":"stdio"}

@@ -1,0 +1,28 @@
+name: Windows build
+# Reproducible Windows build: runs on a Windows runner because a Windows
+# x64 binary, WebView2/Tauri bundle and NSIS installer cannot be produced
+# or verified on Linux. Linux CI (if added) should run cargo test only.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Install NSIS
+        run: choco install nsis -y
+      - name: Build
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
+      - name: Upload installer + portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: fetchforge-windows-x64
+          path: |
+            installer/FetchForge-Setup-0.1.0-x64.exe
+            dist/FetchForge-portable-x64.zip

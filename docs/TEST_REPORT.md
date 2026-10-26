@@ -254,3 +254,65 @@ install the extension, right-click a link, confirm it lands in the
 dashboard, pause/resume it, uninstall, and confirm the data-choice
 prompt. Record those results in this file before calling the Windows
 build "tested".
+
+## Verification round 5: audit fixes (approved 2026-10-26, in user order)
+
+Branch `audit-round`, one commit per item, failing test first each time.
+All results below are PASS (engine, Linux only) unless marked NOT VERIFIED.
+Tauri code in F08 / Feat 1 was never compiled here (no Windows toolchain,
+no GTK/WebKit for Tauri on Linux) and is labelled NOT VERIFIED, never PASS.
+
+- F02 (commit 5be538a): CSPRNG download IDs. Before: 20 rapid adds -> 1 ID,
+  1 record. After: `tests/audit/audit_concurrency_bridge.sh` -> 20/20 unique,
+  20 records. Engine unit test: 10,000 IDs, all unique.
+- F04 (commit 30ae298): bridge token from `getrandom` only, no /dev/urandom
+  fallback. Engine test `tests/secure_token.rs`: 1,000 tokens, 32 hex, unique.
+  If the OS CSPRNG is unavailable, the bridge refuses to start instead of
+  minting a weak token. Windows token generation itself is NOT VERIFIED
+  on Windows (code path is now identical on all platforms, via getrandom).
+- F01 (commit c5e6e6b, strict per Q5): segmented verification. Before:
+  short-segment and mismatch-range both "completed" with corrupt files.
+  After: both fail with plain messages, partial file removed, no final file.
+  Segment retries use the existing retry/backoff; no single-stream fallback.
+  New tests: `crates/engine/tests/segmented_verification.rs` (2 tests).
+- F12 (commit b4aa87b): state backup. Save copies the last good file to
+  downloads.json.bak (only if it parses). Corrupt load renames the file to
+  downloads.json.corrupt-<timestamp>-<pid>, restores from .bak if possible,
+  and records load_warning (bridge and app print it as WARNING). The corrupt
+  file is never overwritten by a later save. Note: .bak is the previous good
+  save, so the very latest save may be lost on a corrupt restore, but all
+  earlier history is kept, and the corrupt file is preserved for manual recovery.
+- F03 (commit 697c80e, smaller fix per Q4): file lock + reload-before-save
+  in Store::save, merge by updated_unix, deletions tracked in-memory.
+  Before: two bridges, same data dir -> disk held only the second record.
+  After: `tests/two_process_store.sh` PASS (disk holds both, restarted bridge
+  lists both). Single-writer refactor stays a later item. In-memory lists
+  are still stale until restart; disk is now correct.
+- F06 (commit 9e5cefd): ETag / Last-Modified resume check. Probe stores both
+  headers; a .part.meta sidecar stores them on first download; on resume a
+  mismatch deletes the part and restarts from 0, and single-stream resume
+  sends If-Range (ETag, else Last-Modified). Before: pause, change server
+  file (same size, different bytes), resume -> mixed file (first byte old,
+  last byte new). After: `tests/changing_resume.sh` PASS (final = new file).
+  The restart is visible as progress resetting to 0 and a message in the
+  bridge log; a persistent UI toast for restarts is not in this round.
+- F08 (commit 16ce617, NOT VERIFIED): Tauri spawns fetchforge-bridge.exe
+  (next to the app exe) on launch with --data-dir and --port 18443, stderr
+  to bridge.log, and kills it on RunEvent::Exit. bridge_status command +
+  status-bar message for the taken-port case. No silent port fallback.
+  Rustfmt-checked only, JS node --check OK, never compiled on Windows.
+  INSTALL.md corrected with the same wording plus the NOT VERIFIED note.
+- Feat 1 (commit 7eabf5e, NOT VERIFIED): "Pair a browser" button in the
+  desktop app (pairBox in index.html, JS countdown 60 s, Tauri commands
+  pair_browser / unpair_all_browsers using TcpStream to the local bridge,
+  no new dependency). JS node --check OK, Rustfmt-checked only, never run
+  in a real browser. The bridge-side pairing API was already proven on
+  Linux in round 4; the app button itself is unproven until Windows.
+
+Full suite after the last item: cargo test 33 tests (23 engine lib + 5
+failure + 1 HLS + 1 segmented progress + 1 secure token + 2 segmented
+verification), 0 failures; fmt clean; clippy -D warnings clean; e2e,
+pause/resume, API failures, pairing e2e, token hygiene, segmented pause/XSS,
+two-process store, changing resume all PASS (engine, Linux only).
+F07 (symlink .part) moved to "do later" per user decision, not implemented.
+Scheduling, notifications, DASH, retry/remove/sort remain banned.

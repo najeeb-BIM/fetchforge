@@ -487,7 +487,9 @@ fn download_segmented(
             let part = part_path.to_path_buf();
             let dl = Arc::clone(&downloaded);
             handles.push(scope.spawn(move || {
-                segment_worker(&opts_c, &url, &part, start, end, &dl, paused, cancelled)
+                segment_worker(
+                    &opts_c, &url, &part, start, end, total, &dl, paused, cancelled,
+                )
             }));
         }
         for h in handles {
@@ -516,10 +518,15 @@ fn download_segmented(
         return Err("__PAUSED__".to_string());
     }
     if let Some(e) = first_error {
+        // F01 (Q5, strict): a bad segment must not leave partial data
+        // that could later be mistaken for a good download. The part
+        // file is removed; the download is never marked Completed.
+        let _ = std::fs::remove_file(part_path);
         return Err(e);
     }
     let actual = std::fs::metadata(part_path).map(|m| m.len()).unwrap_or(0);
     if actual != total {
+        let _ = std::fs::remove_file(part_path);
         return Err(format!(
             "Incomplete download: got {actual} bytes, expected {total}"
         ));
@@ -536,12 +543,52 @@ fn download_segmented(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let rest = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (s, e) = range.split_once('-')?;
+    Some((s.parse().ok()?, e.parse().ok()?, total.parse().ok()?))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn segment_worker(
     opts: &DownloadOptions,
     url: &str,
     part_path: &Path,
     start: u64,
     end: u64,
+    total: u64,
+    downloaded: &AtomicU64,
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    // F01 (Q5, strict): retry a bad segment with the existing retry
+    // logic (same backoff as single-stream). A pause/cancel is never
+    // retried; it returns immediately.
+    let mut last_err = String::new();
+    for attempt in 0..=opts.max_retries {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_secs(1 << attempt.min(4)));
+        }
+        match segment_worker_attempt(
+            opts, url, part_path, start, end, total, downloaded, paused, cancelled,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(e) if e == "__PAUSED__" || e == "__CANCELLED__" => return Err(e),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn segment_worker_attempt(
+    opts: &DownloadOptions,
+    url: &str,
+    part_path: &Path,
+    start: u64,
+    end: u64,
+    total: u64,
     downloaded: &AtomicU64,
     paused: &AtomicBool,
     cancelled: &AtomicBool,
@@ -554,10 +601,30 @@ fn segment_worker(
     let mut resp = req.send().map_err(|e| friendly_net_error(&e))?;
     if resp.status().as_u16() != 206 {
         return Err(format!(
-            "Server did not honour range request (HTTP {})",
+            "Server did not send the requested part of this download (HTTP {} instead of the requested range). The download was stopped and will not be marked as completed.",
             resp.status()
         ));
     }
+    // F01: verify Content-Range equals the requested range, exactly.
+    let cr_header = resp
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let (cs, ce, ctotal) = match cr_header.as_deref().and_then(parse_content_range) {
+        Some(v) => v,
+        None => {
+            return Err(format!(
+                "Server did not say which part of the file it sent for part {start}-{end} (missing or unreadable Content-Range). The download was stopped and will not be marked as completed."
+            ));
+        }
+    };
+    if cs != start || ce != end || ctotal != total {
+        return Err(format!(
+            "Server sent the wrong part of this download: it said bytes {cs}-{ce}/{ctotal}, but part {start}-{end} of {total} bytes was requested. The download was stopped and the partial file was removed, so it will not be marked as completed."
+        ));
+    }
+    let has_length = resp.headers().contains_key("content-length");
     let mut file = OpenOptions::new()
         .write(true)
         .open(part_path)
@@ -565,24 +632,58 @@ fn segment_worker(
     file.seek(SeekFrom::Start(start))
         .map_err(|e| e.to_string())?;
     let mut limiter = Limiter::new(opts.bandwidth_kbps.map(|k| k / 4).filter(|k| *k > 0));
+    let expected = end - start + 1;
+    let mut remaining = expected;
+    let mut written: u64 = 0;
     let mut buf = [0u8; 64 * 1024];
-    loop {
-        check_stop(paused, cancelled).map_err(|r| match r {
-            StopReason::Paused => "__PAUSED__".to_string(),
-            StopReason::Cancelled => "__CANCELLED__".to_string(),
-        })?;
-        match resp.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                limiter.account(n);
-                file.write_all(&buf[..n])
-                    .map_err(|e| format!("Write failed: {e}"))?;
-                downloaded.fetch_add(n as u64, Ordering::Relaxed);
+    let result: Result<(), String> = (|| {
+        loop {
+            if remaining == 0 {
+                break;
             }
-            Err(e) => return Err(format!("Read failed: {e}")),
+            check_stop(paused, cancelled).map_err(|r| match r {
+                StopReason::Paused => "__PAUSED__".to_string(),
+                StopReason::Cancelled => "__CANCELLED__".to_string(),
+            })?;
+            let want = (remaining as usize).min(buf.len());
+            match resp.read(&mut buf[..want]) {
+                Ok(0) => {
+                    return Err(format!(
+                        "Server sent only {} bytes for part {start}-{end} (expected {expected}). The download was stopped and the partial file was removed, so it will not be marked as completed.",
+                        expected - remaining
+                    ));
+                }
+                Ok(n) => {
+                    limiter.account(n);
+                    file.write_all(&buf[..n])
+                        .map_err(|e| format!("Write failed: {e}"))?;
+                    downloaded.fetch_add(n as u64, Ordering::Relaxed);
+                    written += n as u64;
+                    remaining -= n as u64;
+                }
+                Err(e) => return Err(format!("Read failed: {e}")),
+            }
         }
+        // If the server declared a length, one more read must be EOF;
+        // extra bytes mean the server sent more than the segment.
+        if has_length {
+            match resp.read(&mut buf) {
+                Ok(0) => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "Server sent extra data for part {start}-{end} (more than {expected} bytes). The download was stopped and the partial file was removed, so it will not be marked as completed."
+                    ));
+                }
+                Err(e) => return Err(format!("Read failed: {e}")),
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() && written > 0 {
+        // Undo this attempt's progress so a retry starts counting cleanly.
+        downloaded.fetch_sub(written, Ordering::Relaxed);
     }
-    Ok(())
+    result
 }
 
 /// Decode a `__PAUSED__` / `__CANCELLED__` sentinel into a StopReason.

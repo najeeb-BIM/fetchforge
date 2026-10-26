@@ -9,7 +9,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use fetchforge_engine::{
-    category_for_filename, download, probe, sanitize_filename, stop_reason, DownloadOptions,
+    category_for_filename, download, generate_download_id, probe, sanitize_filename, stop_reason, DownloadOptions,
     DownloadRecord, Status, Store,
 };
 use std::collections::HashMap;
@@ -87,7 +87,7 @@ fn add_download(
         ),
         Err(e) => {
             let rec = DownloadRecord {
-                id: format!("dl-{}", now_unix()),
+                id: generate_download_id(),
                 url: clean,
                 filename: filename.unwrap_or_else(|| "download".to_string()),
                 destination: state.download_dir.to_string_lossy().to_string(),
@@ -105,7 +105,7 @@ fn add_download(
             return Ok(rec);
         }
     };
-    let id = format!("dl-{}-{}", now_unix(), std::process::id());
+    let id = generate_download_id();
     let rec = DownloadRecord {
         id: id.clone(),
         url: clean,

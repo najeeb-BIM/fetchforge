@@ -15,8 +15,8 @@
 //!   fetchforge-bridge print-token [--data-dir DIR]
 
 use fetchforge_engine::{
-    category_for_filename, download, probe, sanitize_filename, stop_reason, DownloadOptions,
-    DownloadRecord, Status, Store,
+    category_for_filename, download, generate_download_id, probe, sanitize_filename, stop_reason,
+    DownloadOptions, DownloadRecord, Status, Store,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -187,7 +187,7 @@ impl App {
             ),
             Err(e) => {
                 // Still record the failure so the user sees it, with the reason.
-                let id = format!("dl-{}", now_unix());
+                let id = generate_download_id();
                 let rec = DownloadRecord {
                     id: id.clone(),
                     url: clean_url.clone(),
@@ -225,7 +225,7 @@ impl App {
                     return Ok(existing.clone());
                 }
             }
-            let id = format!("dl-{}-{}", now_unix(), std::process::id());
+            let id = generate_download_id();
             let rec = DownloadRecord {
                 id: id.clone(),
                 url: clean_url.clone(),

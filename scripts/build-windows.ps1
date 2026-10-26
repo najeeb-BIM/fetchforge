@@ -27,9 +27,18 @@ if (-not $appExe) { throw "Tauri exe not found at apps/desktop/src-tauri/target/
 Copy-Item $appExe.FullName "$stage/FetchForge.exe" -Force
 Copy-Item installer/host-manifest-chrome.json, installer/host-manifest-firefox.json $stage -Force
 # Patch bridge path placeholders in the STAGED manifests only.
-$bridgePath = (Join-Path (Get-Location) "$stage/fetchforge-bridge.exe") -replace '\\', '\\'
+# STEP 2 FIX (final round): previously this baked in the BUILD machine's
+# absolute stage path, which does not exist on a user's machine, so
+# native messaging would fail for anyone installing from the GitHub
+# artifact. On Windows, Chrome and Firefox both allow the manifest
+# path to be relative to the manifest file itself (Chrome docs:
+# developer.chrome.com/docs/extensions/develop/concepts/native-messaging;
+# Firefox: path may be relative to the manifest on Windows).
+# The installer puts manifests in $INSTDIR\native-host\ and the bridge
+# in $INSTDIR\, so "../fetchforge-bridge.exe" is correct on every
+# install location, with no build-machine path and no JSON escaping issue.
 foreach ($f in @("$stage/host-manifest-chrome.json", "$stage/host-manifest-firefox.json")) {
-  (Get-Content $f -Raw) -replace '__BRIDGE_EXE_PATH__', $bridgePath | Set-Content $f
+  (Get-Content $f -Raw) -replace '__BRIDGE_EXE_PATH__', '../fetchforge-bridge.exe' | Set-Content $f
 }
 # Run makensis from inside installer/ so that File "stage\..." paths and
 # the OutFile both resolve under installer/ regardless of NSIS's cwd rules.

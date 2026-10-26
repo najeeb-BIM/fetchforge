@@ -34,8 +34,11 @@ Section "Install"
   SetOutPath "$INSTDIR"
   File "stage\FetchForge.exe"
   File "stage\fetchforge-bridge.exe"
-  ; Native-messaging host manifests, with the real binary path already
+  ; Native-messaging host manifests, with a relative bridge path
+  ; ("../fetchforge-bridge.exe", relative to this native-host folder)
   ; patched in by the build script (staged copies only, never the sources).
+  ; Relative paths work on Windows for Chrome and Firefox, and stay
+  ; correct whatever $INSTDIR the user chooses.
   SetOutPath "$INSTDIR\native-host"
   File "stage\host-manifest-chrome.json"
   File "stage\host-manifest-firefox.json"

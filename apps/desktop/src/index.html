@@ -37,6 +37,13 @@
     <button id="saveTokenBtn">Save token locally</button>
     <small>Used only to talk to the loopback bridge on this machine. In the Tauri app this box is hidden.</small>
   </section>
+  <section id="pairBox" class="pair-box">
+    <button id="pairBtn">Pair a browser</button>
+    <span id="pairCode"></span>
+    <span id="pairCountdown"></span>
+    <button id="unpairBtn" class="secondary">Unpair all browsers</button>
+    <small>Pairing code is valid for 60 seconds and can be used once. Type it into the browser extension popup, then click Pair there. Feat 1, NOT VERIFIED in a real browser yet.</small>
+  </section>
   <div class="table-wrap">
   <table>
     <thead><tr><th>File</th><th>Category</th><th>Status</th><th>Progress</th><th>Speed</th><th>Actions</th></tr></thead>

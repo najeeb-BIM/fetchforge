@@ -87,6 +87,50 @@ document.getElementById("addBtn").onclick = async () => {
   catch (e) { setStatus("Could not add download: " + e.message); }
 };
 refresh(); setInterval(refresh, 2000);
+// Feat 1: Pair a browser. Code is shown as text only, never logged,
+// with a 60-second countdown. Tauri mode calls the Rust command
+// (which talks to the local bridge); bridge mode calls the bridge
+// API directly with the stored token. NOT VERIFIED in a real browser.
+let pairTimer = null;
+document.getElementById("pairBtn").onclick = async () => {
+  try {
+    let code;
+    if (isTauri) {
+      code = await window.__TAURI__.core.invoke("pair_browser");
+    } else {
+      const r = await fetch(BRIDGE + "/pair/generate", { method: "POST", headers: { "X-FetchForge-Token": token() } });
+      if (!r.ok) throw new Error(await r.text());
+      code = (await r.json()).code;
+    }
+    document.getElementById("pairCode").textContent = code;
+    let left = 60;
+    document.getElementById("pairCountdown").textContent = left + "s left";
+    if (pairTimer) clearInterval(pairTimer);
+    pairTimer = setInterval(() => {
+      left -= 1;
+      if (left <= 0) {
+        clearInterval(pairTimer);
+        document.getElementById("pairCode").textContent = "";
+        document.getElementById("pairCountdown").textContent = "Code expired. Click Pair a browser again.";
+      } else {
+        document.getElementById("pairCountdown").textContent = left + "s left";
+      }
+    }, 1000);
+    setStatus("Pairing code ready. Type it into the extension popup.");
+  } catch (e) { setStatus("Could not generate a pairing code: " + e.message); }
+};
+document.getElementById("unpairBtn").onclick = async () => {
+  try {
+    if (isTauri) {
+      await window.__TAURI__.core.invoke("unpair_all_browsers");
+    } else {
+      const r = await fetch(BRIDGE + "/unpair-all", { method: "POST", headers: { "X-FetchForge-Token": token() } });
+      if (!r.ok) throw new Error(await r.text());
+    }
+    document.getElementById("pairCode").textContent = "";
+    setStatus("All browsers unpaired. They must pair again.");
+  } catch (e) { setStatus("Could not unpair browsers: " + e.message); }
+};
 // F08: in Tauri mode, show a clear error if the bridge did not start
 // (for example, port 18443 already taken). No silent port fallback.
 if (isTauri) {

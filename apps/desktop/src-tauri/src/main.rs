@@ -13,6 +13,7 @@ use fetchforge_engine::{
     DownloadRecord, Status, Store,
 };
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -319,6 +320,72 @@ fn cancel_download(state: tauri::State<Arc<State>>, id: String) {
     }
 }
 
+/// Feat 1 (NOT VERIFIED on Windows): talk to the local bridge over
+/// loopback with plain TcpStream, so no new dependency is needed.
+/// The token is read from the app's own data dir, never shown in the
+/// UI and never sent anywhere except 127.0.0.1:18443.
+fn bridge_post(data_dir: &PathBuf, token: &str, path: &str) -> Result<String, String> {
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect("127.0.0.1:18443")
+        .map_err(|e| format!("Bridge not reachable ({e}). Is FetchForge running?"))?;
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:18443\r\nX-FetchForge-Token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("Bridge request failed ({e})"))?;
+    let mut raw = String::new();
+    stream
+        .read_to_string(&mut raw)
+        .map_err(|e| format!("Bridge response failed ({e})"))?;
+    let (head, body) = match raw.split_once("\r\n\r\n") {
+        Some((h, b)) => (h, b),
+        None => ("", raw.as_str()),
+    };
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if status != 200 {
+        return Err(format!(
+            "Bridge returned HTTP {status}: {}",
+            body.trim().chars().take(200).collect::<String>()
+        ));
+    }
+    Ok(body.to_string())
+}
+
+fn read_bridge_token(data_dir: &PathBuf) -> Result<String, String> {
+    let token = std::fs::read_to_string(data_dir.join("bridge-token.txt"))
+        .map_err(|_| "Bridge token not found. Wait for the bridge to start, then try again.".to_string())?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err("Bridge token is empty. Restart FetchForge, then try again.".to_string());
+    }
+    Ok(token)
+}
+
+#[tauri::command]
+fn pair_browser(state: tauri::State<Arc<State>>) -> Result<String, String> {
+    let token = read_bridge_token(&state.data_dir)?;
+    let body = bridge_post(&state.data_dir, &token, "/pair/generate")?;
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Bridge returned bad JSON ({e})"))?;
+    v.get("code")
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "Bridge did not return a pairing code.".to_string())
+}
+
+#[tauri::command]
+fn unpair_all_browsers(state: tauri::State<Arc<State>>) -> Result<(), String> {
+    let token = read_bridge_token(&state.data_dir)?;
+    let _ = bridge_post(&state.data_dir, &token, "/unpair-all")?;
+    Ok(())
+}
+
 fn main() {
     let dir = data_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -345,7 +412,9 @@ fn main() {
             pause_download,
             resume_download,
             cancel_download,
-            bridge_status
+            bridge_status,
+            pair_browser,
+            unpair_all_browsers
         ])
         .build(tauri::generate_context!())
         .expect("error while building FetchForge");

@@ -81,12 +81,102 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn load_settings(data_dir: &std::path::Path) -> Settings {
+/// P05 (F11): per-field settings fallback. A settings file with one bad
+/// field used to discard ALL settings silently (whole-file `from_str`
+/// failure -> `Default`). Now each known field is read on its own: a
+/// valid field keeps its value, a missing or wrongly-typed field falls
+/// back to its default, and the bad field names are returned as a
+/// warning so the user can see what was ignored. A missing file is
+/// normal on first run (no warning); a file that is not JSON, or not a
+/// JSON object, still falls back to all defaults, but with a warning.
+fn load_settings_with_warning(data_dir: &std::path::Path) -> (Settings, Option<String>) {
+    let defaults = Settings::default();
     let path = data_dir.join("settings.json");
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return (defaults, None),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                defaults,
+                Some(
+                    "settings.json is not valid JSON; all settings fell back to defaults"
+                        .to_string(),
+                ),
+            )
+        }
+    };
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => {
+            return (
+                defaults,
+                Some(
+                    "settings.json is not a JSON object; all settings fell back to defaults"
+                        .to_string(),
+                ),
+            )
+        }
+    };
+    let mut bad: Vec<&str> = Vec::new();
+    let mut s = defaults.clone();
+    // download_dir: non-empty string, else default.
+    match obj.get("download_dir") {
+        None => {}
+        Some(v) => match v.as_str() {
+            Some(d) if !d.is_empty() => s.download_dir = d.to_string(),
+            _ => bad.push("download_dir"),
+        },
+    }
+    // Numeric fields: JSON number, else default.
+    match obj.get("max_simultaneous") {
+        None => {}
+        Some(v) => match v.as_u64() {
+            Some(n) => s.max_simultaneous = n as usize,
+            None => bad.push("max_simultaneous"),
+        },
+    }
+    match obj.get("max_segments") {
+        None => {}
+        Some(v) => match v.as_u64() {
+            Some(n) => s.max_segments = n as usize,
+            None => bad.push("max_segments"),
+        },
+    }
+    match obj.get("max_retries") {
+        None => {}
+        Some(v) => match v.as_u64() {
+            Some(n) => s.max_retries = n as u32,
+            None => bad.push("max_retries"),
+        },
+    }
+    // bandwidth_kbps: null = unlimited, number = limit, anything else = default.
+    match obj.get("bandwidth_kbps") {
+        None => {}
+        Some(serde_json::Value::Null) => s.bandwidth_kbps = None,
+        Some(v) => match v.as_u64() {
+            Some(n) => s.bandwidth_kbps = Some(n),
+            None => bad.push("bandwidth_kbps"),
+        },
+    }
+    match obj.get("organise_by_category") {
+        None => {}
+        Some(v) => match v.as_bool() {
+            Some(b) => s.organise_by_category = b,
+            None => bad.push("organise_by_category"),
+        },
+    }
+    let warning = if bad.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "settings.json field(s) ignored (using defaults): {}",
+            bad.join(", ")
+        ))
+    };
+    (s, warning)
 }
 
 fn load_or_create_token(data_dir: &std::path::Path) -> String {
@@ -126,7 +216,10 @@ struct App {
 impl App {
     fn new(data_dir: PathBuf) -> Arc<Self> {
         let _ = std::fs::create_dir_all(&data_dir);
-        let settings = load_settings(&data_dir);
+        let (settings, settings_warning) = load_settings_with_warning(&data_dir);
+        if let Some(w) = &settings_warning {
+            eprintln!("FetchForge WARNING: {w}");
+        }
         let token = load_or_create_token(&data_dir);
         let mut store = Store::load(data_dir.join("downloads.json"));
         if let Some(w) = &store.load_warning {

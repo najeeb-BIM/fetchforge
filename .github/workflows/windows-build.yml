@@ -1,0 +1,47 @@
+name: Windows build
+# Reproducible Windows build: runs on a Windows runner because a Windows
+# x64 binary, WebView2/Tauri bundle and NSIS installer cannot be produced
+# or verified on Linux. Validated locally with actionlint 1.7.7.
+# Manual run (for a non-developer): see docs/WINDOWS_BUILD_GUIDE.md.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install NSIS
+        run: choco install nsis -y
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+      - name: Run tests
+        run: cargo test
+      - name: Build Tauri app, NSIS installer and portable zip
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
+      - name: Print SHA-256 of each output file
+        shell: pwsh
+        run: |
+          $files = @(
+            "installer/FetchForge-Setup-0.1.0-x64.exe",
+            "dist/FetchForge-portable-x64.zip",
+            "installer/stage/FetchForge.exe",
+            "installer/stage/fetchforge-bridge.exe"
+          )
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { throw "Missing expected output file: $f" }
+            (Get-FileHash -Algorithm SHA256 $f).Hash + "  " + $f
+          }
+      - name: Upload installer and portable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: fetchforge-windows-x64
+          path: |
+            installer/FetchForge-Setup-0.1.0-x64.exe
+            dist/FetchForge-portable-x64.zip

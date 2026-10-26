@@ -40,9 +40,69 @@ pub struct Store {
     /// surface this to the user (bridge prints it, desktop app logs it).
     /// It is never part of the saved JSON.
     pub load_warning: Option<String>,
+    /// F03: IDs removed in this process, with deletion time. `save`
+    /// must not resurrect them from disk. `remove` is currently unused
+    /// in product code (history removal is banned), so this set is
+    /// in-memory only; if removal is reintroduced, tombstones must
+    /// persist, otherwise a restart could resurrect a deleted record.
+    deleted: BTreeMap<String, u64>,
 }
 
-fn bak_path(path: &PathBuf) -> PathBuf {
+/// F03: lock-file guard. The lock file is created atomically
+/// (`create_new`), held only for one save, and removed on drop, so a
+/// crash cannot leave a permanent lock (stale locks older than 30 s
+/// are broken on acquisition).
+struct LockGuard {
+    path: PathBuf,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn acquire_lock(path: &std::path::Path) -> Option<LockGuard> {
+    let lock_path = path.with_extension("json.lock");
+    for _ in 0..50 {
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                let _ = writeln!(f, "{} {}", std::process::id(), now_secs());
+                return Some(LockGuard { path: lock_path });
+            }
+            Err(_) => {
+                // Break a stale lock (older than 30 s); a save takes
+                // milliseconds, so 30 s means the holder crashed.
+                if let Ok(meta) = fs::metadata(&lock_path) {
+                    if let Ok(mtime) = meta.modified() {
+                        if let Ok(age) = std::time::SystemTime::now().duration_since(mtime) {
+                            if age.as_secs() > 30 {
+                                let _ = fs::remove_file(&lock_path);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+    None
+}
+
+fn bak_path(path: &std::path::Path) -> PathBuf {
     path.with_extension("json.bak")
 }
 
@@ -54,6 +114,7 @@ impl Store {
                 path,
                 records: BTreeMap::new(),
                 load_warning: None,
+                deleted: BTreeMap::new(),
             };
         }
         match fs::read_to_string(&path)
@@ -64,6 +125,7 @@ impl Store {
                 path,
                 records,
                 load_warning: None,
+                deleted: BTreeMap::new(),
             },
             None => {
                 // F12: corrupt file. Never overwrite it, never silently
@@ -100,6 +162,7 @@ impl Store {
                     path,
                     records,
                     load_warning: Some(warning),
+                    deleted: BTreeMap::new(),
                 }
             }
         }
@@ -108,21 +171,60 @@ impl Store {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        // F12: keep the last good save as .bak, but only if the current
-        // file actually parses. Copying a corrupt file to .bak would
-        // destroy the only good backup.
-        if self.path.exists() {
-            if let Ok(s) = fs::read_to_string(&self.path) {
-                if serde_json::from_str::<BTreeMap<String, DownloadRecord>>(&s).is_ok() {
-                    let _ = fs::copy(&self.path, bak_path(&self.path));
+        // F03: file lock + reload-before-save. Without this, two
+        // processes (app + bridge) each holding their own in-memory
+        // Store would overwrite each other's records (last writer wins).
+        let _guard = acquire_lock(&self.path)
+            .ok_or_else(|| "Could not acquire state lock; will retry on next save".to_string())?;
+        // Reload disk first. If disk is corrupt, refuse to overwrite it
+        // (F12): a restart will rename it and restore from .bak.
+        let disk_records: BTreeMap<String, DownloadRecord> = if self.path.exists() {
+            match fs::read_to_string(&self.path) {
+                Ok(s) => match serde_json::from_str(&s) {
+                    Ok(recs) => recs,
+                    Err(_) => {
+                        return Err(
+                            "State file on disk is corrupt; refusing to overwrite it".to_string()
+                        );
+                    }
+                },
+                Err(_) => BTreeMap::new(),
+            }
+        } else {
+            BTreeMap::new()
+        };
+        let had_disk = self.path.exists();
+        // Merge: disk records first, then in-memory records win only if
+        // they are as new or newer than disk (by updated_unix). A stale
+        // in-memory record must not overwrite a newer disk record.
+        let mut merged = disk_records;
+        for (id, rec) in &self.records {
+            match merged.get(id) {
+                None => {
+                    merged.insert(id.clone(), rec.clone());
+                }
+                Some(disk_rec) if rec.updated_unix >= disk_rec.updated_unix => {
+                    merged.insert(id.clone(), rec.clone());
+                }
+                Some(_) => {}
+            }
+        }
+        for (id, deleted_at) in &self.deleted {
+            if let Some(disk_rec) = merged.get(id) {
+                if disk_rec.updated_unix <= *deleted_at {
+                    merged.remove(id);
                 }
             }
+        }
+        // F12: keep the last good save as .bak, before overwriting.
+        if had_disk {
+            let _ = fs::copy(&self.path, bak_path(&self.path));
         }
         // Atomic write: temp file + rename, so a crash cannot corrupt history.
         let tmp = self.path.with_extension("json.tmp");
         fs::write(
             &tmp,
-            serde_json::to_string_pretty(&self.records).map_err(|e| e.to_string())?,
+            serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
         fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
@@ -138,7 +240,12 @@ impl Store {
         self.records.values().collect()
     }
     pub fn remove(&mut self, id: &str) -> bool {
-        self.records.remove(id).is_some()
+        if self.records.remove(id).is_some() {
+            self.deleted.insert(id.to_string(), now_secs());
+            true
+        } else {
+            false
+        }
     }
     /// On startup, anything left `Downloading` was interrupted: mark Paused
     /// if it was resumable, Failed otherwise, so the UI never shows a
@@ -154,6 +261,7 @@ impl Store {
                 if rec.error.is_none() {
                     rec.error = Some("Interrupted by app close or crash".to_string());
                 }
+                rec.updated_unix = now_secs();
             }
         }
     }
@@ -258,6 +366,30 @@ mod tests {
             corrupt_content,
             "corrupt file must never be overwritten by a save"
         );
+    }
+
+    #[test]
+    fn two_stores_merging_do_not_lose_each_others_records() {
+        let dir = std::env::temp_dir().join("fetchforge-test-store-merge");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("downloads.json");
+        let mut a = Store::load(path.clone());
+        a.upsert(rec("one"));
+        a.save().unwrap();
+        // B loads after A's first save, so B knows "one".
+        let mut b = Store::load(path.clone());
+        // A adds "two" and saves. B does NOT reload, then adds "three"
+        // and saves. Without reload-before-save, B's save would wipe "two".
+        a.upsert(rec("two"));
+        a.save().unwrap();
+        b.upsert(rec("three"));
+        b.save().unwrap();
+        let disk: BTreeMap<String, DownloadRecord> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(disk.contains_key("one"), "one must survive");
+        assert!(disk.contains_key("two"), "two must survive B's save");
+        assert!(disk.contains_key("three"), "three must survive");
     }
 
     #[test]

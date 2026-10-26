@@ -42,6 +42,28 @@ fn sidecar_path(part_path: &Path) -> PathBuf {
     ))
 }
 
+/// P02 (F07): never write through a symlink. A pre-planted symlink
+/// `.part` file used to let a download write into a file outside the
+/// download folder (the audit grew an outside file from 17 bytes to
+/// 884,753 bytes). `remove_file` on a symlink removes the link itself,
+/// never its target, so removing the link and starting fresh is safe.
+/// Returns true if a symlink was removed. On Windows, junction
+/// behaviour was NOT VERIFIED here; the check is the same
+/// `symlink_metadata` call, but a junction is a different reparse
+/// point, so Windows junction handling stays an open verification item.
+fn remove_symlink(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            eprintln!(
+                "FetchForge: ignoring a symlink at {}; it was removed and this download starts fresh, so no data is written through it.",
+                path.display()
+            );
+            std::fs::remove_file(path).is_ok()
+        }
+        _ => false,
+    }
+}
+
 fn write_sidecar(part_path: &Path, probe: &Probe) {
     let meta = ResumeMeta {
         url: probe.final_url.clone(),
@@ -50,7 +72,10 @@ fn write_sidecar(part_path: &Path, probe: &Probe) {
         total: probe.content_length,
     };
     if let Ok(s) = serde_json::to_string(&meta) {
-        let _ = std::fs::write(sidecar_path(part_path), s);
+        // Same class as the .part itself: never write through a symlink.
+        let sidecar = sidecar_path(part_path);
+        remove_symlink(&sidecar);
+        let _ = std::fs::write(sidecar, s);
     }
 }
 
@@ -321,6 +346,10 @@ pub fn download(
             final_path.file_name().unwrap().to_string_lossy()
         ))
     };
+    // P02: a pre-planted symlink .part is removed before any size
+    // check, open, or rename, so the download can never resume into
+    // or write through it. The size check below then sees 0 (fresh).
+    remove_symlink(&part_path);
 
     let total = probe.content_length;
     let mut existing = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
@@ -448,6 +477,12 @@ fn download_single_attempt(
     paused: &AtomicBool,
     cancelled: &AtomicBool,
 ) -> Result<PathBuf, StopOrError> {
+    // P02: defence in depth for a symlink planted after download()
+    // checked. Removing it here also resets the start offset, because
+    // the file it pointed at is no longer the download's partial data.
+    if remove_symlink(part_path) {
+        downloaded = 0;
+    }
     let c = client(opts).map_err(StopOrError::Error)?;
     let mut req = c.get(&probe.final_url);
     if downloaded > 0 {
@@ -543,6 +578,9 @@ fn download_segmented(
     cancelled: &AtomicBool,
 ) -> Result<PathBuf, String> {
     // Pre-allocate the part file so segment threads can seek safely.
+    // P02: remove a pre-planted symlink first, or set_len would grow
+    // the file the link points at (the segmented form of F07).
+    remove_symlink(part_path);
     {
         let f = OpenOptions::new()
             .create(true)
@@ -730,6 +768,19 @@ fn segment_worker_attempt(
         ));
     }
     let has_length = resp.headers().contains_key("content-length");
+    // P02: a segment worker must never write through a symlink planted
+    // mid-download. Removing it here would corrupt the other segments,
+    // so fail this segment instead; the segmented caller deletes the
+    // part file on any segment error.
+    if std::fs::symlink_metadata(part_path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(
+            "Download stopped: a symlink was found at the partial file, so no data was written through it."
+                .to_string(),
+        );
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .open(part_path)

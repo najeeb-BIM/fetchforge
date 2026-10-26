@@ -184,6 +184,78 @@ mod tests {
         let _ = std::fs::remove_file(dir.join("dup (2).zip"));
     }
     #[test]
+    fn windows_filename_rules() {
+        // Reserved device names, with and without an extension, any case.
+        for name in ["CON", "NUL", "AUX", "PRN"] {
+            let clean = sanitize_filename(name);
+            assert!(clean.starts_with('_'), "{name} -> {clean}");
+            assert!(!clean.contains('/'));
+        }
+        for i in 1..=9 {
+            for name in [format!("COM{i}"), format!("LPT{i}")] {
+                let clean = sanitize_filename(&name);
+                assert!(clean.starts_with('_'), "{name} -> {clean}");
+                // With an extension the stem is still reserved.
+                let with_ext = sanitize_filename(&format!("{name}.zip"));
+                assert!(with_ext.starts_with('_'), "{name}.zip -> {with_ext}");
+                assert!(with_ext.ends_with(".zip"));
+            }
+        }
+        // Trailing dot or space (Windows silently mangles these).
+        assert_eq!(sanitize_filename("report."), "report");
+        assert_eq!(sanitize_filename("report "), "report");
+        assert_eq!(sanitize_filename("report. "), "report");
+        assert_eq!(sanitize_filename("report.."), "report");
+        // Colon / Alternate Data Stream: the colon must not survive, so
+        // "file.txt:stream" can never become an ADS on Windows.
+        assert_eq!(sanitize_filename("report.txt:secret"), "report.txt_secret");
+        assert!(!sanitize_filename("a:b:c").contains(':'));
+        // Backslash and drive letters: only the final segment survives.
+        assert_eq!(sanitize_filename(r"C:\Users\test\file.txt"), "file.txt");
+        assert_eq!(sanitize_filename(r"D:\data\report.pdf"), "report.pdf");
+        assert_eq!(sanitize_filename("C:file.txt"), "C_file.txt");
+        // Traversal, both separators, and empty / dot-only names.
+        assert_eq!(sanitize_filename("../etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename(r"..\..\Windows\win.ini"), "win.ini");
+        assert_eq!(sanitize_filename("....//....//secret.txt"), "secret.txt");
+        assert_eq!(sanitize_filename(""), "download");
+        assert_eq!(sanitize_filename("."), "download");
+        assert_eq!(sanitize_filename(".."), "download");
+        // No result may ever contain a separator or a forbidden char.
+        for raw in [
+            "a/b/c.txt",
+            r"a\b\c.txt",
+            "a<b>c:d\"e|f?g*h",
+            "CON",
+            "file.txt:stream",
+        ] {
+            let clean = sanitize_filename(raw);
+            assert!(
+                !clean.contains('/') && !clean.contains('\\') && !clean.contains(':'),
+                "{raw} -> {clean}"
+            );
+        }
+    }
+    #[test]
+    fn long_name_keeps_total_path_under_260() {
+        // Pure-function limit: the name itself is capped at 200 chars.
+        // With a realistic 50-char download folder, the total path
+        // (folder + separator + name) stays under Windows' 260 limit.
+        let long = format!("{}.pdf", "a".repeat(500));
+        let clean = sanitize_filename(&long);
+        assert!(clean.chars().count() <= 200);
+        let dir = Path::new("/tmp/downloads/0123456789abcdefghij0123456789ab");
+        let total = unique_path(dir, &long);
+        assert!(
+            total.to_string_lossy().chars().count() < 260,
+            "total path too long: {}",
+            total.display()
+        );
+        // A 260+ char name on its own must still be truncated, not passed through.
+        let very_long = "x".repeat(400);
+        assert!(sanitize_filename(&very_long).chars().count() <= 200);
+    }
+    #[test]
     fn parses_content_disposition() {
         assert_eq!(
             filename_from_content_disposition(Some("attachment; filename=\"report 2026.pdf\""))

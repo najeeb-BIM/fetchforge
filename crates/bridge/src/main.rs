@@ -350,6 +350,31 @@ struct AddRequest {
     filename: Option<String>,
 }
 
+/// Host check (DNS-rebinding defence): the bridge only answers when the
+/// HTTP Host is loopback. A browser that was tricked by DNS rebinding
+/// into contacting 127.0.0.1 via an attacker domain would send that
+/// domain as Host, and must be rejected even though the TCP destination
+/// is loopback. A missing Host is also rejected (HTTP/1.1 requires it;
+/// curl, fetch, and the desktop UI always send it).
+fn host_allowed(headers: &str) -> bool {
+    for line in headers.lines() {
+        if let Some(v) = line
+            .strip_prefix("Host:")
+            .or_else(|| line.strip_prefix("host:"))
+        {
+            let v = v.trim().to_ascii_lowercase();
+            let host = if let Some(rest) = v.strip_prefix('[') {
+                // IPv6: "[::1]:18443" -> "::1"
+                rest.split(']').next().unwrap_or("")
+            } else {
+                v.split(':').next().unwrap_or("")
+            };
+            return matches!(host, "127.0.0.1" | "localhost" | "::1");
+        }
+    }
+    false
+}
+
 fn origin_allowed(headers: &str) -> bool {
     // No Origin (curl, native tools) is allowed on loopback; a browser
     // Origin must be an extension origin or another loopback page.
@@ -430,6 +455,10 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
     } else {
         String::new()
     };
+    if !host_allowed(&headers) {
+        let _ = stream.write_all(http_response(403, r#"{"error":"Host not allowed"}"#).as_bytes());
+        return;
+    }
     if !origin_allowed(&headers) {
         let _ =
             stream.write_all(http_response(403, r#"{"error":"Origin not allowed"}"#).as_bytes());

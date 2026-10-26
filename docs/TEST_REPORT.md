@@ -4,6 +4,54 @@ Environment: Ubuntu 24.04 x64, Rust stable 1.99.1 (installed during
 this build; initial 1.82 could not build current crates.io deps),
 Node 24, Python 3.12. No Windows, no NSIS, no Wine, no browser.
 
+## Verification round 3 (2026-10-26, after v0.1.0 acceptance)
+
+- Git: v0.1.0 committed as `4b17a7b` on main, annotated tag
+  `v0.1.0-engine`. Original backup kept:
+  `~/workspace/backups/fetchforge-2026-10-26-preverify.tar.gz`
+  (SHA-256 `f22723bcef810362d21025f2c57d61927dd2723d7aff8d87b2569ca84ea8a175`).
+  Round-3 work is committed separately and does NOT move the tag.
+- Windows workflow: `.github/workflows/windows-build.yml` now runs on
+  `windows-latest`, runs `cargo test`, installs NSIS + Tauri CLI,
+  builds the Tauri app, NSIS installer and portable zip via
+  `scripts/build-windows.ps1`, prints SHA-256 of all four outputs
+  (installer, portable zip, app exe, bridge exe) and uploads the
+  installer + portable zip as artifacts. Validated with actionlint
+  1.7.7: exit 0, no findings. The workflow itself has NOT run on
+  GitHub yet — that needs the user's repo + Run workflow click.
+  Non-developer guide: `docs/WINDOWS_BUILD_GUIDE.md`, exactly 10 lines
+  (verified with `wc -l`). Note: the guide tells the user to unzip
+  first and upload the files, not the zip itself, because GitHub
+  Actions cannot run from a zip stored as a single file.
+- Build-script bug fixed in round 3: the old script copied patched
+  host manifests back over the source manifests in `installer/`,
+  corrupting them with an absolute build path. Now it stages only
+  under `installer/stage/`, NSIS reads from `stage/`, and makensis
+  runs from inside `installer/` so paths resolve deterministically.
+  Also: the script now fails explicitly if the Tauri CLI or app exe
+  is missing, instead of warning and continuing.
+- Filename tests (Linux, pure function): reserved CON/NUL/AUX/PRN and
+  COM1-9/LPT1-9 with and without extension, trailing dot/space,
+  colon/ADS, backslash, drive letters, `../` and `..\` traversal,
+  empty/dot-only names, and a 500-char name truncated so a realistic
+  total path stays under 260 — all pass (`cargo test filename`: 7 tests).
+- Bridge Host tests (Linux): evil Host 403, suffix-trick Host
+  (`127.0.0.1.evil.example`) 403, `localhost` Host 200,
+  `127.0.0.1` Host 200 — all pass in `tests/bridge_api_failures.sh`.
+- Segmented progress (Linux): reporter thread polls the shared
+  counter every 100 ms; new test `segmented_progress` (2 MiB slow
+  server, 4 segments) asserts an intermediate value strictly between
+  0 and total and a final value equal to total — passes in ~5 s.
+  Progress callback type changed to `Send + Sync` to allow this;
+  bridge builds cleanly with the new type.
+- Full suite after round 3: 12 unit + 5 failure + 1 HLS + 1 segmented
+  progress = 19 tests, 0 failures; `cargo fmt --check` clean,
+  `cargo clippy --all-targets` clean; e2e and pause/resume re-run
+  and still hash-match.
+- NOT built in round 3, per user order: scheduling, notifications,
+  DASH, retry/remove/sort. Token UX was NOT implemented — design
+  only, awaiting user approval (see final report).
+
 ## Verification round 2 (user's proof process, 2026-10-26)
 
 Backup before changes: `~/workspace/backups/fetchforge-2026-10-26-preverify.tar.gz`

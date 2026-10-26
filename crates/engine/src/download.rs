@@ -224,7 +224,7 @@ fn check_stop(paused: &AtomicBool, cancelled: &AtomicBool) -> Result<(), StopRea
 /// pause/cancel so the caller can persist state instead of marking failure.
 pub fn download(
     opts: &DownloadOptions,
-    progress: &dyn Fn(Progress),
+    progress: &(dyn Fn(Progress) + Send + Sync),
     paused: &AtomicBool,
     cancelled: &AtomicBool,
 ) -> Result<PathBuf, String> {
@@ -312,7 +312,7 @@ fn download_single(
     final_path: &Path,
     part_path: &Path,
     start_from: u64,
-    progress: &dyn Fn(Progress),
+    progress: &(dyn Fn(Progress) + Send + Sync),
     paused: &AtomicBool,
     cancelled: &AtomicBool,
 ) -> Result<PathBuf, String> {
@@ -349,7 +349,7 @@ fn download_single_attempt(
     final_path: &Path,
     part_path: &Path,
     mut downloaded: u64,
-    progress: &dyn Fn(Progress),
+    progress: &(dyn Fn(Progress) + Send + Sync),
     paused: &AtomicBool,
     cancelled: &AtomicBool,
 ) -> Result<PathBuf, StopOrError> {
@@ -433,7 +433,7 @@ fn download_segmented(
     final_path: &Path,
     part_path: &Path,
     total: u64,
-    progress: &dyn Fn(Progress),
+    progress: &(dyn Fn(Progress) + Send + Sync),
     paused: &AtomicBool,
     cancelled: &AtomicBool,
 ) -> Result<PathBuf, String> {
@@ -453,8 +453,28 @@ fn download_segmented(
     let started = Instant::now();
     // Scoped threads: &AtomicBool is Send because AtomicBool is Sync, so
     // pause/cancel flags set by the caller are visible to every segment.
+    // Aggregate progress: a reporter thread polls the shared downloaded
+    // counter every 100 ms and calls the progress callback, so the UI
+    // shows a rising total while segments run — not 0 until the end.
+    // The callback type is Send + Sync precisely so this thread can use it.
     let mut first_error: Option<String> = None;
+    let done = Arc::new(AtomicBool::new(false));
     std::thread::scope(|scope| {
+        let reporter_done = Arc::clone(&done);
+        let reporter_downloaded = Arc::clone(&downloaded);
+        let reporter = scope.spawn(move || {
+            let reporter_start = Instant::now();
+            while !reporter_done.load(Ordering::Relaxed) {
+                let dl = reporter_downloaded.load(Ordering::Relaxed);
+                let secs = reporter_start.elapsed().as_secs_f64().max(0.001);
+                progress(Progress {
+                    downloaded: dl,
+                    total: Some(total),
+                    bytes_per_sec: dl as f64 / secs,
+                });
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
         let mut handles = Vec::new();
         for i in 0..segments {
             let start = i as u64 * chunk_size;
@@ -485,6 +505,8 @@ fn download_segmented(
                 }
             }
         }
+        done.store(true, Ordering::Relaxed);
+        let _ = reporter.join();
     });
     if cancelled.load(Ordering::Relaxed) {
         let _ = std::fs::remove_file(part_path);

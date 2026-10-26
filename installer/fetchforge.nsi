@@ -1,9 +1,12 @@
 ; FetchForge installer (NSIS 3.x). Per-user install, no admin required.
-; Build on Windows with: makensis installer/fetchforge.nsi
-; Requires, in this folder at build time:
-;   FetchForge.exe          (Tauri app binary, from cargo tauri build)
-;   fetchforge-bridge.exe   (cargo build --release -p fetchforge-bridge)
-;   host-manifest-chrome.json / host-manifest-firefox.json (paths patched below)
+; Build on Windows with: scripts/build-windows.ps1 (which stages files
+; under installer/stage/ and then runs makensis on this script).
+; Requires, staged under installer/stage/ at build time:
+;   stage/FetchForge.exe          (Tauri app binary, from cargo tauri build)
+;   stage/fetchforge-bridge.exe   (cargo build --release -p fetchforge-bridge)
+;   stage/host-manifest-*.json    (placeholders patched by the build script;
+;                                  the source manifests in installer/ are
+;                                  NEVER overwritten with patched paths)
 ; This script is NOT signed. Do not claim a signed installer unless a
 ; code-signing certificate was actually applied and verified (see docs/BUILD.md).
 !define APPNAME "FetchForge"
@@ -29,13 +32,13 @@ ShowUninstDetails show
 
 Section "Install"
   SetOutPath "$INSTDIR"
-  File "FetchForge.exe"
-  File "fetchforge-bridge.exe"
-  ; Native-messaging host manifests: the installer writes the real binary
-  ; path into them at install time (placeholders replaced by the build script).
+  File "stage\FetchForge.exe"
+  File "stage\fetchforge-bridge.exe"
+  ; Native-messaging host manifests, with the real binary path already
+  ; patched in by the build script (staged copies only, never the sources).
   SetOutPath "$INSTDIR\native-host"
-  File "host-manifest-chrome.json"
-  File "host-manifest-firefox.json"
+  File "stage\host-manifest-chrome.json"
+  File "stage\host-manifest-firefox.json"
   ; Register Chrome/Edge native host (per-user, HKCU).
   WriteRegStr HKCU "Software\Google\Chrome\NativeMessagingHosts\com.fetchforge.bridge" "" "$INSTDIR\native-host\host-manifest-chrome.json"
   WriteRegStr HKCU "Software\Microsoft\Edge\NativeMessagingHosts\com.fetchforge.bridge" "" "$INSTDIR\native-host\host-manifest-chrome.json"

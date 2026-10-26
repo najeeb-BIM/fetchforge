@@ -11,6 +11,11 @@ malicious page tricking the extension into sending a dangerous URL.
 
 - **Loopback only.** The bridge binds `127.0.0.1:18443` explicitly.
   It never binds `0.0.0.0`. A remote machine cannot reach it.
+- **Host check (DNS-rebinding defence).** Even on loopback, a request
+  is rejected (403) unless its HTTP Host is `127.0.0.1`, `localhost`,
+  or `::1` (with or without a port). A browser tricked by DNS rebinding
+  into contacting loopback via an attacker domain would send that
+  domain as Host and is rejected.
 - **Per-install token.** `POST /downloads`, `GET /downloads`,
   pause/resume/cancel all require `X-FetchForge-Token`, a 32-hex-char
   secret generated on first run, stored with mode 0600 where the OS

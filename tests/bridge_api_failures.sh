@@ -23,6 +23,10 @@ check "bad JSON" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://12
 check "wrong type url" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18445/downloads -H "X-FetchForge-Token: $TOKEN" -d '{"url": 123}')"
 check "missing url" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18445/downloads -H "X-FetchForge-Token: $TOKEN" -d '{}')"
 check "bad origin" 403 "$(curl -s -o /dev/null -w '%{http_code}' -H 'Origin: https://evil.example' -H "X-FetchForge-Token: $TOKEN" http://127.0.0.1:18445/downloads)"
+check "bad Host evil" 403 "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' http://127.0.0.1:18445/health)"
+check "bad Host suffix trick" 403 "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: 127.0.0.1.evil.example' http://127.0.0.1:18445/health)"
+check "good Host localhost" 200 "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: localhost:18445' http://127.0.0.1:18445/health)"
+check "good Host 127.0.0.1" 200 "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: 127.0.0.1:18445' http://127.0.0.1:18445/health)"
 echo "--- bridge log must NOT contain the token ---"
 if grep -q "$TOKEN" "$ROOT/bridge.log"; then echo "FAIL: token leaked into bridge log"; cat "$ROOT/bridge.log"; exit 1; fi
 echo "PASS: token not in bridge log"

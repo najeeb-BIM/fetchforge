@@ -12,6 +12,7 @@ pub mod category;
 pub mod download;
 pub mod filename;
 pub mod media;
+pub mod pairing;
 pub mod state;
 pub mod validate;
 

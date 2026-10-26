@@ -11,11 +11,19 @@ Extensions do nothing useful without FetchForge running. Install it
    Developer mode.
 2. Load unpacked > select `extensions/chromium/`.
 3. Right-click any download link > "Download with FetchForge".
-4. If the popup says the app is not reachable: open the popup, paste
-   the bridge token from FetchForge Settings, Save. Native messaging
-   (installed by the Windows installer) is tried first; the token path
-   is the fallback for portable installs or when native messaging is
-   not registered.
+4. Pairing (preferred, replaces manual token entry): in FetchForge
+   Settings click "Pair a browser" to show a code for 60 seconds,
+   then in the extension popup paste that code and click "Pair with
+   code". Native messaging (installed by the Windows installer) is
+   tried first; pairing is the fallback for portable installs or
+   when native messaging is not registered.
+5. Manual token entry is now behind the Advanced button in the
+   popup, with the warning "Never paste this into a website". It
+   will be removed once pairing is verified in a real browser.
+   The stable Chrome ID is documented in docs/EXTENSION_ID.md:
+   `hkmnehbdedolcaaikibkadblmbfkkija`.
+   NOTE: pairing, challenge-response, and the popup changes in this
+   round are written but NOT VERIFIED in a real browser yet.
 
 ## Firefox (Manifest V3, Firefox 109+)
 

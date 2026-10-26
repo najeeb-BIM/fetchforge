@@ -97,18 +97,7 @@ fn load_or_create_token(data_dir: &std::path::Path) -> String {
             return t;
         }
     }
-    // 32 hex chars from OS randomness where available, else time+pid.
-    let mut bytes = [0u8; 16];
-    let filled = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .is_ok();
-    if !filled {
-        let seed = now_unix() ^ (std::process::id() as u64) << 32;
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = ((seed >> ((i % 8) * 8)) & 0xff) as u8 ^ (i as u8 * 37);
-        }
-    }
-    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let token = generate_token();
     let _ = std::fs::create_dir_all(data_dir);
     let _ = std::fs::write(&path, &token);
     #[cfg(unix)]
@@ -126,7 +115,9 @@ struct Job {
 
 struct App {
     settings: Settings,
-    token: String,
+    data_dir: PathBuf,
+    token: Mutex<String>,
+    pairing: Mutex<fetchforge_engine::pairing::PairingState>,
     store: Mutex<Store>,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     active: Mutex<usize>,
@@ -142,11 +133,34 @@ impl App {
         let _ = store.save();
         Arc::new(Self {
             settings,
-            token,
+            data_dir,
+            token: Mutex::new(token),
+            pairing: Mutex::new(fetchforge_engine::pairing::PairingState::new()),
             store: Mutex::new(store),
             jobs: Mutex::new(HashMap::new()),
             active: Mutex::new(0),
         })
+    }
+
+    /// Rotate the bridge token ("Unpair all browsers"): generate a new
+    /// token, write it to the token file, replace the in-memory token,
+    /// and clear any active pairing code. Old tokens stop working
+    /// immediately; paired browsers must re-pair with a new code.
+    /// The new token is NOT returned here — the app reads it from the
+    /// token file, and extensions must re-pair, never receive it
+    /// automatically.
+    fn rotate_token(&self) -> Result<(), String> {
+        let new_token = generate_token();
+        let path = self.data_dir.join("bridge-token.txt");
+        std::fs::write(&path, &new_token).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        *self.token.lock().unwrap() = new_token;
+        *self.pairing.lock().unwrap() = fetchforge_engine::pairing::PairingState::new();
+        Ok(())
     }
 
     fn add_download(
@@ -350,6 +364,20 @@ struct AddRequest {
     filename: Option<String>,
 }
 
+fn generate_token() -> String {
+    let mut bytes = [0u8; 16];
+    let filled = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .is_ok();
+    if !filled {
+        let seed = now_unix() ^ (std::process::id() as u64) << 32;
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = ((seed >> ((i % 8) * 8)) & 0xff) as u8 ^ (i as u8 * 37);
+        }
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Host check (DNS-rebinding defence): the bridge only answers when the
 /// HTTP Host is loopback. A browser that was tricked by DNS rebinding
 /// into contacting 127.0.0.1 via an attacker domain would send that
@@ -402,6 +430,7 @@ fn http_response(status: u16, body: &str) -> String {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        500 => "Internal Server Error",
         _ => "OK",
     };
     format!(
@@ -474,17 +503,112 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
         let _ = stream.write_all(http_response(200, &body.to_string()).as_bytes());
         return;
     }
-    // Everything else needs the token.
+    // Challenge-response (no token required, no token returned): the
+    // extension sends a nonce, the bridge answers with HMAC(token,
+    // nonce). The extension verifies that HMAC with its stored token
+    // BEFORE sending the token to this server. A fake server that does
+    // not know the token cannot produce a matching HMAC.
+    if method == "POST" && path == "/challenge" {
+        let nonce = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("nonce")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+        let valid_nonce = !nonce.is_empty()
+            && nonce.len() <= 256
+            && nonce
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !valid_nonce {
+            let _ = stream.write_all(http_response(400, r#"{"error":"Invalid nonce"}"#).as_bytes());
+            return;
+        }
+        let token = app.token.lock().unwrap().clone();
+        let hmac = fetchforge_engine::pairing::challenge_hmac(&token, &nonce);
+        let b = serde_json::json!({"hmac": hmac}).to_string();
+        let _ = stream.write_all(http_response(200, &b).as_bytes());
+        return;
+    }
+    // Pairing verification (no token required): the extension sends the
+    // one-time code it was given by the user. Only on a correct code is
+    // the bridge token returned, to the extension background script only.
+    if method == "POST" && path == "/pair/verify" {
+        let code = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("code")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+        let result = app.pairing.lock().unwrap().verify(&code);
+        match result {
+            Ok(()) => {
+                let token = app.token.lock().unwrap().clone();
+                let b = serde_json::json!({"paired": true, "token": token}).to_string();
+                let _ = stream.write_all(http_response(200, &b).as_bytes());
+            }
+            Err(e) => {
+                let b = serde_json::json!({"error": e.to_string()}).to_string();
+                let _ = stream.write_all(http_response(403, &b).as_bytes());
+            }
+        }
+        return;
+    }
+    // Everything else needs the token, compared via SHA-256 hashes in
+    // constant time (see pairing::constant_time_eq) so a wrong token
+    // does not leak how many characters matched through timing.
     let token_ok = headers.lines().any(|l| {
         l.to_ascii_lowercase()
             .strip_prefix("x-fetchforge-token:")
-            .map(|v| v.trim() == app.token)
+            .map(|v| {
+                let provided = fetchforge_engine::pairing::hash_code(v.trim());
+                let stored = fetchforge_engine::pairing::hash_code(&app.token.lock().unwrap());
+                fetchforge_engine::pairing::constant_time_eq(&provided, &stored)
+            })
             .unwrap_or(false)
     });
     if !token_ok {
         let _ = stream.write_all(
             http_response(401, r#"{"error":"Missing or invalid bridge token"}"#).as_bytes(),
         );
+        return;
+    }
+    // Pairing code generation (app only, token required): returns the
+    // display form XXXX-XXXX. Only its hash is stored in the bridge.
+    if method == "POST" && path == "/pair/generate" {
+        match app.pairing.lock().unwrap().generate() {
+            Ok(code) => {
+                let b = serde_json::json!({
+                    "code": fetchforge_engine::pairing::display_code(&code),
+                    "expires_in_seconds": 60
+                })
+                .to_string();
+                let _ = stream.write_all(http_response(200, &b).as_bytes());
+            }
+            Err(e) => {
+                let b = serde_json::json!({"error": e}).to_string();
+                let _ = stream.write_all(http_response(500, &b).as_bytes());
+            }
+        }
+        return;
+    }
+    // Unpair all browsers (app only, token required): rotates the token
+    // and clears any active pairing code. Old tokens stop working
+    // immediately. The new token is NOT returned here.
+    if method == "POST" && path == "/unpair-all" {
+        match app.rotate_token() {
+            Ok(()) => {
+                let _ = stream.write_all(http_response(200, r#"{"rotated":true}"#).as_bytes());
+            }
+            Err(e) => {
+                let b = serde_json::json!({"error": e}).to_string();
+                let _ = stream.write_all(http_response(500, &b).as_bytes());
+            }
+        }
         return;
     }
     if method == "GET" && path == "/downloads" {
@@ -642,7 +766,9 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "print-token") {
-        println!("{}", app.token);
+        // Explicit user action only: this command prints the token to
+        // stdout so the app can read it. Serve mode never prints it.
+        println!("{}", app.token.lock().unwrap());
         return;
     }
     // Default: serve.

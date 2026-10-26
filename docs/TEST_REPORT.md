@@ -4,6 +4,49 @@ Environment: Ubuntu 24.04 x64, Rust stable 1.99.1 (installed during
 this build; initial 1.82 could not build current crates.io deps),
 Node 24, Python 3.12. No Windows, no NSIS, no Wine, no browser.
 
+## Verification round 4 — token pairing (2026-10-26, approved with conditions)
+
+- Stable Chrome ID: RSA-2048 public key added to the Chromium
+  manifest; derived ID `hkmnehbdedolcaaikibkadblmbfkkija` matches
+  the host manifest's allowed_origins (checked by
+  `tests/token_hygiene.sh`). The private key was generated in
+  /tmp, used only to extract the public key, then shredded; it
+  was never in the repository, zip, or backups. Firefox gecko ID
+  `fetchforge@example.local` is fixed and matches its host manifest.
+  Derivation documented in docs/EXTENSION_ID.md.
+- Engine pairing (`crates/engine/src/pairing.rs`): CSPRNG code,
+  SHA-256 hash only, constant-time compare, 60s expiry, single
+  use, one active code, 5-wrong-attempt invalidation, and
+  HMAC-SHA256 challenge — all unit-tested (7 new pairing tests;
+  lib suite now 19 tests). One test bug was found and fixed by
+  correcting check order (used codes now report AlreadyUsed),
+  not by weakening the assertion. HMAC helper matches the RFC
+  4231 test vector.
+- Bridge pairing e2e (`tests/pairing_e2e.sh`, real bridge, Linux):
+  challenge HMAC matches the token-derived HMAC, bad nonce 400,
+  generate + 4 wrong (403) + correct (returns real token) + reuse
+  (403), 5th wrong invalidates and correct code then fails,
+  display form with hyphen verifies, unpair-all rotates the token
+  (old 401, new 200, challenge follows the new token only),
+  second bridge on the same port exits loudly with "could not
+  bind", first bridge still alive, tokens not in bridge log.
+- Token hygiene (`tests/token_hygiene.sh`): no content_scripts,
+  token header only in background.js, popup never preloads or
+  shows the stored token, no token in logs/URLs/cookies, Advanced
+  toggle + exact red warning + pairing input present, no private
+  key/token/.env tracked. All checks pass.
+- Extension UI changes (pairing input, Advanced toggle, challenge
+  in background.js, fallback recording) are written for both
+  browsers, identical between them, `node --check` clean,
+  manifests parse — but NOT VERIFIED in a real browser.
+- Full suite after round 4: 19 unit + 5 failure + 1 HLS + 1
+  segmented progress = 26 tests, 0 failures; e2e, pause/resume,
+  API failures, pairing e2e, and token hygiene all re-run and pass.
+- NOT built, per user order: scheduling, notifications, DASH,
+  retry/remove/sort. Tauri app pairing UI (Settings > Pair a
+  browser button) is not yet written — the bridge endpoint
+  `POST /pair/generate` is token-authenticated and ready for it.
+
 ## Verification round 3 (2026-10-26, after v0.1.0 acceptance)
 
 - Git: v0.1.0 committed as `4b17a7b` on main, annotated tag

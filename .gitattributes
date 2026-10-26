@@ -1,0 +1,11 @@
+# Files that must never appear in a git archive / source zip,
+# even if one is accidentally tracked later.
+*.pem export-ignore
+*.key export-ignore
+.env export-ignore
+.env.* export-ignore
+**/bridge-token.txt export-ignore
+target/ export-ignore
+dist/ export-ignore
+installer/stage/ export-ignore
+*.log export-ignore

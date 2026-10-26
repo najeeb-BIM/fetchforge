@@ -18,8 +18,12 @@ function sendMessage(msg) {
   return new Promise((resolve) => api.runtime.sendMessage(msg, resolve));
 }
 async function refresh() {
-  const token = (await getStorage("token")).token;
-  status.textContent = token ? "Token saved. Checking app…" : "No bridge token saved yet. Native messaging is tried first.";
+  const s = await getStorage("token");
+  const token = s.token;
+  const fb = (await getStorage("lastFallback")).lastFallback;
+  const note = document.getElementById("fallbackNote");
+  if (note) note.textContent = fb ? "Last link fell back to browser download because FetchForge was not reachable." : "";
+  status.textContent = token ? "Paired. Checking app…" : "Not paired yet. Use a pairing code from FetchForge, or Advanced for manual token. Native messaging is tried first.";
   try {
     const r = await sendMessage({ type: "checkBridge" });
     if (r && r.bridge) status.textContent = "FetchForge app is reachable on this machine.";
@@ -28,8 +32,21 @@ async function refresh() {
     if (!token) status.textContent = "App not reachable. Install the desktop app, then save its bridge token above.";
   }
 }
+document.getElementById("advancedToggle").onclick = () => {
+  const d = document.getElementById("advanced");
+  d.style.display = d.style.display === "none" ? "block" : "none";
+};
+document.getElementById("pair").onclick = async () => {
+  const input = document.getElementById("pairCode");
+  const r = await sendMessage({ type: "pairCode", code: input.value.trim() });
+  input.value = "";
+  status.textContent = r && r.ok ? "Paired with FetchForge." : "Pairing failed: " + (r && r.error ? r.error : "bridge not reachable");
+  refresh();
+};
 document.getElementById("saveToken").onclick = async () => {
-  await setStorage({ token: document.getElementById("token").value.trim() });
+  const input = document.getElementById("token");
+  await setStorage({ token: input.value.trim() });
+  input.value = "";
   refresh();
 };
 document.getElementById("send").onclick = async () => {
@@ -38,5 +55,4 @@ document.getElementById("send").onclick = async () => {
   const r = await sendMessage({ type: "sendUrl", url, filename });
   status.textContent = r && r.ok ? "Sent (or fell back to browser download)." : "Could not send. Is the link http/https?";
 };
-getStorage("token").then((s) => { if (s.token) document.getElementById("token").value = s.token; });
 refresh();

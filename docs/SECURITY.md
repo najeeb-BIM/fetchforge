@@ -16,6 +16,29 @@ malicious page tricking the extension into sending a dangerous URL.
   or `::1` (with or without a port). A browser tricked by DNS rebinding
   into contacting loopback via an attacker domain would send that
   domain as Host and is rejected.
+- **Pairing, not token display.** Pairing codes are 8 CSPRNG
+  characters from a 32-character no-look-alike alphabet, hashed
+  with SHA-256 in memory only, 60-second expiry, single use, one
+  active code at a time, invalidated after 5 wrong attempts
+  (global counter, all clients are loopback). The token is
+  returned only after a correct code, to the extension background
+  script, which stores it in background storage only.
+- **Challenge-response.** Before sending its stored token, the
+  extension challenges the server with a random nonce and checks
+  HMAC-SHA256(token, nonce). A server that does not know the
+  token cannot pass. Token comparisons in the bridge use SHA-256
+  hashes compared in constant time.
+- **Rotation.** "Unpair all browsers" rotates the token in the
+  token file and in memory and clears pairing state; old tokens
+  return 401 immediately and the new token is not returned over
+  the API.
+- **Port binding.** If the bridge cannot bind 127.0.0.1:18443 it
+  exits with a clear error and never picks another port silently.
+- **Honest limit.** This protects against websites and web pages.
+  It does NOT protect against malware already running as the same
+  Windows user, which could read the token file or browser
+  storage. See docs/TOKEN_PAIRING_DESIGN.md for the full threat
+  model.
 - **Per-install token.** `POST /downloads`, `GET /downloads`,
   pause/resume/cancel all require `X-FetchForge-Token`, a 32-hex-char
   secret generated on first run, stored with mode 0600 where the OS

@@ -3,8 +3,14 @@
 <input id="url" placeholder="Paste a download link">
 <input id="filename" placeholder="Filename (optional)">
 <button id="send">Send to FetchForge</button>
-<hr><label>Bridge token (from FetchForge Settings)</label>
+<hr><label>Pairing code (from FetchForge Settings &gt; Pair a browser, 60 seconds)</label>
+<input id="pairCode" placeholder="e.g. ABCD-EFGH">
+<button id="pair">Pair with code</button>
+<button id="advancedToggle">Advanced</button>
+<div id="advanced" style="display:none"><label>Bridge token (advanced, manual entry only)</label>
 <input id="token" type="password" placeholder="Paste token once">
 <button id="saveToken">Save token</button>
+<p style="color:#dc2626;font-weight:700">Never paste this into a website</p></div>
+<p id="fallbackNote"></p>
 <p><small>If the app is not running, the link falls back to your browser's downloader. No browsing history is sent anywhere.</small></p>
 <script src="popup.js"></script></body></html>

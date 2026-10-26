@@ -1,8 +1,79 @@
-# Token UX redesign — DESIGN ONLY, awaiting user approval
+# Token UX redesign — APPROVED and IMPLEMENTED (engine + bridge, Linux only)
 
-Status: NOT implemented. No code in this round changes how tokens work.
-The manual copy-paste token path in the app and extension is unchanged
-until the user approves a design below and it is tested in a real browser.
+Status, updated 2026-10-26: the design below was approved with
+conditions and implemented in `crates/engine/src/pairing.rs` and
+`crates/bridge/src/main.rs`, tested on Linux only (see
+`tests/pairing_e2e.sh` and `tests/token_hygiene.sh`). Extension popup
+and background changes for pairing and challenge-response are written
+in this round but are NOT VERIFIED until tested in a real browser.
+Manual token entry stays behind the Advanced toggle with the red
+warning "Never paste this into a website" and will be removed once
+pairing is verified in a real browser.
+
+Approved conditions, as implemented:
+1. Stable extension ID: Chromium manifest carries a fixed public
+   `key`; the derived ID is `hkmnehbdedolcaaikibkadblmbfkkija`
+   (see docs/EXTENSION_ID.md). Firefox uses the fixed gecko ID
+   `fetchforge@example.local`. The private key was shredded and
+   never stored in the repository.
+2. Pairing code: OS CSPRNG (`getrandom`), 8 characters from the
+   32-character alphabet `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` (no
+   0/O, 1/I/L), SHA-256 hash stored in memory only, constant-time
+   hash compare (no early return), 60-second expiry, single use,
+   one active code at a time. After 5 wrong attempts the active
+   code is INVALIDATED (this replaces the earlier 60-second
+   lockout idea — an invalidated code can never be used, even
+   with the correct code). Lockout counting is global because
+   the state is a single shared PairingState and all clients are
+   loopback.
+3. Challenge-response: before the extension sends its stored token,
+   it sends a random nonce to `POST /challenge`; the bridge
+   answers with HMAC-SHA256(token, nonce); the extension verifies
+   it locally and refuses to send the token on mismatch. If the
+   bridge cannot bind 127.0.0.1:18443 it exits with a clear error
+   ("could not bind … Is another copy already running?") and
+   never picks another port silently.
+4. Token hygiene: the token lives only in extension background
+   storage (`storage.local`, read only in background.js). No
+   content script exists, the token is never in a page context,
+   URL, or log, and the popup never shows the stored token.
+   `tests/token_hygiene.sh` greps for all of this.
+5. "Unpair all browsers": `POST /unpair-all` (token required)
+   rotates the token in the token file and in memory, clears
+   any active pairing code, and old tokens return 401 immediately.
+   The new token is NOT returned by the endpoint; the app reads
+   it from the token file and browsers must re-pair.
+6. Manual token entry: behind the Advanced toggle, red warning
+   "Never paste this into a website", removed once pairing is
+   verified in a real browser (see above).
+7. Threat model: see below, stated honestly.
+8. Linux-only proof: code generation, hashing, expiry, single
+   use, lockout/invalidation, challenge-response, and rotation
+   are all tested on Linux. Extension UI is written, not verified.
+9. Still not built: scheduling, notifications, DASH,
+   retry/remove/sort.
+
+## Threat model — stated honestly
+
+This design protects against websites and web pages:
+- A malicious web page cannot call the bridge directly because of
+  loopback binding, Host check, Origin check, and the token.
+- A malicious web page cannot steal the token because there is no
+  content script, the token is never in a page context, URL, or
+  log, and the popup never displays it.
+- A fake server that does not know the token cannot pass the
+  challenge-response check, so the extension will not send the
+  token to it — provided the extension already holds a real token
+  from a real pairing.
+
+It does NOT protect against malware already running as the same
+Windows user. Such malware could read the token file from the
+user's data directory, read the browser profile's extension
+storage, bind the loopback port before FetchForge starts, or
+simply run code as that user. No loopback token, pairing code,
+or HMAC can stop code that already runs with the user's own
+permissions. The pairing code's 60-second window and single use
+limit shoulder-surfing and accidental exposure, not local malware.
 
 ## The problem today
 
@@ -38,7 +109,9 @@ on screen invites copying it into the wrong place.
 4. The bridge checks, in order: Host is loopback, Origin is an
    extension origin, the code hash matches, it has not expired
    (60 seconds), and it has not been used before. At most 5 wrong
-   attempts are allowed; after that, pairing locks for 60 seconds.
+   attempts are allowed; after the 5th wrong attempt the code is
+   invalidated (see the approved conditions above — this replaced
+   the earlier 60-second lockout idea).
 5. On success, the bridge marks that extension instance as paired and
    the extension stores the existing bridge token internally in
    `storage.local`. The user never sees, types, or copies the token.
@@ -51,8 +124,9 @@ on screen invites copying it into the wrong place.
 - v1 keeps a single bridge token (as today), so "Unpair all browsers"
   in Settings regenerates that token and forces every browser to
   re-pair. Per-browser tokens are a later improvement, not in v1.
-- The manual token display is kept as a hidden advanced fallback for
-  one release after pairing ships, then removed once pairing is
+- The manual token display is kept behind the Advanced toggle with
+  the red warning "Never paste this into a website" for one
+  release after pairing ships, then removed once pairing is
   proven in a real browser. Removing it on day one would leave
   portable users with no fallback if pairing has a bug.
 

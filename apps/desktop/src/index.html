@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FetchForge</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <h1>FetchForge</h1>
+  <p class="tag">Local download manager. Nothing leaves this machine.</p>
+</header>
+<main>
+  <section class="add">
+    <input id="url" type="url" placeholder="Paste a download link (http / https)">
+    <input id="filename" type="text" placeholder="Filename (optional)">
+    <button id="addBtn">Download</button>
+  </section>
+  <section class="controls">
+    <input id="search" type="search" placeholder="Search downloads">
+    <select id="filter">
+      <option value="all">All</option>
+      <option value="downloading">Active</option>
+      <option value="queued">Queued</option>
+      <option value="completed">Completed</option>
+      <option value="failed">Failed</option>
+      <option value="paused">Paused</option>
+    </select>
+    <button id="refreshBtn">Refresh</button>
+    <span id="status"></span>
+  </section>
+  <section id="tokenBox" class="token-box" hidden>
+    <label>Bridge token (for browser extension setup):
+      <input id="token" type="password" placeholder="Paste token from FetchForge Settings">
+    </label>
+    <button id="saveTokenBtn">Save token locally</button>
+    <small>Used only to talk to the loopback bridge on this machine. In the Tauri app this box is hidden.</small>
+  </section>
+  <section id="pairBox" class="pair-box">
+    <button id="pairBtn">Pair a browser</button>
+    <span id="pairCode"></span>
+    <span id="pairCountdown"></span>
+    <button id="unpairBtn" class="secondary">Unpair all browsers</button>
+    <small>Pairing code is valid for 60 seconds and can be used once. Type it into the browser extension popup, then click Pair there. Feat 1, NOT VERIFIED in a real browser yet.</small>
+  </section>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>File</th><th>Category</th><th>Status</th><th>Progress</th><th>Speed</th><th>Actions</th></tr></thead>
+    <tbody id="list"></tbody>
+  </table>
+  </div>
+  <p id="empty">No downloads yet. Paste a link above.</p>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

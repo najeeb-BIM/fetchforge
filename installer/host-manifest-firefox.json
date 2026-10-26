@@ -1,0 +1,1 @@
+{"allowed_extensions":["fetchforge@example.local"],"description":"FetchForge native messaging host","name":"com.fetchforge.bridge","path":"__BRIDGE_EXE_PATH__","type":"stdio"}

@@ -1,0 +1,18 @@
+[package]
+name = "fetchforge-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "FetchForge desktop app (Tauri shell around fetchforge-engine)"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+fetchforge-engine = { path = "../../../crates/engine" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1

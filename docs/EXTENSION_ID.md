@@ -64,3 +64,6 @@ Firefox does not derive its ID from a key. It uses the fixed ID in
 `fetchforge@example.local`. That string is chosen by the developer,
 not computed, and must match the ID in the Firefox host manifest's
 `allowed_extensions` (`installer/host-manifest-firefox.json`).
+Development only: this ID must be replaced with a proper permanent
+ID before any public release. Changing it after users install will
+break native messaging, because `allowed_extensions` must match.

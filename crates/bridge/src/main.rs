@@ -15,8 +15,8 @@
 //!   fetchforge-bridge print-token [--data-dir DIR]
 
 use fetchforge_engine::{
-    category_for_filename, download, generate_download_id, probe, sanitize_filename, stop_reason,
-    DownloadOptions, DownloadRecord, Status, Store,
+    category_for_filename, download, generate_download_id, generate_secure_token, probe,
+    sanitize_filename, stop_reason, DownloadOptions, DownloadRecord, Status, Store,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -365,17 +365,16 @@ struct AddRequest {
 }
 
 fn generate_token() -> String {
-    let mut bytes = [0u8; 16];
-    let filled = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .is_ok();
-    if !filled {
-        let seed = now_unix() ^ (std::process::id() as u64) << 32;
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = ((seed >> ((i % 8) * 8)) & 0xff) as u8 ^ (i as u8 * 37);
+    // F04: OS CSPRNG only, on every platform. No time/pid fallback.
+    // Refusing to start is safer than minting a predictable token.
+    match generate_secure_token() {
+        Ok(tok) => tok,
+        Err(e) => {
+            eprintln!("FetchForge bridge: cannot generate a secure token: {e}");
+            eprintln!("Refusing to start with a weak token.");
+            std::process::exit(1);
         }
     }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Host check (DNS-rebinding defence): the bridge only answers when the

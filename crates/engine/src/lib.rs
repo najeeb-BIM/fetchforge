@@ -15,6 +15,7 @@ pub mod id;
 pub mod media;
 pub mod pairing;
 pub mod state;
+pub mod token;
 pub mod validate;
 
 pub use category::category_for_filename;
@@ -23,4 +24,5 @@ pub use filename::{sanitize_filename, unique_path};
 pub use id::generate_download_id;
 pub use media::{download_dash, download_hls};
 pub use state::{DownloadRecord, Status, Store};
+pub use token::generate_secure_token;
 pub use validate::validate_url;

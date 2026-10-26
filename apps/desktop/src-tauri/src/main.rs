@@ -27,6 +27,69 @@ struct State {
     store: Mutex<Store>,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     download_dir: PathBuf,
+    data_dir: PathBuf,
+    /// F08: bridge child spawned on app launch, killed on app exit.
+    /// The bridge never keeps running after the app closes.
+    bridge_child: Mutex<Option<std::process::Child>>,
+}
+
+/// F08 (NOT VERIFIED on Windows): spawn the bridge in serve mode next
+/// to the app executable, so browser extensions can talk to it without
+/// the user running anything manually. If port 18443 is already taken,
+/// the bridge exits with its clear "could not bind" error (written to
+/// bridge.log in the data dir) and there is NO silent port fallback.
+/// If the bridge binary is missing, direct downloads in the app still
+/// work; only the extension bridge path is unavailable.
+fn spawn_bridge(data_dir: &PathBuf) -> Option<std::process::Child> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()));
+    let mut candidates = Vec::new();
+    if let Some(d) = exe_dir {
+        candidates.push(d.join("fetchforge-bridge.exe"));
+        candidates.push(d.join("fetchforge-bridge"));
+    }
+    let bridge_path = candidates.into_iter().find(|c| c.exists());
+    let bridge_path = match bridge_path {
+        Some(p) => p,
+        None => {
+            eprintln!("FetchForge: bridge binary not found next to the app. Browser extension bridge path will not work; direct downloads in the app still work.");
+            return None;
+        }
+    };
+    let log_path = data_dir.join("bridge.log");
+    let log_file = std::fs::File::create(&log_path).ok();
+    let mut cmd = std::process::Command::new(&bridge_path);
+    cmd.arg("serve")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--port")
+        .arg("18443");
+    if let Some(f) = log_file {
+        cmd.stderr(f);
+    }
+    match cmd.spawn() {
+        Ok(child) => Some(child),
+        Err(e) => {
+            eprintln!("FetchForge: could not start the bridge ({e}). Browser extension bridge path will not work; direct downloads in the app still work.");
+            None
+        }
+    }
+}
+
+#[tauri::command]
+fn bridge_status(state: tauri::State<Arc<State>>) -> String {
+    let mut guard = state.bridge_child.lock().unwrap();
+    match guard.as_mut() {
+        None => "Bridge not found next to the app. Browser extension bridge path will not work; direct downloads in the app still work.".to_string(),
+        Some(child) => match child.try_wait() {
+            Ok(None) => "running".to_string(),
+            Ok(Some(status)) => format!(
+                "Bridge stopped (exit {status}). Port 18443 may already be in use, or the bridge failed to start. See bridge.log in the FetchForge data folder. The bridge does not fall back to another port."
+            ),
+            Err(e) => format!("Bridge status unknown ({e})."),
+        },
+    }
 }
 
 fn now_unix() -> u64 {
@@ -265,20 +328,34 @@ fn main() {
     }
     store.recover_interrupted();
     let _ = store.save();
+    let bridge_child = spawn_bridge(&dir);
     let state = Arc::new(State {
         store: Mutex::new(store),
         jobs: Mutex::new(HashMap::new()),
         download_dir: download_dir(),
+        data_dir: dir,
+        bridge_child: Mutex::new(bridge_child),
     });
-    tauri::Builder::default()
+    let state_for_exit = Arc::clone(&state);
+    let app = tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             list_downloads,
             add_download,
             pause_download,
             resume_download,
-            cancel_download
+            cancel_download,
+            bridge_status
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running FetchForge");
+        .build(tauri::generate_context!())
+        .expect("error while building FetchForge");
+    // F08: kill the bridge on app exit, so it never outlives the app.
+    app.run(|_app, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(mut child) = state_for_exit.bridge_child.lock().unwrap().take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    });
 }

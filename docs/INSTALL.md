@@ -8,8 +8,19 @@
    and registers the native-messaging host for Chrome, Edge, and
    Firefox (per-user registry keys under HKCU).
 3. Launch FetchForge. First run creates `%LOCALAPPDATA%\FetchForge`
-   (settings, download history, bridge token) and starts the bridge
-   on `127.0.0.1:18443`.
+   (settings, download history, bridge token) and the app starts the
+   bridge on `127.0.0.1:18443` automatically. The bridge stops when
+   you close the app; it does not keep running after the app closes.
+   If port 18443 is already taken, the bridge exits with a clear
+   "could not bind" error (see `bridge.log` in
+   `%LOCALAPPDATA%\FetchForge`, and the app status bar) and there is
+   no silent fallback to another port. Close the other program using
+   18443, then relaunch FetchForge.
+   Note (F08, NOT VERIFIED): the Tauri autostart code has not yet
+   been compiled or run on Windows; until the Windows build runs,
+   treat this step as unproven and, if the extension says the bridge
+   is not reachable, run `fetchforge-bridge.exe serve` manually from
+   the install folder as a workaround.
 4. Downloads go to `%USERPROFILE%\Downloads\<Category>\` by default.
 
 If Windows SmartScreen warns, that is because v0.1.0 is unsigned

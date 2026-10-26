@@ -87,3 +87,10 @@ document.getElementById("addBtn").onclick = async () => {
   catch (e) { setStatus("Could not add download: " + e.message); }
 };
 refresh(); setInterval(refresh, 2000);
+// F08: in Tauri mode, show a clear error if the bridge did not start
+// (for example, port 18443 already taken). No silent port fallback.
+if (isTauri) {
+  window.__TAURI__.core.invoke("bridge_status").then((s) => {
+    if (s !== "running") setStatus("Bridge: " + s);
+  }).catch(() => {});
+}

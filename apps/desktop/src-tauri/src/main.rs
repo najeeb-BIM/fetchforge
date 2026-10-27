@@ -169,6 +169,24 @@ fn add_download(
             return Ok(rec);
         }
     };
+    // Same idempotent-add rule as the bridge: an already-active job for
+    // the same URL + filename is returned, never duplicated (two workers
+    // would share one .part path and corrupt each other). This check
+    // runs before `clean` is moved into the new record below, so the
+    // same value is never used after a move (E0382 fix).
+    {
+        let store = state.store.lock().unwrap();
+        for existing in store.all() {
+            if existing.url == clean
+                && existing.filename == filename
+                && existing.destination == state.download_dir.to_string_lossy().to_string()
+                && (existing.status == Status::Queued
+                    || existing.status == Status::Downloading)
+            {
+                return Ok(existing.clone());
+            }
+        }
+    }
     let id = generate_download_id();
     let rec = DownloadRecord {
         id: id.clone(),
@@ -184,21 +202,8 @@ fn add_download(
         created_unix: now_unix(),
         updated_unix: now_unix(),
     };
-    // Same idempotent-add rule as the bridge: an already-active job for
-    // the same URL + filename is returned, never duplicated (two workers
-    // would share one .part path and corrupt each other).
     {
         let mut store = state.store.lock().unwrap();
-        for existing in store.all() {
-            if existing.url == clean
-                && existing.filename == filename
-                && existing.destination == state.download_dir.to_string_lossy().to_string()
-                && (existing.status == Status::Queued
-                    || existing.status == Status::Downloading)
-            {
-                return Ok(existing.clone());
-            }
-        }
         store.upsert(rec.clone());
         let _ = store.save();
     }

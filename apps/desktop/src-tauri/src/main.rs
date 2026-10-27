@@ -329,7 +329,12 @@ fn cancel_download(state: tauri::State<Arc<State>>, id: String) {
 /// loopback with plain TcpStream, so no new dependency is needed.
 /// The token is read from the app's own data dir, never shown in the
 /// UI and never sent anywhere except 127.0.0.1:18443.
-fn bridge_post(data_dir: &PathBuf, token: &str, path: &str) -> Result<String, String> {
+// bridge_post's data_dir is intentionally unused: callers already read
+// the token from data_dir via read_bridge_token, and the port is fixed
+// at 127.0.0.1:18443 (the same port spawn_bridge uses), so there is no
+// port or token left to look up here. Renamed to _data_dir to silence
+// the warning, not a logic bug. Callers still pass &state.data_dir.
+fn bridge_post(_data_dir: &PathBuf, token: &str, path: &str) -> Result<String, String> {
     use std::net::TcpStream;
     let mut stream = TcpStream::connect("127.0.0.1:18443")
         .map_err(|e| format!("Bridge not reachable ({e}). Is FetchForge running?"))?;

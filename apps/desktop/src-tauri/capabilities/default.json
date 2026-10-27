@@ -1,0 +1,1 @@
+{"$schema":"https://schema.tauri.app/config/2/capability","description":"Minimal Tauri v2 capability: default core permissions for the main window. No plugin permissions (no fs, shell, dialog, or notification access) are granted; the frontend only invokes the app's own Rust commands.","identifier":"default","permissions":["core:default"],"windows":["main"]}

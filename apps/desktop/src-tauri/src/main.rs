@@ -169,6 +169,24 @@ fn add_download(
             return Ok(rec);
         }
     };
+    // Same idempotent-add rule as the bridge: an already-active job for
+    // the same URL + filename is returned, never duplicated (two workers
+    // would share one .part path and corrupt each other). This check
+    // runs before `clean` is moved into the new record below, so the
+    // same value is never used after a move (E0382 fix).
+    {
+        let store = state.store.lock().unwrap();
+        for existing in store.all() {
+            if existing.url == clean
+                && existing.filename == filename
+                && existing.destination == state.download_dir.to_string_lossy().to_string()
+                && (existing.status == Status::Queued
+                    || existing.status == Status::Downloading)
+            {
+                return Ok(existing.clone());
+            }
+        }
+    }
     let id = generate_download_id();
     let rec = DownloadRecord {
         id: id.clone(),
@@ -184,21 +202,8 @@ fn add_download(
         created_unix: now_unix(),
         updated_unix: now_unix(),
     };
-    // Same idempotent-add rule as the bridge: an already-active job for
-    // the same URL + filename is returned, never duplicated (two workers
-    // would share one .part path and corrupt each other).
     {
         let mut store = state.store.lock().unwrap();
-        for existing in store.all() {
-            if existing.url == clean
-                && existing.filename == filename
-                && existing.destination == state.download_dir.to_string_lossy().to_string()
-                && (existing.status == Status::Queued
-                    || existing.status == Status::Downloading)
-            {
-                return Ok(existing.clone());
-            }
-        }
         store.upsert(rec.clone());
         let _ = store.save();
     }
@@ -324,7 +329,12 @@ fn cancel_download(state: tauri::State<Arc<State>>, id: String) {
 /// loopback with plain TcpStream, so no new dependency is needed.
 /// The token is read from the app's own data dir, never shown in the
 /// UI and never sent anywhere except 127.0.0.1:18443.
-fn bridge_post(data_dir: &PathBuf, token: &str, path: &str) -> Result<String, String> {
+// bridge_post's data_dir is intentionally unused: callers already read
+// the token from data_dir via read_bridge_token, and the port is fixed
+// at 127.0.0.1:18443 (the same port spawn_bridge uses), so there is no
+// port or token left to look up here. Renamed to _data_dir to silence
+// the warning, not a logic bug. Callers still pass &state.data_dir.
+fn bridge_post(_data_dir: &PathBuf, token: &str, path: &str) -> Result<String, String> {
     use std::net::TcpStream;
     let mut stream = TcpStream::connect("127.0.0.1:18443")
         .map_err(|e| format!("Bridge not reachable ({e}). Is FetchForge running?"))?;

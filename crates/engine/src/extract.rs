@@ -591,6 +591,15 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
                         true,
                     ),
                 };
+            // Plausibility: some extractors report nonsense sizes
+            // (Google Drive's transcodes report ~2.9 KB for a whole
+            // video). A real stream carries far more than 1 KB/s, so
+            // a size below duration * 1 KB/s is dropped and shown as
+            // unknown rather than misleading the picker.
+            let filesize = match (filesize, duration_secs) {
+                (Some(s), Some(d)) if d > 0 && s < d.saturating_mul(1000) => None,
+                (s, _) => s,
+            };
             let needs_merge = kind == FormatKind::VideoOnly;
             let label = format_label(
                 format_id,
@@ -739,12 +748,30 @@ fn pick_default_format(formats: &[MediaFormat], extractor: &str) -> Option<Strin
 }
 
 /// The yt-dlp `-f` selector for a chosen format. A video-only format
-/// is paired with the best audio stream (`<id>+bestaudio`); the
-/// `/<id>` fallback keeps the video alone if the page has no audio
-/// stream at all, instead of failing the whole download.
+/// is paired with the best audio stream in the SAME container when
+/// one exists (m4a for mp4 video, webm for webm video) so the merge
+/// stays in the video's container: plain `bestaudio` on YouTube is
+/// usually opus (webm), which forces an mp4 video to merge into an
+/// .mkv file — surprising on Windows, where mp4 plays everywhere.
+/// The chain falls back to any audio, then (`/<id>`) to the video
+/// alone if the page has no audio stream at all.
 pub fn format_selector(format: &MediaFormat) -> String {
     match format.kind {
-        FormatKind::VideoOnly => format!("{}+bestaudio/{}", format.format_id, format.format_id),
+        FormatKind::VideoOnly => {
+            let compat = match format.ext.as_str() {
+                "mp4" => "m4a",
+                "webm" => "webm",
+                _ => "",
+            };
+            if compat.is_empty() {
+                format!("{}+bestaudio/{}", format.format_id, format.format_id)
+            } else {
+                format!(
+                    "{}+bestaudio[ext={}]/{}+bestaudio/{}",
+                    format.format_id, compat, format.format_id, format.format_id
+                )
+            }
+        }
         _ => format.format_id.clone(),
     }
 }
@@ -930,6 +957,10 @@ pub struct MediaPlan {
     pub format_id: String,
     pub format_label: String,
     pub needs_merge: bool,
+    /// Full yt-dlp `-f` selector for the chosen format, from
+    /// [`format_selector`] — container-aware, so a merge stays in
+    /// the video's container when possible.
+    pub selector: String,
 }
 
 fn stem_for_title(title: &str) -> String {
@@ -1024,6 +1055,7 @@ fn plan_from_info(
         format_id: chosen.format_id.clone(),
         format_label: chosen.label.clone(),
         needs_merge: chosen.needs_merge,
+        selector: format_selector(chosen),
     })
 }
 
@@ -1068,7 +1100,11 @@ pub fn drive_direct_url(file_id: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct MediaDownloadOptions {
     pub url: String,
-    pub format_id: String,
+    /// Full yt-dlp `-f` selector, computed at plan time by
+    /// [`format_selector`] and stored on the record — the download
+    /// path must not rebuild it from the bare format id, or the
+    /// container-aware audio choice is lost.
+    pub selector: String,
     pub needs_merge: bool,
     pub destination_dir: PathBuf,
     /// Filename stem (no extension); the container comes from yt-dlp.
@@ -1247,11 +1283,7 @@ pub fn download_media_with(
         "{}.%(ext)s",
         escape_template(&dir.join(&unique_stem).to_string_lossy())
     );
-    let selector = if opts.needs_merge {
-        format!("{}+bestaudio/{}", opts.format_id, opts.format_id)
-    } else {
-        opts.format_id.clone()
-    };
+    let selector = opts.selector.clone();
     let mut cmd = Command::new(ytdlp);
     cmd.args(["--no-playlist", "--no-warnings", "--progress", "--newline"])
         .arg("--socket-timeout")
@@ -1346,6 +1378,16 @@ pub fn download_media_with(
     // Bounded joins: a killed yt-dlp can leave an ffmpeg grandchild
     // holding the pipes open (see join_reader).
     let _ = join_reader(stdout_thread, Duration::from_secs(2));
+    // Drain lines the reader forwarded after the child was reaped: a
+    // fast child can exit before its last lines (the 100% progress
+    // line, the final filepath) reach the channel, so draining only
+    // inside the loop above loses them intermittently.
+    while let Ok(line) = line_rx.try_recv() {
+        if let Some((pct, total, speed)) = parse_progress_line(&line) {
+            progress(tracker.feed(pct, total, speed));
+        }
+        stdout_lines.push(line);
+    }
     let stderr_text = join_reader(stderr_thread, Duration::from_secs(2)).unwrap_or_default();
     if let Some(reason) = stop {
         match reason {
@@ -1532,6 +1574,31 @@ mod tests {
     }
 
     #[test]
+    fn implausible_filesizes_are_dropped() {
+        // Google Drive reports ~2.9 KB for whole-video transcodes.
+        // With a 5 s duration, that is below the 1 KB/s floor and
+        // must be shown as unknown, not as "2.8 KB".
+        let v = serde_json::json!({
+            "title": "Sample",
+            "extractor": "GoogleDrive",
+            "duration": 5,
+            "formats": [
+                {"format_id": "22", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a",
+                 "height": 720, "filesize": 2899},
+                {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a",
+                 "abr": 128.0, "filesize": 88033}
+            ]
+        });
+        let info = parse_media_info(&v, "https://example.com").unwrap();
+        let f22 = info.formats.iter().find(|f| f.format_id == "22").unwrap();
+        assert_eq!(f22.filesize, None);
+        assert!(!f22.label.contains("KB"), "label: {}", f22.label);
+        // The plausible audio size survives (88,033 > 5,000).
+        let f140 = info.formats.iter().find(|f| f.format_id == "140").unwrap();
+        assert_eq!(f140.filesize, Some(88033));
+    }
+
+    #[test]
     fn all_drm_formats_are_refused_plainly() {
         let v = serde_json::json!({
             "title": "Protected",
@@ -1562,7 +1629,18 @@ mod tests {
     fn format_selector_pairs_video_only_with_best_audio() {
         let info = parse_media_info(&youtube_json(), "https://example.com").unwrap();
         let video = info.formats.iter().find(|f| f.format_id == "137").unwrap();
-        assert_eq!(format_selector(video), "137+bestaudio/137");
+        // mp4 video prefers m4a audio so the merge stays mp4 (plain
+        // bestaudio would be opus and force an .mkv), then any
+        // audio, then the video alone.
+        assert_eq!(
+            format_selector(video),
+            "137+bestaudio[ext=m4a]/137+bestaudio/137"
+        );
+        let webm = info.formats.iter().find(|f| f.format_id == "313").unwrap();
+        assert_eq!(
+            format_selector(webm),
+            "313+bestaudio[ext=webm]/313+bestaudio/313"
+        );
         let combined = info.formats.iter().find(|f| f.format_id == "22").unwrap();
         assert_eq!(format_selector(combined), "22");
         let audio = info.formats.iter().find(|f| f.format_id == "140").unwrap();
@@ -1577,6 +1655,10 @@ mod tests {
         let plan = plan_from_info(&info, Some("137"), None).unwrap();
         assert_eq!(plan.format_id, "137");
         assert!(plan.needs_merge);
+        // The plan carries the full container-aware selector, so the
+        // download path cannot lose it (a plain 137+bestaudio would
+        // merge to .mkv via opus audio).
+        assert_eq!(plan.selector, "137+bestaudio[ext=m4a]/137+bestaudio/137");
         assert_eq!(plan.total_bytes, Some(200_000_000 + 12_000_000));
         assert!(plan.filename.ends_with(".mp4"), "filename: {}", plan.filename);
         assert!(plan.filename.starts_with("Big Buck Bunny"), "filename: {}", plan.filename);
@@ -1797,7 +1879,7 @@ exit 0
         );
         let opts = MediaDownloadOptions {
             url: "https://www.youtube.com/watch?v=aqz-KE-bpKQ".to_string(),
-            format_id: "22".to_string(),
+            selector: "22".to_string(),
             needs_merge: false,
             destination_dir: dir.clone(),
             filename_stem: "Big Buck Bunny".to_string(),
@@ -1842,7 +1924,7 @@ exit 0
         );
         let opts = MediaDownloadOptions {
             url: "https://www.youtube.com/watch?v=aqz-KE-bpKQ".to_string(),
-            format_id: "22".to_string(),
+            selector: "22".to_string(),
             needs_merge: false,
             destination_dir: dir.clone(),
             filename_stem: "Slow Video".to_string(),
@@ -1879,7 +1961,7 @@ exit 0
         let stub = write_stub_ytdlp(&dir, "fake-yt-dlp", "#!/bin/sh\nexit 0\n");
         let opts = MediaDownloadOptions {
             url: "https://www.youtube.com/watch?v=aqz-KE-bpKQ".to_string(),
-            format_id: "137".to_string(),
+            selector: "137".to_string(),
             needs_merge: true,
             destination_dir: dir.clone(),
             filename_stem: "Video".to_string(),
@@ -1946,5 +2028,53 @@ exit 0
             sha256_file(&p).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// One-shot loopback HTTP server for download tests: serves `body`
+    /// once (plain HTTP, no TLS), then exits. Returns the URL.
+    fn serve_once(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}/tool.bin"), handle)
+    }
+
+    #[test]
+    fn download_verified_accepts_matching_hash_rejects_mismatch() {
+        let dir = std::env::temp_dir().join("fetchforge-test-dl-verified");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = b"fake-tool-binary-content".to_vec();
+        let mut h = Sha256::new();
+        h.update(&body);
+        let good_hash = to_hex(&h.finalize());
+        // Matching hash: file lands, temp file gone.
+        let (url, handle) = serve_once(body.clone());
+        let dest = dir.join("tool.bin");
+        download_verified(&url, &good_hash, &dest, "test tool").unwrap();
+        handle.join().unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert!(!dir.join("tool.tmp").exists());
+        // Mismatching hash: error, nothing left behind (no dest, no tmp).
+        let (url, handle) = serve_once(body);
+        let dest2 = dir.join("tool2.bin");
+        let err = download_verified(&url, &"0".repeat(64), &dest2, "test tool").unwrap_err();
+        handle.join().unwrap();
+        assert!(err.contains("did not match"), "error: {err}");
+        assert!(!dest2.exists());
+        assert!(!dir.join("tool2.tmp").exists());
     }
 }

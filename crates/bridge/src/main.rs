@@ -335,6 +335,7 @@ impl App {
                     updated_unix: now_unix(),
                     format_id: None,
                     needs_merge: false,
+                    format_selector: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -404,6 +405,7 @@ impl App {
                     updated_unix: now_unix(),
                     format_id: None,
                     needs_merge: false,
+                    format_selector: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -457,6 +459,7 @@ impl App {
                 updated_unix: now_unix(),
                 format_id: Some(plan.format_id),
                 needs_merge: plan.needs_merge,
+                format_selector: Some(plan.selector),
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -509,6 +512,7 @@ impl App {
                 updated_unix: now_unix(),
                 format_id: None,
                 needs_merge: false,
+                format_selector: None,
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -635,9 +639,20 @@ impl App {
             .extension()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "mp4".to_string());
+        // The selector was computed at plan time and stored on the
+        // record; rebuild a plain one only for records written
+        // before the field existed.
+        let format_id = rec.format_id.clone().unwrap_or_default();
+        let selector = rec.format_selector.clone().unwrap_or_else(|| {
+            if rec.needs_merge {
+                format!("{format_id}+bestaudio/{format_id}")
+            } else {
+                format_id.clone()
+            }
+        });
         let opts = MediaDownloadOptions {
             url: rec.url.clone(),
-            format_id: rec.format_id.clone().unwrap_or_default(),
+            selector,
             needs_merge: rec.needs_merge,
             destination_dir: PathBuf::from(&self.settings.download_dir),
             filename_stem: stem,

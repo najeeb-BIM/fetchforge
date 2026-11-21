@@ -224,6 +224,7 @@ fn failed_record(
         updated_unix: now_unix(),
         format_id: None,
         needs_merge: false,
+        format_selector: None,
     };
     state.store.lock().unwrap().upsert(rec.clone());
     let _ = state.store.lock().unwrap().save();
@@ -321,6 +322,7 @@ fn try_media_download(
         updated_unix: now_unix(),
         format_id: Some(plan.format_id),
         needs_merge: plan.needs_merge,
+        format_selector: Some(plan.selector),
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -374,6 +376,7 @@ fn queue_direct_download(
         updated_unix: now_unix(),
         format_id: None,
         needs_merge: false,
+        format_selector: None,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -503,9 +506,20 @@ fn run_media_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
         .extension()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "mp4".to_string());
+    // The selector was computed at plan time and stored on the
+    // record; rebuild a plain one only for records written before
+    // the field existed.
+    let format_id = rec.format_id.clone().unwrap_or_default();
+    let selector = rec.format_selector.clone().unwrap_or_else(|| {
+        if rec.needs_merge {
+            format!("{format_id}+bestaudio/{format_id}")
+        } else {
+            format_id.clone()
+        }
+    });
     let opts = MediaDownloadOptions {
         url: rec.url.clone(),
-        format_id: rec.format_id.clone().unwrap_or_default(),
+        selector,
         needs_merge: rec.needs_merge,
         destination_dir: state.download_dir.clone(),
         filename_stem: stem,

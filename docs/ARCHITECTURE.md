@@ -24,7 +24,11 @@ popularity:
   bridge preview mode.
 - **reqwest (blocking, rustls)** — rustls avoids an OpenSSL dependency
   on Windows. Blocking + threads keeps the engine simple and avoids a
-  tokio runtime in the download path.
+  tokio runtime in the download path. The `system-proxy` feature is
+  enabled (it is a reqwest default, dropped by `default-features =
+  false` until v0.2.0), so downloads honour the OS proxy settings;
+  TLS roots stay the pinned Mozilla set (webpki), so a TLS-intercepting
+  proxy is refused rather than trusted — see `docs/SECURITY.md`.
 - **NSIS 3** per-user installer, no admin. The Tauri bundle config also
   targets NSIS, but `installer/fetchforge.nsi` is the canonical
   installer because it also registers the native-messaging hosts and

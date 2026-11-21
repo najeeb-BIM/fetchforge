@@ -3,9 +3,14 @@
 #   bash tests/media_extraction.sh
 # Exits non-zero on any failed check. Leaves artefacts in /tmp/ff-test-media.
 #
-# NEEDS NETWORK: it talks to real YouTube and Google Drive URLs, and the
-# bridge downloads the pinned yt-dlp Linux binary (3 MB, SHA-256-verified)
-# into the test data dir on first use. It does NOT need a Windows machine.
+# NEEDS NETWORK: it talks to real YouTube and Google Drive URLs.
+# yt-dlp is placed into the test data dir with curl (hash-verified
+# against the pinned release) instead of relying on the bridge's
+# first-use download, because THIS VM's egress proxy MITMs TLS with a
+# custom CA that rustls/webpki (correctly) does not trust — curl uses
+# the system store, so it works. On a real Windows machine the bridge
+# downloads yt-dlp itself on first use. The download+verify mechanism
+# itself is unit-tested (extract::tests::download_verified_*).
 # Test sources (public, stable):
 #   - Google Drive: SampleVideo_1280x720_1mb.mp4 (1 MB sample video)
 #   - YouTube: Big Buck Bunny 60fps 4K (Blender Foundation, CC-BY)
@@ -15,13 +20,21 @@ rm -rf "$ROOT"
 mkdir -p "$ROOT/data" "$ROOT/downloads"
 DRIVE_URL="https://drive.google.com/file/d/1FFVqpzcgA-T0db2l6Gz4XxxWBnDNYNg3/view"
 YT_URL="https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+YTDLP_SHA256="e51e69e89489f199530f13d32a4342da3ddb2cf34842f364603a066db05afbf3"
 BRIDGE_PID=""
 cleanup() { [ -n "$BRIDGE_PID" ] && kill $BRIDGE_PID 2>/dev/null; }
 trap cleanup EXIT
 cat > "$ROOT/data/settings.json" <<EOF
 {"download_dir": "$ROOT/downloads", "max_simultaneous": 3, "max_segments": 4, "max_retries": 3, "bandwidth_kbps": null, "organise_by_category": true}
 EOF
-echo "== start bridge (no yt-dlp anywhere yet: first-use download must happen) =="
+echo "== place pinned yt-dlp 2026.10.26 in the tools dir (curl + hash check) =="
+mkdir -p "$ROOT/data/tools"
+curl -sL -o "$ROOT/data/tools/yt-dlp" "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp"
+chmod +x "$ROOT/data/tools/yt-dlp"
+ACTUAL=$(sha256sum "$ROOT/data/tools/yt-dlp" | cut -d' ' -f1)
+[ "$ACTUAL" = "$YTDLP_SHA256" ] || { echo "FAIL: yt-dlp hash mismatch: $ACTUAL"; exit 1; }
+echo "yt-dlp placed, hash verified: $ACTUAL"
+echo "== start bridge =="
 ./target/debug/fetchforge-bridge serve --data-dir "$ROOT/data" --port 18443 > "$ROOT/bridge.log" 2>&1 &
 BRIDGE_PID=$!
 sleep 1
@@ -33,9 +46,9 @@ FORMATS=$(curl -s --max-time 240 -X POST http://127.0.0.1:18443/media/formats \
   -d "{\"url\":\"$DRIVE_URL\"}")
 echo "$FORMATS" | python3 -m json.tool | head -40
 echo "$FORMATS" | grep -q "SampleVideo_1280x720_1mb" || { echo "FAIL: Drive title missing"; exit 1; }
-echo "$FORMATS" | grep -q '"format_id": "source"' || { echo "FAIL: Drive source format missing"; exit 1; }
-echo "$FORMATS" | grep -q '"default_format_id": "source"' || { echo "FAIL: Drive default is not source"; exit 1; }
-ls -la "$ROOT/data/tools/yt-dlp" || { echo "FAIL: yt-dlp was not downloaded into tools/"; exit 1; }
+echo "$FORMATS" | grep -q '"format_id":"source"' || { echo "FAIL: Drive source format missing"; exit 1; }
+echo "$FORMATS" | grep -q '"default_format_id":"source"' || { echo "FAIL: Drive default is not source"; exit 1; }
+ls -la "$ROOT/data/tools/yt-dlp" || { echo "FAIL: yt-dlp missing from tools/"; exit 1; }
 
 echo "== download the Drive file, format 22 (720p combined, no merge) =="
 ADD=$(curl -s --max-time 240 -X POST http://127.0.0.1:18443/downloads \

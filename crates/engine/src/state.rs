@@ -43,6 +43,15 @@ pub struct DownloadRecord {
     /// ffmpeg). Stored so a resume does not have to re-extract the page.
     #[serde(default)]
     pub needs_merge: bool,
+    /// Media downloads only: the full yt-dlp `-f` selector computed
+    /// at plan time (e.g. `160+bestaudio[ext=m4a]/160+bestaudio/160`
+    /// — the audio is chosen to match the video's container, so a
+    /// merge stays mp4 instead of falling back to mkv). Stored so a
+    /// resume re-runs the exact same selector. None for direct
+    /// downloads, and for media records written before this field
+    /// existed (the worker then rebuilds a plain selector).
+    #[serde(default)]
+    pub format_selector: Option<String>,
 }
 
 pub struct Store {
@@ -330,6 +339,7 @@ mod tests {
             updated_unix: now,
             format_id: None,
             needs_merge: false,
+            format_selector: None,
         });
         s.save().unwrap();
         let mut s2 = Store::load(path);
@@ -353,6 +363,7 @@ mod tests {
             updated_unix: 1_700_000_000,
             format_id: None,
             needs_merge: false,
+            format_selector: None,
         }
     }
 

@@ -31,6 +31,18 @@ pub struct DownloadRecord {
     pub error: Option<String>,
     pub created_unix: u64,
     pub updated_unix: u64,
+    /// Media downloads only: the yt-dlp format id chosen for this
+    /// download (user-picked in the format picker, or the recorded
+    /// auto-picked default for extension-sent URLs). None means a
+    /// direct file download. `#[serde(default)]` so history files
+    /// written before v0.2.0 still load.
+    #[serde(default)]
+    pub format_id: Option<String>,
+    /// Media downloads only: true when the chosen format is video-only
+    /// and the download merges it with the best audio stream (needs
+    /// ffmpeg). Stored so a resume does not have to re-extract the page.
+    #[serde(default)]
+    pub needs_merge: bool,
 }
 
 pub struct Store {
@@ -316,6 +328,8 @@ mod tests {
             error: None,
             created_unix: now,
             updated_unix: now,
+            format_id: None,
+            needs_merge: false,
         });
         s.save().unwrap();
         let mut s2 = Store::load(path);
@@ -337,6 +351,8 @@ mod tests {
             error: None,
             created_unix: 1_700_000_000,
             updated_unix: 1_700_000_000,
+            format_id: None,
+            needs_merge: false,
         }
     }
 

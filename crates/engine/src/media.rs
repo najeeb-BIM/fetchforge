@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicBool;
 
 fn fetch_text(url: &str, referer: &Option<String>) -> Result<String, String> {
     let c = reqwest::blocking::Client::builder()
-        .user_agent("FetchForge/0.1")
+        .user_agent("FetchForge/0.2")
         .timeout(std::time::Duration::from_secs(60))
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
@@ -120,7 +120,7 @@ pub fn download_hls(
 
 fn fetch_bytes(url: &str, referer: &Option<String>) -> Result<Vec<u8>, String> {
     let c = reqwest::blocking::Client::builder()
-        .user_agent("FetchForge/0.1")
+        .user_agent("FetchForge/0.2")
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;

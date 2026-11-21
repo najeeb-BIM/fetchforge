@@ -13,5 +13,9 @@ sha2 = "0.10"
 hmac = "0.12"
 getrandom = "0.2"
 url = "2"
+# Extracting bin/ffmpeg.exe from the pinned gyan.dev essentials zip
+# (first-use ffmpeg provisioning). Deflate only: the gyan zip uses
+# deflate, and the other codecs would only bloat the binary.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]

@@ -147,7 +147,7 @@ fn client(opts: &DownloadOptions) -> Result<Client, String> {
         .user_agent(
             opts.user_agent
                 .clone()
-                .unwrap_or_else(|| "FetchForge/0.1".to_string()),
+                .unwrap_or_else(|| "FetchForge/0.2".to_string()),
         )
         .timeout(Duration::from_secs(120))
         .connect_timeout(Duration::from_secs(30))

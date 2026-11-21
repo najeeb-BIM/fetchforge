@@ -1680,21 +1680,48 @@ mod tests {
         }
     }
 
-    fn write_stub_ytdlp(dir: &Path, name: &str, script: &str) -> PathBuf {
-        let path = dir.join(name);
-        // Write + sync + close before the stub is ever executed: on
-        // some filesystems an exec immediately after a write can hit
-        // ETXTBSY ("Text file busy") if the write is still in flight.
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(script.as_bytes()).unwrap();
-        f.sync_all().unwrap();
-        drop(f);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    /// Write a stub yt-dlp the production code can spawn, on either OS.
+    ///
+    /// Windows cannot execute a `#!/bin/sh` script: `CreateProcess` has
+    /// no shebang support, so the extensionless shell stub fails to spawn
+    /// and every test using it fails on the Windows runner (the v0.2.0
+    /// build's "Run tests" step failed exactly this way). On Windows the
+    /// stub is therefore a `.bat` wrapper — `Command::new` runs `.bat`
+    /// files via `cmd.exe` (std documents this) and std's batch escaping
+    /// passes `%` in arguments through untouched, so the `%(ext)s`
+    /// output template survives — that forwards its arguments to an
+    /// adjacent PowerShell script holding the real stub logic.
+    /// PowerShell 5.1 ships with Windows, and `-ExecutionPolicy Bypass`
+    /// sidesteps any machine policy.
+    fn write_stub_ytdlp(dir: &Path, name: &str, sh_script: &str, ps_script: &str) -> PathBuf {
+        if cfg!(windows) {
+            let bat_path = dir.join(format!("{name}.bat"));
+            let ps_path = dir.join(format!("{name}.ps1"));
+            std::fs::write(&ps_path, ps_script).unwrap();
+            std::fs::write(
+                &bat_path,
+                format!(
+                    "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"%~dp0{name}.ps1\" %*\r\nexit /b %ERRORLEVEL%\r\n"
+                ),
+            )
+            .unwrap();
+            bat_path
+        } else {
+            let path = dir.join(name);
+            // Write + sync + close before the stub is ever executed: on
+            // some filesystems an exec immediately after a write can hit
+            // ETXTBSY ("Text file busy") if the write is still in flight.
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(sh_script.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+            drop(f);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
         }
-        path
     }
 
     /// Per-process unique temp dir: the cancel test orphans a `sleep`
@@ -1722,6 +1749,10 @@ mod tests {
                 "#!/bin/sh\ncat \"{}\"\n",
                 json_path.to_string_lossy().replace('\\', "\\\\")
             ),
+            &format!(
+                "[Console]::Out.Write([IO.File]::ReadAllText('{}'))\n",
+                json_path.to_string_lossy().replace('\'', "''")
+            ),
         );
         let info = list_formats_with(&stub, "https://www.youtube.com/watch?v=aqz-KE-bpKQ").unwrap();
         assert_eq!(info.formats.len(), 6);
@@ -1737,6 +1768,7 @@ mod tests {
             &dir,
             "fake-yt-dlp",
             "#!/bin/sh\necho 'ERROR: [youtube] abc: Private video' >&2\nexit 1\n",
+            "[Console]::Error.WriteLine('ERROR: [youtube] abc: Private video')\nexit 1\n",
         );
         let err = list_formats_with(&stub, "https://www.youtube.com/watch?v=abc").unwrap_err();
         assert!(err.contains("private"), "error: {err}");
@@ -1763,6 +1795,20 @@ echo "[download] 100.0% of  10.00KiB at  100.00KiB/s ETA 00:00"
 echo "[download] 100% of  10.00KiB in 00:00:01 at 100.00KiB/s"
 printf 'FAKE-VIDEO-DATA' > "$out"
 echo "$out"
+exit 0
+"#,
+            r#"$template = $null
+$prev = $null
+foreach ($a in $args) {
+  if ($prev -eq '-o') { $template = $a }
+  $prev = $a
+}
+$out = $template.Replace('%(ext)s', 'mp4')
+Write-Output '[download]  50.0% of  10.00KiB at  100.00KiB/s ETA 00:00'
+Write-Output '[download] 100.0% of  10.00KiB at  100.00KiB/s ETA 00:00'
+Write-Output '[download] 100% of  10.00KiB in 00:00:01 at 100.00KiB/s'
+[IO.File]::WriteAllText($out, 'FAKE-VIDEO-DATA')
+Write-Output $out
 exit 0
 "#,
         );
@@ -1810,6 +1856,7 @@ exit 0
             &dir,
             "fake-yt-dlp",
             "#!/bin/sh\nsleep 60\nexit 0\n",
+            "Start-Sleep -Seconds 60\nexit 0\n",
         );
         let opts = MediaDownloadOptions {
             url: "https://www.youtube.com/watch?v=aqz-KE-bpKQ".to_string(),
@@ -1847,7 +1894,7 @@ exit 0
         let dir = std::env::temp_dir().join("fetchforge-test-no-ffmpeg");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let stub = write_stub_ytdlp(&dir, "fake-yt-dlp", "#!/bin/sh\nexit 0\n");
+        let stub = write_stub_ytdlp(&dir, "fake-yt-dlp", "#!/bin/sh\nexit 0\n", "exit 0\n");
         let opts = MediaDownloadOptions {
             url: "https://www.youtube.com/watch?v=aqz-KE-bpKQ".to_string(),
             selector: "137".to_string(),

@@ -28,7 +28,7 @@
       <option value="paused">Paused</option>
     </select>
     <button id="refreshBtn">Refresh</button>
-    <span id="status"></span>
+    <span id="status">Starting...</span>
   </section>
   <section id="tokenBox" class="token-box" hidden>
     <label>Bridge token (for browser extension setup):
@@ -55,6 +55,7 @@
   </div>
   <p id="empty">No downloads yet. Paste a link above.</p>
 </main>
+<script>document.getElementById("status").textContent="INLINE JS WORKS";</script>
 <script src="app.js"></script>
 </body>
 </html>

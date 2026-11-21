@@ -17,6 +17,63 @@ function sendMessage(msg) {
   if (isFirefox) return api.runtime.sendMessage(msg);
   return new Promise((resolve) => api.runtime.sendMessage(msg, resolve));
 }
+function queryActiveTab() {
+  if (isFirefox) return api.tabs.query({ active: true, currentWindow: true });
+  return new Promise((resolve) => api.tabs.query({ active: true, currentWindow: true }, resolve));
+}
+// Returns null when the tab has no content script listening (restricted
+// page, or the page was loaded before the extension was installed).
+function sendTabMessage(tabId, msg) {
+  if (isFirefox) return api.tabs.sendMessage(tabId, msg);
+  return new Promise((resolve) => api.tabs.sendMessage(tabId, msg, (r) => {
+    if (api.runtime.lastError) resolve(null);
+    else resolve(r);
+  }));
+}
+async function refreshMedia() {
+  const listEl = document.getElementById("mediaList");
+  const mediaStatus = document.getElementById("mediaStatus");
+  if (!listEl || !mediaStatus) return;
+  listEl.textContent = "";
+  try {
+    const tabs = await queryActiveTab();
+    const tab = tabs && tabs[0];
+    if (!tab || !tab.id) { mediaStatus.textContent = "Could not reach this page."; return; }
+    if (tab.url && !/^https?:\/\//i.test(tab.url)) {
+      mediaStatus.textContent = "This page does not allow media detection (browser or extension page).";
+      return;
+    }
+    const r = await sendTabMessage(tab.id, { type: "getMedia" });
+    if (r === null || r === undefined) {
+      mediaStatus.textContent = "Could not reach this page. Reload the page and try again.";
+      return;
+    }
+    const items = r.items || [];
+    if (!items.length) { mediaStatus.textContent = "No media found on this page."; return; }
+    mediaStatus.textContent = items.length + (items.length === 1 ? " media item found:" : " media items found:");
+    for (const item of items) {
+      const row = document.createElement("div");
+      row.className = "media-row";
+      const label = document.createElement("span");
+      label.className = "media-label";
+      label.textContent = (item.kind === "audio" ? "Audio: " : "Video: ") + item.title + (item.viaPage ? " (via page link)" : "");
+      const btn = document.createElement("button");
+      btn.className = "media-btn";
+      btn.textContent = "Download";
+      btn.onclick = async () => {
+        btn.disabled = true;
+        const res = await sendMessage({ type: "sendUrl", url: item.url, filename: item.filename });
+        status.textContent = res && res.ok ? "Sent (or fell back to browser download)." : "Could not send.";
+        btn.disabled = false;
+      };
+      row.appendChild(label);
+      row.appendChild(btn);
+      listEl.appendChild(row);
+    }
+  } catch (_) {
+    mediaStatus.textContent = "Could not reach this page. Reload the page and try again.";
+  }
+}
 async function refresh() {
   const s = await getStorage("token");
   const token = s.token;
@@ -56,3 +113,4 @@ document.getElementById("send").onclick = async () => {
   status.textContent = r && r.ok ? "Sent (or fell back to browser download)." : "Could not send. Is the link http/https?";
 };
 refresh();
+refreshMedia();

@@ -16,6 +16,15 @@
     <input id="url" type="url" placeholder="Paste a download link (http / https)">
     <input id="filename" type="text" placeholder="Filename (optional)">
     <button id="addBtn">Download</button>
+    <small>Video pages (YouTube, Google Drive, Vimeo, …) open a quality picker before downloading.</small>
+  </section>
+  <section id="formatPicker" class="format-picker" hidden>
+    <h2 id="fpTitle">Pick a quality</h2>
+    <p id="fpMeta"></p>
+    <div id="fpList" role="radiogroup" aria-label="Available qualities"></div>
+    <p id="fpMergeNote" class="merge-note" hidden>This quality merges separate video and audio streams. FFmpeg is needed for the merge: it is downloaded once (about 120 MB) if it is not already installed.</p>
+    <button id="fpDownloadBtn">Download</button>
+    <button id="fpCancelBtn" class="secondary">Cancel</button>
   </section>
   <section class="controls">
     <input id="search" type="search" placeholder="Search downloads">
@@ -78,7 +87,7 @@ function clearError() { stickyError = null; }
 
 // ---- Startup diagnostic ----
 // This line proves the frontend script actually ran. If the status
-// line stays empty, app.js never executed. If it sticks on "Loading…",
+// line stays empty, the inlined script never executed. If it sticks on "Loading…",
 // the script ran but the first Rust call never answered.
 setStatus("Loading…");
 
@@ -118,6 +127,7 @@ function setBusy(btn, busy, busyText) {
 // error carries .code = "TIMEOUT" so callers can word it honestly.
 const INVOKE_TIMEOUT_MS = 10000;
 const ADD_TIMEOUT_MS = 130000; // covers the engine's 120s probe timeout
+const FORMATS_TIMEOUT_MS = 180000; // covers 90s extraction + a first-use yt-dlp download
 function invokeTimed(cmd, args, timeoutMs = INVOKE_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -135,6 +145,7 @@ async function api(path, method = "GET", body) {
   if (isTauri) {
     if (path === "/downloads" && method === "GET") return invokeTimed("list_downloads");
     if (path === "/downloads" && method === "POST") return invokeTimed("add_download", body, ADD_TIMEOUT_MS);
+    if (path === "/media/formats" && method === "POST") return invokeTimed("media_formats", body, FORMATS_TIMEOUT_MS);
     const m = path.match(/^\/downloads\/(.+)\/(pause|resume|cancel)$/);
     if (m) return invokeTimed(m[2] + "_download", { id: m[1] });
     throw new Error("Unsupported Tauri call " + path);
@@ -212,6 +223,19 @@ document.getElementById("addBtn").onclick = async () => {
   const btn = document.getElementById("addBtn");
   setBusy(btn, true, "Adding…");
   try {
+    if (looksLikeMediaPage(url)) {
+      // Video page: list qualities and let the user pick one. If the
+      // listing fails (not a video page after all, private video,
+      // extraction error), fall through to a plain add: the Rust side
+      // auto-picks a quality or records the failure with its reason.
+      try {
+        const info = await api("/media/formats", "POST", { url });
+        showFormatPicker(info, url, filename);
+        clearError();
+        setStatus("Pick a quality, then click Download.");
+        return;
+      } catch (e) { /* fall through to a plain add */ }
+    }
     await api("/downloads", "POST", { url, filename });
     clearError();
     setStatus("Added.");
@@ -220,6 +244,97 @@ document.getElementById("addBtn").onclick = async () => {
     if (e.code === "TIMEOUT") {
       // The Rust side keeps working after a timeout: the download may
       // still appear in the list on the next refresh.
+      setStatus("Still adding — if the download appears in the list, it was added.");
+      setTimeout(refresh, 5000);
+    } else {
+      setError("Could not add download: " + e.message, "action");
+    }
+  } finally { setBusy(btn, false); }
+};
+// ---- Format picker (video pages) ----
+// A host-based hint only: the Rust side still auto-handles any page
+// that turns out to be a video page, so a host missing from this list
+// just skips the picker (default quality) instead of failing.
+const MEDIA_HOSTS = [
+  "youtube.com", "youtu.be", "youtube-nocookie.com", "drive.google.com",
+  "vimeo.com", "dailymotion.com", "twitch.tv", "tiktok.com",
+  "instagram.com", "facebook.com", "fb.watch", "x.com", "twitter.com",
+  "soundcloud.com", "reddit.com", "streamable.com", "bitchute.com",
+  "odysee.com", "rumble.com",
+];
+function looksLikeMediaPage(url) {
+  let host = "";
+  try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return false; }
+  return MEDIA_HOSTS.some((h) => host === h || host.endsWith("." + h));
+}
+function fmtDuration(secs) {
+  if (secs == null) return "";
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+  const mm = String(m).padStart(2, "0"), ss = String(s).padStart(2, "0");
+  return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+}
+let pendingMedia = null; // { url, filename, info } while the picker is open
+function showFormatPicker(info, url, filename) {
+  pendingMedia = { url, filename, info };
+  // textContent only: the title comes from the page (untrusted).
+  document.getElementById("fpTitle").textContent = info.title || "Pick a quality";
+  const meta = [];
+  if (info.extractor) meta.push(info.extractor);
+  const dur = fmtDuration(info.duration_secs);
+  if (dur) meta.push(dur);
+  meta.push(info.formats.length + " qualities available");
+  document.getElementById("fpMeta").textContent = meta.join(" · ");
+  const list = document.getElementById("fpList");
+  list.textContent = "";
+  for (const f of info.formats) {
+    const row = document.createElement("label");
+    row.className = "format-row";
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = "format";
+    radio.value = f.format_id;
+    radio.checked = f.format_id === info.default_format_id;
+    radio.onchange = updateMergeNote;
+    const span = document.createElement("span");
+    span.textContent = f.label + (f.format_id === info.default_format_id ? " (recommended)" : "");
+    row.append(radio, span);
+    list.appendChild(row);
+  }
+  // If no format was pre-checked (no default), check the first one.
+  if (!list.querySelector("input:checked") && list.firstChild) {
+    list.querySelector("input").checked = true;
+  }
+  updateMergeNote();
+  document.getElementById("formatPicker").hidden = false;
+}
+function updateMergeNote() {
+  if (!pendingMedia) return;
+  const checked = document.querySelector("#fpList input:checked");
+  const f = checked && pendingMedia.info.formats.find((x) => x.format_id === checked.value);
+  document.getElementById("fpMergeNote").hidden = !(f && f.needs_merge);
+}
+function hideFormatPicker() {
+  pendingMedia = null;
+  document.getElementById("formatPicker").hidden = true;
+}
+document.getElementById("fpCancelBtn").onclick = () => { hideFormatPicker(); setStatus("Cancelled."); };
+document.getElementById("fpDownloadBtn").onclick = async () => {
+  if (!pendingMedia) return;
+  const checked = document.querySelector("#fpList input:checked");
+  if (!checked) { setError("Pick a quality first.", "action"); return; }
+  const { url, filename } = pendingMedia;
+  const format_id = checked.value;
+  const btn = document.getElementById("fpDownloadBtn");
+  setBusy(btn, true, "Adding…");
+  try {
+    await api("/downloads", "POST", { url, filename, format_id });
+    hideFormatPicker();
+    clearError();
+    setStatus("Added.");
+    refresh();
+  } catch (e) {
+    if (e.code === "TIMEOUT") {
+      hideFormatPicker();
       setStatus("Still adding — if the download appears in the list, it was added.");
       setTimeout(refresh, 5000);
     } else {

@@ -9,8 +9,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use fetchforge_engine::{
-    category_for_filename, download, generate_download_id, probe, sanitize_filename, stop_reason, DownloadOptions,
-    DownloadRecord, Status, Store,
+    category_for_filename, download, download_media, drive_direct_url, drive_file_id,
+    find_ytdlp, generate_download_id, list_formats, plan_media_download, probe,
+    sanitize_filename, stop_reason, DownloadOptions, DownloadRecord, MediaDownloadOptions,
+    MediaInfo, Status, Store,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -140,61 +142,204 @@ fn list_downloads(state: tauri::State<Arc<State>>) -> Vec<DownloadRecord> {
 
 // Async so the blocking probe runs on Tauri's async runtime instead of
 // the IPC thread: a slow probe used to freeze the whole UI.
+// `format_id` is the quality the user picked in the format picker;
+// None means the recorded default (the paste-link box also accepts a
+// video page directly, without opening the picker first).
 #[tauri::command]
 async fn add_download(
     state: tauri::State<'_, Arc<State>>,
     url: String,
     filename: Option<String>,
+    format_id: Option<String>,
 ) -> Result<DownloadRecord, String> {
     let clean = fetchforge_engine::validate_url(&url)?;
     let probe_opts = DownloadOptions {
         url: clean.clone(),
         ..Default::default()
     };
-    // A web page is not a downloadable file: a YouTube watch page (or
-    // any HTML page) would otherwise be saved as a useless file named
-    // after the URL path. Refuse it here so the probe-error branch
-    // below records a Failed row with this reason.
-    let probe_result = probe(&probe_opts).and_then(|p| {
-        if p.content_type
+    let probe_result = probe(&probe_opts);
+    // A web page is not a downloadable file — but since v0.2.0 it is no
+    // longer refused outright: a page whose probe returns text/html
+    // (YouTube, Vimeo, a public Google Drive file, any video page) goes
+    // through media extraction instead. Same flow as the bridge's
+    // add_download; the two must not drift apart.
+    let is_page = probe_result.as_ref().is_ok_and(|p| {
+        p.content_type
             .as_deref()
             .is_some_and(|ct| ct.starts_with("text/html"))
-        {
-            Err("This link is a web page, not a downloadable file. FetchForge downloads direct file links; video pages such as YouTube are not supported yet.".to_string())
-        } else {
-            Ok(p)
-        }
     });
-    let (filename, total, resumable) = match probe_result {
-        Ok(p) => (
-            filename
-                .as_deref()
-                .map(sanitize_filename)
-                .or(p.filename.as_deref().map(sanitize_filename))
-                .unwrap_or_else(|| "download".to_string()),
-            p.content_length,
-            p.accept_ranges,
-        ),
-        Err(e) => {
-            let rec = DownloadRecord {
-                id: generate_download_id(),
-                url: clean,
-                filename: filename.unwrap_or_else(|| "download".to_string()),
-                destination: state.download_dir.to_string_lossy().to_string(),
-                category: "Other".to_string(),
-                status: Status::Failed,
-                total_bytes: None,
-                downloaded_bytes: 0,
-                resumable: false,
-                error: Some(e),
-                created_unix: now_unix(),
-                updated_unix: now_unix(),
-            };
-            state.store.lock().unwrap().upsert(rec.clone());
-            let _ = state.store.lock().unwrap().save();
-            return Ok(rec);
+    if is_page {
+        return add_media_download(&state, &clean, filename, format_id);
+    }
+    match probe_result {
+        Ok(p) => {
+            let (filename, total, resumable) = (
+                filename
+                    .as_deref()
+                    .map(sanitize_filename)
+                    .or(p.filename.as_deref().map(sanitize_filename))
+                    .unwrap_or_else(|| "download".to_string()),
+                p.content_length,
+                p.accept_ranges,
+            );
+            queue_direct_download(&state, clean, filename, total, resumable)
         }
+        Err(e) => {
+            // Probe failed: try media extraction as a fallback, but
+            // ONLY if yt-dlp is already installed (see the bridge for
+            // why a dead direct link must never trigger a first-use
+            // yt-dlp download).
+            if find_ytdlp(&state.data_dir).is_ok() {
+                if let Ok(rec) =
+                    try_media_download(&state, &clean, filename.clone(), format_id.clone())
+                {
+                    return Ok(rec);
+                }
+            }
+            let rec = failed_record(&state, clean, filename, e);
+            Ok(rec)
+        }
+    }
+}
+
+/// A Failed record, saved so the user sees the reason.
+fn failed_record(
+    state: &Arc<State>,
+    url: String,
+    filename: Option<String>,
+    error: String,
+) -> DownloadRecord {
+    let rec = DownloadRecord {
+        id: generate_download_id(),
+        url,
+        filename: filename.unwrap_or_else(|| "download".to_string()),
+        destination: state.download_dir.to_string_lossy().to_string(),
+        category: "Other".to_string(),
+        status: Status::Failed,
+        total_bytes: None,
+        downloaded_bytes: 0,
+        resumable: false,
+        error: Some(error),
+        created_unix: now_unix(),
+        updated_unix: now_unix(),
+        format_id: None,
+        needs_merge: false,
     };
+    state.store.lock().unwrap().upsert(rec.clone());
+    let _ = state.store.lock().unwrap().save();
+    rec
+}
+
+/// Media path for the desktop app (mirrors the bridge): extract the
+/// page, pick a format, queue the download. On extraction failure a
+/// Google Drive link gets one direct-download fallback.
+fn add_media_download(
+    state: &Arc<State>,
+    clean_url: &str,
+    filename: Option<String>,
+    format_id: Option<String>,
+) -> Result<DownloadRecord, String> {
+    match try_media_download(state, clean_url, filename.clone(), format_id) {
+        Ok(rec) => Ok(rec),
+        Err(e) => {
+            if let Some(file_id) = drive_file_id(clean_url) {
+                let direct = drive_direct_url(&file_id);
+                let probe_opts = DownloadOptions {
+                    url: direct.clone(),
+                    ..Default::default()
+                };
+                if let Ok(p) = probe(&probe_opts) {
+                    if !p.content_type
+                        .as_deref()
+                        .is_some_and(|ct| ct.starts_with("text/html"))
+                    {
+                        let fname = filename
+                            .as_deref()
+                            .map(sanitize_filename)
+                            .or(p.filename.as_deref().map(sanitize_filename))
+                            .unwrap_or_else(|| "download".to_string());
+                        return queue_direct_download(
+                            state,
+                            direct,
+                            fname,
+                            p.content_length,
+                            p.accept_ranges,
+                        );
+                    }
+                }
+            }
+            Ok(failed_record(
+                state,
+                clean_url.to_string(),
+                filename,
+                e,
+            ))
+        }
+    }
+}
+
+fn try_media_download(
+    state: &Arc<State>,
+    clean_url: &str,
+    filename: Option<String>,
+    format_id: Option<String>,
+) -> Result<DownloadRecord, String> {
+    let plan = plan_media_download(
+        &state.data_dir,
+        clean_url,
+        format_id.as_deref(),
+        filename.as_deref(),
+    )?;
+    // Same idempotent-add rule as the bridge: an already-active job for
+    // the same URL + filename is returned, never duplicated.
+    {
+        let store = state.store.lock().unwrap();
+        for existing in store.all() {
+            if existing.url == clean_url
+                && existing.filename == plan.filename
+                && existing.destination == state.download_dir.to_string_lossy().to_string()
+                && (existing.status == Status::Queued || existing.status == Status::Downloading)
+            {
+                return Ok(existing.clone());
+            }
+        }
+    }
+    let id = generate_download_id();
+    let rec = DownloadRecord {
+        id: id.clone(),
+        url: clean_url.to_string(),
+        filename: plan.filename.clone(),
+        destination: state.download_dir.to_string_lossy().to_string(),
+        category: category_for_filename(&plan.filename).to_string(),
+        status: Status::Queued,
+        total_bytes: plan.total_bytes,
+        downloaded_bytes: 0,
+        // yt-dlp resumes from its own .part files.
+        resumable: true,
+        error: None,
+        created_unix: now_unix(),
+        updated_unix: now_unix(),
+        format_id: Some(plan.format_id),
+        needs_merge: plan.needs_merge,
+    };
+    {
+        let mut store = state.store.lock().unwrap();
+        store.upsert(rec.clone());
+        let _ = store.save();
+    }
+    spawn_download_worker(state, id);
+    Ok(rec)
+}
+
+/// Queue a direct file download (the pre-0.2.0 path, unchanged except
+/// for the new record fields).
+fn queue_direct_download(
+    state: &Arc<State>,
+    clean: String,
+    filename: String,
+    total: Option<u64>,
+    resumable: bool,
+) -> Result<DownloadRecord, String> {
     // Same idempotent-add rule as the bridge: an already-active job for
     // the same URL + filename is returned, never duplicated (two workers
     // would share one .part path and corrupt each other). This check
@@ -227,13 +372,20 @@ async fn add_download(
         error: None,
         created_unix: now_unix(),
         updated_unix: now_unix(),
+        format_id: None,
+        needs_merge: false,
     };
     {
         let mut store = state.store.lock().unwrap();
         store.upsert(rec.clone());
         let _ = store.save();
     }
-    let state2 = Arc::clone(&state);
+    spawn_download_worker(state, id);
+    Ok(rec)
+}
+
+fn spawn_download_worker(state: &Arc<State>, id: String) {
+    let state2 = Arc::clone(state);
     let job = Arc::new(Job {
         paused: Arc::new(AtomicBool::new(false)),
         cancelled: Arc::new(AtomicBool::new(false)),
@@ -244,7 +396,18 @@ async fn add_download(
         .unwrap()
         .insert(id.clone(), Arc::clone(&job));
     std::thread::spawn(move || run_download(&state2, &id, &job));
-    Ok(rec)
+}
+
+/// List the qualities available for a video page (format picker).
+/// Async so the yt-dlp extraction (up to 90 s on a slow site) does not
+/// block the IPC thread.
+#[tauri::command]
+async fn media_formats(
+    state: tauri::State<'_, Arc<State>>,
+    url: String,
+) -> Result<MediaInfo, String> {
+    let clean = fetchforge_engine::validate_url(&url)?;
+    list_formats(&state.data_dir, &clean)
 }
 
 fn set_status(state: &Arc<State>, id: &str, status: Status, error: Option<String>) {
@@ -265,6 +428,12 @@ fn run_download(state: &Arc<State>, id: &str, job: &Job) {
         Some(r) => r.clone(),
         None => return,
     };
+    // Media downloads (a format was chosen) run through yt-dlp;
+    // everything else takes the direct path, exactly as before.
+    if rec.format_id.is_some() {
+        run_media_download(state, &rec, job);
+        return;
+    }
     set_status(state, id, Status::Downloading, None);
     let opts = DownloadOptions {
         url: rec.url.clone(),
@@ -313,6 +482,82 @@ fn run_download(state: &Arc<State>, id: &str, job: &Job) {
                 }
             } else {
                 set_status(state, id, Status::Failed, Some(e));
+            }
+        }
+    }
+}
+
+/// Run a media download (yt-dlp). Mirrors the bridge's run_media:
+/// the filename stem comes from the record so a resume re-runs yt-dlp
+/// with the same output template and picks up its own .part files,
+/// and the record's filename is corrected to the real file name on
+/// completion (a merge may pick a different container than planned).
+fn run_media_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
+    let id = rec.id.clone();
+    set_status(state, &id, Status::Downloading, None);
+    let stem = std::path::Path::new(&rec.filename)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "video".to_string());
+    let ext = std::path::Path::new(&rec.filename)
+        .extension()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "mp4".to_string());
+    let opts = MediaDownloadOptions {
+        url: rec.url.clone(),
+        format_id: rec.format_id.clone().unwrap_or_default(),
+        needs_merge: rec.needs_merge,
+        destination_dir: state.download_dir.clone(),
+        filename_stem: stem,
+        expected_ext: ext,
+        expected_total: rec.total_bytes,
+        organise_by_category: true,
+    };
+    let id2 = id.clone();
+    let state2 = Arc::clone(state);
+    let progress = move |p: fetchforge_engine::Progress| {
+        let mut store = state2.store.lock().unwrap();
+        if let Some(mut r) = store.get(&id2).cloned() {
+            r.downloaded_bytes = p.downloaded;
+            r.total_bytes = p.total.or(r.total_bytes);
+            r.updated_unix = now_unix();
+            store.upsert(r);
+            let _ = store.save();
+        }
+    };
+    match download_media(
+        &state.data_dir,
+        &opts,
+        &progress,
+        &job.paused,
+        &job.cancelled,
+    ) {
+        Ok(final_path) => {
+            let mut store = state.store.lock().unwrap();
+            if let Some(mut r) = store.get(&id).cloned() {
+                r.status = Status::Completed;
+                r.destination = final_path.to_string_lossy().to_string();
+                if let Some(name) = final_path.file_name() {
+                    r.filename = name.to_string_lossy().to_string();
+                }
+                r.error = None;
+                r.updated_unix = now_unix();
+                store.upsert(r);
+                let _ = store.save();
+            }
+        }
+        Err(e) => {
+            if let Some(reason) = stop_reason(&e) {
+                match reason {
+                    fetchforge_engine::download::StopReason::Paused => {
+                        set_status(state, &id, Status::Paused, None)
+                    }
+                    fetchforge_engine::download::StopReason::Cancelled => {
+                        set_status(state, &id, Status::Cancelled, None)
+                    }
+                }
+            } else {
+                set_status(state, &id, Status::Failed, Some(e));
             }
         }
     }
@@ -452,6 +697,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_downloads,
             add_download,
+            media_formats,
             pause_download,
             resume_download,
             cancel_download,

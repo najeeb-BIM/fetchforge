@@ -3,13 +3,19 @@
 // written in this round and has not run in Chrome/Edge/Firefox yet.
 // Token hygiene: the token lives ONLY in storage.local, read only here
 // in the background script. It is never put in a content script, page
-// context, URL, or log. No content script exists in this extension.
+// context, URL, or log. The content script (content.js) detects media
+// and sends only the clicked media/page URL here; it never sees the token.
 // Minimal permissions, no browsing history is read or sent anywhere.
-// Flow: context-menu click -> try native messaging -> try loopback bridge
-// with the stored token -> fall back to the browser's own downloader.
-// Service-worker safe: no persistent in-memory state, no DOM access, all
-// state lives in storage. Works after a service-worker restart because
-// every listener is registered at the top level on each start.
+// Flow: context-menu click / overlay click / popup -> try native messaging
+// -> try loopback bridge with the stored token -> fall back to the browser's
+// own downloader. Detected media (content script reports) is POSTed to
+// POST /media/detected best-effort and shown as the toolbar badge count.
+// Service-worker safe: no DOM access, every listener is registered at
+// the top level on each start. Download/pairing state lives in storage.
+// Detected-media reporting keeps per-tab frame state in memory (lost on
+// a service-worker restart, rebuilt from the next content-script report);
+// only the badge counts are mirrored to storage so the badge survives
+// a restart. Reporting is best-effort, so losing it is never fatal.
 const api = typeof browser !== "undefined" ? browser : chrome;
 const isFirefox = typeof browser !== "undefined";
 const BRIDGE = "http://127.0.0.1:18443";
@@ -94,6 +100,99 @@ api.runtime.onInstalled.addListener(() => {
     api.contextMenus.create({ id: "fetchforge-download", title: "Download with FetchForge", contexts: ["link", "video", "audio"] });
   } catch (_) { /* already created on a service-worker restart */ }
 });
+
+// ---- Detected-media reporting (Phase 4 data flow) ----
+// Content scripts report their detected set per frame; the background
+// merges frames per tab, shows the count as the toolbar badge, and
+// POSTs the merged set to the bridge (POST /media/detected) so the
+// app's Media Detector panel (Phase 9) can list it. Reporting is
+// best-effort and silent: no token, no bridge, or a missing endpoint
+// (the desktop agent is building it in parallel) never breaks
+// detection or downloading. Only confirmed metadata is sent —
+// no cookies, no credentials, no page content. The token is used
+// here exactly as for downloads (HMAC challenge first) and never
+// leaves the background script.
+const tabFrames = new Map(); // tabId -> Map(frameId -> items[])
+const tabPostTimers = new Map(); // tabId -> timeout id
+const tabLastPosted = new Map(); // tabId -> JSON key of last POSTed set
+let mediaCounts = {}; // tabId -> count, mirrored to storage.local for SW restarts
+
+async function loadMediaCounts() {
+  try {
+    const s = await callApi((...a) => api.storage.local.get(...a), "mediaCounts");
+    if (s && s.mediaCounts) mediaCounts = s.mediaCounts;
+  } catch (_) {}
+}
+async function saveMediaCounts() {
+  try { await callApi((...a) => api.storage.local.set(...a), { mediaCounts }); } catch (_) {}
+}
+function setBadge(tabId, count) {
+  try {
+    api.action.setBadgeText({ tabId, text: count > 0 ? String(count) : "" });
+    api.action.setBadgeBackgroundColor({ tabId, color: "#22c55e" });
+  } catch (_) { /* action API unavailable */ }
+}
+function mergedItems(tabId) {
+  const frames = tabFrames.get(tabId);
+  const items = [];
+  const seen = new Set();
+  if (!frames) return items;
+  for (const list of frames.values()) {
+    for (const item of list) {
+      const key = item.kind + "|" + item.url;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push(item);
+    }
+  }
+  return items;
+}
+async function postDetected(tabId, pageUrl) {
+  const items = mergedItems(tabId).map((it) => Object.assign({}, it, { pageUrl }));
+  const key = JSON.stringify(items);
+  if (tabLastPosted.get(tabId) === key) return;
+  tabLastPosted.set(tabId, key);
+  let token = "";
+  try { token = await getToken(); } catch (_) { return; }
+  if (!token) return;
+  try {
+    if (!(await verifyServer(token))) return;
+    await fetch(BRIDGE + "/media/detected", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-FetchForge-Token": token },
+      body: JSON.stringify({ items }),
+    });
+    // Any status is fine: a 404 just means the endpoint has not landed yet.
+  } catch (_) { /* bridge unreachable; reporting is best-effort */ }
+}
+function handleReport(tabId, frameId, items, pageUrl) {
+  if (!tabFrames.has(tabId)) tabFrames.set(tabId, new Map());
+  tabFrames.get(tabId).set(frameId, Array.isArray(items) ? items : []);
+  const count = mergedItems(tabId).length;
+  mediaCounts[tabId] = count;
+  setBadge(tabId, count);
+  saveMediaCounts();
+  if (tabPostTimers.has(tabId)) clearTimeout(tabPostTimers.get(tabId));
+  tabPostTimers.set(tabId, setTimeout(() => {
+    tabPostTimers.delete(tabId);
+    postDetected(tabId, pageUrl);
+  }, 1000));
+}
+loadMediaCounts();
+if (api.tabs && api.tabs.onActivated) {
+  api.tabs.onActivated.addListener((info) => {
+    if (typeof mediaCounts[info.tabId] === "number") setBadge(info.tabId, mediaCounts[info.tabId]);
+  });
+}
+if (api.tabs && api.tabs.onRemoved) {
+  api.tabs.onRemoved.addListener((tabId) => {
+    tabFrames.delete(tabId);
+    tabLastPosted.delete(tabId);
+    if (tabPostTimers.has(tabId)) { clearTimeout(tabPostTimers.get(tabId)); tabPostTimers.delete(tabId); }
+    delete mediaCounts[tabId];
+    saveMediaCounts();
+  });
+}
 api.contextMenus.onClicked.addListener((info) => {
   const url = info.linkUrl || info.srcUrl;
   if (url) sendDownload(url);
@@ -103,6 +202,20 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.type === "sendUrl") {
     sendDownload(msg.url, msg.filename).then((ok) => sendResponse({ ok }));
     return true;
+  }
+  if (msg && msg.type === "downloadMedia") {
+    // Content-script overlay click: same sendDownload path as the popup
+    // and context menu. Only accept from a real tab's content script.
+    if (!_sender || !_sender.tab) { sendResponse({ ok: false }); return false; }
+    sendDownload(msg.url, msg.filename).then((ok) => sendResponse({ ok }));
+    return true;
+  }
+  if (msg && msg.type === "reportMedia") {
+    // Content-script detected-media report (fire-and-forget, no response).
+    if (_sender && _sender.tab && typeof _sender.tab.id === "number") {
+      handleReport(_sender.tab.id, _sender.frameId || 0, msg.items, _sender.tab.url || "");
+    }
+    return false;
   }
   if (msg && msg.type === "pairCode") {
     // Pairing: send only the one-time code (never a token) to the bridge.

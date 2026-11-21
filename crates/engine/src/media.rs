@@ -797,51 +797,1012 @@ pub fn download_hls_variant(
     Ok(final_path)
 }
 
+
 // ---------------------------------------------------------------------------
-// DASH
+// DASH parsing (MPD is XML; parsed with quick-xml, not string scans:
+// attribute order, self-closing tags and namespace prefixes vary)
 // ---------------------------------------------------------------------------
 
-/// List the qualities of a DASH manifest. Implemented with the DASH
-/// segment assembly work (same phase); until then a DASH URL fails
-/// here with a clear message instead of being saved as a file.
-pub fn list_dash_formats(_manifest_url: &str) -> Result<StreamInfo, String> {
-    Err(
-        "DASH segment assembly is not yet implemented for this manifest shape. \
-         Direct video files and HLS are supported; see docs/FEATURE_MATRIX.md."
-            .to_string(),
-    )
+/// One representation (quality) of a DASH manifest.
+#[derive(Debug, Clone)]
+pub struct DashRepresentation {
+    pub id: String,
+    pub bandwidth: Option<u64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub frame_rate: Option<f64>,
+    pub codecs: Option<String>,
+    /// Effective MIME type (representation, else AdaptationSet).
+    pub mime_type: String,
+    /// Effective content type ("video" / "audio", else empty).
+    pub content_type: String,
+    /// Most specific BaseURL (representation > set > period > MPD),
+    /// still relative — resolved against the manifest URL at use.
+    pub base_url: Option<String>,
+    /// SegmentTemplate, representation-level if present, else the
+    /// AdaptationSet's. Mutually exclusive with `segment_list`.
+    pub template: Option<SegmentTemplate>,
+    pub segment_list: Option<DashSegmentList>,
 }
 
-/// Minimal DASH support: only clear, single-period manifests with a
-/// SegmentTemplate or SegmentList. Anything with ContentProtection,
-/// multiple periods, or an unsupported template is refused honestly
-/// instead of producing a broken file.
-pub fn download_dash(
+impl DashRepresentation {
+    fn is_video(&self) -> bool {
+        self.content_type.eq_ignore_ascii_case("video")
+            || self.mime_type.to_ascii_lowercase().starts_with("video/")
+            || (!self.is_audio() && (self.width.is_some() || self.height.is_some()))
+    }
+
+    fn is_audio(&self) -> bool {
+        self.content_type.eq_ignore_ascii_case("audio")
+            || self.mime_type.to_ascii_lowercase().starts_with("audio/")
+    }
+}
+
+/// A parsed DASH manifest (clear, single-period only).
+#[derive(Debug, Clone)]
+pub struct DashManifest {
+    /// Presentation duration in seconds (MPD mediaPresentationDuration,
+    /// else the Period duration), when the manifest states one.
+    pub duration_secs: Option<f64>,
+    pub representations: Vec<DashRepresentation>,
+}
+
+/// A SegmentTemplate element (at AdaptationSet or Representation
+/// level), with its SegmentTimeline when present.
+#[derive(Debug, Clone, Default)]
+pub struct SegmentTemplate {
+    pub media: Option<String>,
+    pub initialization: Option<String>,
+    pub timescale: u64,
+    /// Segment duration in `timescale` units (Number-based).
+    pub duration: Option<u64>,
+    pub start_number: u64,
+    pub timeline: Vec<TimelineEntry>,
+}
+
+/// One `<S>` element of a SegmentTimeline: `t` is the start time
+/// (timescale units; omitted means "previous segment's end"),
+/// `d` the duration, `r` how many times it repeats (default 0).
+#[derive(Debug, Clone)]
+pub struct TimelineEntry {
+    pub start: Option<u64>,
+    pub duration: u64,
+    pub repeat: u32,
+}
+
+/// A SegmentList element.
+#[derive(Debug, Clone, Default)]
+pub struct DashSegmentList {
+    pub initialization: Option<ListInit>,
+    pub segments: Vec<ListSegment>,
+}
+
+/// SegmentList Initialization: sourceURL and/or a byte range of the
+/// BaseURL file.
+#[derive(Debug, Clone)]
+pub struct ListInit {
+    pub url: Option<String>,
+    pub range: Option<(u64, u64)>,
+}
+
+/// One SegmentURL: a media URL, or a byte range of the BaseURL file.
+#[derive(Debug, Clone)]
+pub struct ListSegment {
+    pub media: Option<String>,
+    pub range: Option<(u64, u64)>,
+}
+
+/// Parse an ISO 8601 duration such as PT634.566S, PT10M30.5S,
+/// PT2H3M or P1DT2H into seconds. Years/months/weeks are not
+/// supported (they never occur in real manifests) and return None.
+fn parse_iso8601_duration(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let rest = s.strip_prefix('P')?;
+    let (date, time) = match rest.split_once('T') {
+        Some((d, t)) => (d, t),
+        None => (rest, ""),
+    };
+    let mut secs = 0.0f64;
+    let parse_part = |part: &str, units: &[char]| -> Option<f64> {
+        let mut total = 0.0f64;
+        let mut num = String::new();
+        for c in part.chars() {
+            if c.is_ascii_digit() || c == '.' {
+                num.push(c);
+            } else if units.contains(&c) {
+                let v: f64 = num.parse().ok()?;
+                let mult = match c {
+                    'D' => 86_400.0,
+                    'H' => 3_600.0,
+                    'M' => 60.0,
+                    'S' => 1.0,
+                    _ => return None,
+                };
+                total += v * mult;
+                num.clear();
+            } else {
+                return None;
+            }
+        }
+        if !num.is_empty() {
+            return None;
+        }
+        Some(total)
+    };
+    // Date part: only days are supported (Y/M/W rejected).
+    if !date.is_empty() {
+        secs += parse_part(date, &['D'])?;
+    }
+    if !time.is_empty() {
+        secs += parse_part(time, &['H', 'M', 'S'])?;
+    }
+    Some(secs)
+}
+
+/// Parse a byte range "start-end" (inclusive) from a mediaRange
+/// attribute.
+fn parse_byte_range(s: &str) -> Option<(u64, u64)> {
+    let (a, b) = s.split_once('-')?;
+    let start: u64 = a.parse().ok()?;
+    let end: u64 = b.parse().ok()?;
+    if end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Substitute a SegmentTemplate URL: $RepresentationID$,
+/// $Bandwidth$, $Number$, $Time$, each optionally with a %0Nd
+/// zero-padding format, and $$ for a literal $. `number`/`time`
+/// are None where the template must not use them (initialization).
+fn substitute_template(
+    tpl: &str,
+    rep_id: &str,
+    bandwidth: Option<u64>,
+    number: Option<u64>,
+    time: Option<u64>,
+) -> Result<String, String> {
+    let mut out = String::new();
+    let mut rest = tpl;
+    while let Some(dollar) = rest.find('$') {
+        out.push_str(&rest[..dollar]);
+        rest = &rest[dollar..];
+        if let Some(after) = rest.strip_prefix("$$") {
+            out.push('$');
+            rest = after;
+            continue;
+        }
+        let Some(end) = rest[1..].find('$').map(|i| i + 1) else {
+            return Err(format!(
+                "Bad SegmentTemplate: unterminated $ in {tpl:?}"
+            ));
+        };
+        let token = &rest[1..end];
+        rest = &rest[end + 1..];
+        let (name, fmt) = match token.split_once('%') {
+            Some((n, f)) => (n, Some(f)),
+            None => (token, None),
+        };
+        let value: String = match name {
+            "RepresentationID" => rep_id.to_string(),
+            "Bandwidth" => bandwidth
+                .map(|b| b.to_string())
+                .ok_or_else(|| {
+                    "SegmentTemplate uses $Bandwidth$ but the Representation has no bandwidth"
+                        .to_string()
+                })?,
+            "Number" => number
+                .map(|n| n.to_string())
+                .ok_or_else(|| {
+                    "SegmentTemplate uses $Number$ but no segment number is available"
+                        .to_string()
+                })?,
+            "Time" => time
+                .map(|t| t.to_string())
+                .ok_or_else(|| {
+                    "SegmentTemplate uses $Time$ but no segment time is available".to_string()
+                })?,
+            other => {
+                return Err(format!(
+                    "Unsupported SegmentTemplate variable ${other}$"
+                ));
+            }
+        };
+        match fmt {
+            None => out.push_str(&value),
+            Some(f) => {
+                // %0Nd: zero-pad a numeric value to width N.
+                let width = f
+                    .strip_suffix('d')
+                    .and_then(|w| w.parse::<usize>().ok())
+                    .unwrap_or(0);
+                if width > 0 && value.chars().all(|c| c.is_ascii_digit()) {
+                    for _ in 0..width.saturating_sub(value.len()) {
+                        out.push('0');
+                    }
+                }
+                out.push_str(&value);
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Parse an MPD document. Refuses DRM (ContentProtection),
+/// dynamic (live) manifests, and multi-period manifests with plain
+/// explanations instead of producing a broken download.
+pub fn parse_dash_manifest(text: &str) -> Result<DashManifest, String> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(text);
+    reader.config_mut().trim_text(true);
+
+    let mut manifest = DashManifest {
+        duration_secs: None,
+        representations: Vec::new(),
+    };
+    let mut mpd_base_url: Option<String> = None;
+    let mut period_base_url: Option<String> = None;
+    let mut period_count = 0usize;
+    let mut period_duration: Option<f64> = None;
+
+    // AdaptationSet-level state, inherited by its Representations.
+    let mut set_mime = String::new();
+    let mut set_content = String::new();
+    let mut set_template: Option<SegmentTemplate> = None;
+    let mut set_list: Option<DashSegmentList> = None;
+    let mut set_base_url: Option<String> = None;
+
+    // Representation being built (None outside one).
+    let mut current_rep: Option<RepBuilder> = None;
+
+    // A SegmentTemplate/SegmentList whose children are still being
+    // read (Start, not Empty): (belongs to set or rep, value).
+    let mut pending_template: Option<(bool, SegmentTemplate)> = None; // bool: true = rep-level
+    let mut pending_list: Option<(bool, DashSegmentList)> = None;
+
+    // BaseURL text: which level the open <BaseURL> belongs to.
+    let mut base_url_owner: Option<&'static str> = None;
+    let mut stack: Vec<String> = Vec::new();
+
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        // Start and Empty are matched separately: the distinction
+        // (self-closing vs paired element) decides whether a
+        // Representation/SegmentTemplate is finished immediately or
+        // on its End event.
+        let (e, is_empty) = match reader.read_event_into(&mut buf) {
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => (e, false),
+            Ok(Event::Empty(e)) => (e, true),
+            Ok(Event::Text(e)) => {
+                if let Some(owner) = base_url_owner.take() {
+                    if stack.last().map(String::as_str) == Some("BaseURL") {
+                        if let Ok(value) =
+                            quick_xml::escape::unescape(&String::from_utf8_lossy(e.as_ref()))
+                        {
+                            let value = value.trim().to_string();
+                            if !value.is_empty() {
+                                match owner {
+                                    "mpd" => mpd_base_url = Some(value),
+                                    "period" => period_base_url = Some(value),
+                                    "set" => set_base_url = Some(value),
+                                    "rep" => {
+                                        if let Some(r) = current_rep.as_mut() {
+                                            r.own_base_url = Some(value);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            Ok(Event::End(e)) => {
+                let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                match name.as_str() {
+                    "SegmentTemplate" => {
+                        if let Some((in_rep, tpl)) = pending_template.take() {
+                            if in_rep {
+                                if let Some(r) = current_rep.as_mut() {
+                                    r.own_template = Some(tpl);
+                                }
+                            } else {
+                                set_template = Some(tpl);
+                            }
+                        }
+                    }
+                    "SegmentList" => {
+                        if let Some((in_rep, list)) = pending_list.take() {
+                            if in_rep {
+                                if let Some(r) = current_rep.as_mut() {
+                                    r.own_list = Some(list);
+                                }
+                            } else {
+                                set_list = Some(list);
+                            }
+                        }
+                    }
+                    "Representation" => {
+                        if let Some(rep) = current_rep.take() {
+                            manifest.representations.push(finish_rep(
+                                rep,
+                                &set_mime,
+                                &set_content,
+                                &set_template,
+                                &set_list,
+                                &set_base_url,
+                                &period_base_url,
+                                &mpd_base_url,
+                            ));
+                        }
+                    }
+                    "BaseURL" => {
+                        base_url_owner = None;
+                    }
+                    _ => {}
+                }
+                stack.pop();
+                continue;
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                return Err(format!("Could not parse this DASH manifest as XML ({e})."));
+            }
+        };
+        {
+            let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                let mut attrs: HashMap<String, String> = HashMap::new();
+                for a in e.attributes().flatten() {
+                    let key = String::from_utf8_lossy(a.key.local_name().as_ref()).to_string();
+                    let value = a
+                        .unescape_value()
+                        .map(|v| v.to_string())
+                        .unwrap_or_default();
+                    attrs.insert(key, value);
+                }
+                match name.as_str() {
+                    "MPD" => {
+                        if attrs
+                            .get("type")
+                            .is_some_and(|t| t.eq_ignore_ascii_case("dynamic"))
+                        {
+                            return Err(
+                                "This DASH stream is live (type=\"dynamic\"). FetchForge does not record live streams."
+                                    .to_string(),
+                            );
+                        }
+                        if let Some(d) = attrs.get("mediaPresentationDuration") {
+                            manifest.duration_secs = parse_iso8601_duration(d);
+                        }
+                    }
+                    "Period" => {
+                        period_count += 1;
+                        if period_count > 1 {
+                            return Err(
+                                "Multi-period DASH manifests are not supported in this release"
+                                    .to_string(),
+                            );
+                        }
+                        if let Some(d) = attrs.get("duration") {
+                            period_duration = parse_iso8601_duration(d);
+                        }
+                    }
+                    "BaseURL" => {
+                        // Owner = the enclosing element.
+                        base_url_owner = match stack.last().map(String::as_str) {
+                            Some("MPD") => Some("mpd"),
+                            Some("Period") => Some("period"),
+                            Some("AdaptationSet") => Some("set"),
+                            Some("Representation") => Some("rep"),
+                            _ => None,
+                        };
+                    }
+                    "AdaptationSet" => {
+                        set_mime = attrs.get("mimeType").cloned().unwrap_or_default();
+                        set_content = attrs.get("contentType").cloned().unwrap_or_default();
+                        set_template = None;
+                        set_list = None;
+                        set_base_url = None;
+                    }
+                    "SegmentTemplate" => {
+                        let in_rep = current_rep.is_some();
+                        let tpl = SegmentTemplate {
+                            media: attrs.get("media").cloned(),
+                            initialization: attrs.get("initialization").cloned(),
+                            timescale: attrs
+                                .get("timescale")
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(1),
+                            duration: attrs.get("duration").and_then(|v| v.parse().ok()),
+                            start_number: attrs
+                                .get("startNumber")
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(1),
+                            timeline: Vec::new(),
+                        };
+                        if is_empty {
+                            if in_rep {
+                                if let Some(r) = current_rep.as_mut() {
+                                    r.own_template = Some(tpl);
+                                }
+                            } else {
+                                set_template = Some(tpl);
+                            }
+                        } else {
+                            pending_template = Some((in_rep, tpl));
+                        }
+                    }
+                    "S" => {
+                        if let Some((_, tpl)) = pending_template.as_mut() {
+                            if let Some(d) = attrs.get("d").and_then(|v| v.parse::<u64>().ok()) {
+                                tpl.timeline.push(TimelineEntry {
+                                    start: attrs.get("t").and_then(|v| v.parse().ok()),
+                                    duration: d,
+                                    repeat: attrs
+                                        .get("r")
+                                        .and_then(|v| v.parse().ok())
+                                        .unwrap_or(0),
+                                });
+                            }
+                        }
+                    }
+                    "SegmentList" => {
+                        let in_rep = current_rep.is_some();
+                        let list = DashSegmentList {
+                            initialization: None,
+                            segments: Vec::new(),
+                        };
+                        if is_empty {
+                            if in_rep {
+                                if let Some(r) = current_rep.as_mut() {
+                                    r.own_list = Some(list);
+                                }
+                            } else {
+                                set_list = Some(list);
+                            }
+                        } else {
+                            pending_list = Some((in_rep, list));
+                        }
+                    }
+                    "Initialization" => {
+                        if let Some((_, list)) = pending_list.as_mut() {
+                            list.initialization = Some(ListInit {
+                                url: attrs.get("sourceURL").cloned(),
+                                range: attrs
+                                    .get("range")
+                                    .and_then(|v| parse_byte_range(v)),
+                            });
+                        }
+                    }
+                    "SegmentURL" => {
+                        if let Some((_, list)) = pending_list.as_mut() {
+                            list.segments.push(ListSegment {
+                                media: attrs.get("media").cloned(),
+                                range: attrs
+                                    .get("mediaRange")
+                                    .and_then(|v| parse_byte_range(v)),
+                            });
+                        }
+                    }
+                    "Representation" => {
+                        let rep = RepBuilder {
+                            id: attrs.get("id").cloned().unwrap_or_default(),
+                            bandwidth: attrs.get("bandwidth").and_then(|v| v.parse().ok()),
+                            width: attrs.get("width").and_then(|v| v.parse().ok()),
+                            height: attrs.get("height").and_then(|v| v.parse().ok()),
+                            frame_rate: attrs.get("frameRate").and_then(|v| {
+                                // frameRate may be a ratio ("30000/1001").
+                                if let Some((n, d)) = v.split_once('/') {
+                                    let n: f64 = n.parse().ok()?;
+                                    let d: f64 = d.parse().ok()?;
+                                    if d == 0.0 {
+                                        None
+                                    } else {
+                                        Some(n / d)
+                                    }
+                                } else {
+                                    v.parse().ok()
+                                }
+                            }),
+                            codecs: attrs.get("codecs").cloned(),
+                            mime_type: attrs.get("mimeType").cloned(),
+                            content_type: attrs.get("contentType").cloned(),
+                            own_base_url: None,
+                            own_template: None,
+                            own_list: None,
+                        };
+                        if is_empty {
+                            manifest.representations.push(finish_rep(
+                                rep,
+                                &set_mime,
+                                &set_content,
+                                &set_template,
+                                &set_list,
+                                &set_base_url,
+                                &period_base_url,
+                                &mpd_base_url,
+                            ));
+                        } else {
+                            current_rep = Some(rep);
+                        }
+                    }
+                    "ContentProtection" => {
+                        return Err(
+                            "This DASH stream is DRM-protected (ContentProtection). FetchForge does not bypass DRM."
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+                if !is_empty {
+                    stack.push(name);
+                }
+        }
+    }
+    if period_count == 0 {
+        return Err("This DASH manifest contains no Period element.".to_string());
+    }
+    if manifest.representations.is_empty() {
+        return Err("This DASH manifest contains no Representations.".to_string());
+    }
+    if manifest.duration_secs.is_none() {
+        manifest.duration_secs = period_duration;
+    }
+    Ok(manifest)
+}
+
+/// A Representation being built while its element is open.
+struct RepBuilder {
+    id: String,
+    bandwidth: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    frame_rate: Option<f64>,
+    codecs: Option<String>,
+    mime_type: Option<String>,
+    content_type: Option<String>,
+    own_base_url: Option<String>,
+    own_template: Option<SegmentTemplate>,
+    own_list: Option<DashSegmentList>,
+}
+
+/// Apply AdaptationSet/Period/MPD inheritance to a finished
+/// Representation builder.
+#[allow(clippy::too_many_arguments)]
+fn finish_rep(
+    rep: RepBuilder,
+    set_mime: &str,
+    set_content: &str,
+    set_template: &Option<SegmentTemplate>,
+    set_list: &Option<DashSegmentList>,
+    set_base_url: &Option<String>,
+    period_base_url: &Option<String>,
+    mpd_base_url: &Option<String>,
+) -> DashRepresentation {
+    DashRepresentation {
+        id: rep.id,
+        bandwidth: rep.bandwidth,
+        width: rep.width,
+        height: rep.height,
+        frame_rate: rep.frame_rate,
+        codecs: rep.codecs,
+        mime_type: rep.mime_type.unwrap_or_else(|| set_mime.to_string()),
+        content_type: rep.content_type.unwrap_or_else(|| set_content.to_string()),
+        base_url: rep
+            .own_base_url
+            .or_else(|| set_base_url.clone())
+            .or_else(|| period_base_url.clone())
+            .or_else(|| mpd_base_url.clone()),
+        template: rep.own_template.or_else(|| set_template.clone()),
+        segment_list: rep.own_list.or_else(|| set_list.clone()),
+    }
+}
+
+/// Compute a representation's segments: (initialisation segment,
+/// media segments). The initialisation segment downloads first and
+/// is part of the assembled file.
+fn dash_segments(
+    rep: &DashRepresentation,
     manifest_url: &str,
-    _destination_dir: &Path,
-    _filename: &str,
-    referer: &Option<String>,
-) -> Result<PathBuf, String> {
+    duration_secs: Option<f64>,
+) -> Result<(Option<Segment>, Vec<Segment>), String> {
+    let base = match &rep.base_url {
+        Some(b) => resolve(manifest_url, b),
+        None => manifest_url.to_string(),
+    };
+    if let Some(t) = &rep.template {
+        return template_segments(rep, t, &base, duration_secs);
+    }
+    if let Some(list) = &rep.segment_list {
+        return list_segments(list, &base);
+    }
+    Err(format!(
+        "Representation {} has neither a SegmentTemplate nor a SegmentList, so its segments cannot be found.",
+        rep.id
+    ))
+}
+
+fn template_segments(
+    rep: &DashRepresentation,
+    t: &SegmentTemplate,
+    base: &str,
+    duration_secs: Option<f64>,
+) -> Result<(Option<Segment>, Vec<Segment>), String> {
+    let init = match &t.initialization {
+        Some(init_tpl) => {
+            let url = substitute_template(init_tpl, &rep.id, rep.bandwidth, None, None)?;
+            Some(Segment {
+                url: resolve(base, &url),
+                range: None,
+            })
+        }
+        None => None,
+    };
+    let media_tpl = t.media.as_ref().ok_or_else(|| {
+        "This SegmentTemplate has no media attribute, so its segment URLs cannot be built."
+            .to_string()
+    })?;
+    let uses_time = media_tpl.contains("$Time");
+    let mut segments = Vec::new();
+    if !t.timeline.is_empty() {
+        // SegmentTimeline: expand S entries (r repeats each). Times
+        // default to the previous segment's end; the first defaults
+        // to 0. Numbers run from startNumber regardless of whether
+        // the template uses $Number$ or $Time$.
+        let mut number = t.start_number;
+        let mut time = 0u64;
+        for s in &t.timeline {
+            if let Some(st) = s.start {
+                time = st;
+            }
+            for _ in 0..=s.repeat {
+                let url = substitute_template(
+                    media_tpl,
+                    &rep.id,
+                    rep.bandwidth,
+                    Some(number),
+                    Some(time),
+                )?;
+                segments.push(Segment {
+                    url: resolve(base, &url),
+                    range: None,
+                });
+                number += 1;
+                time += s.duration;
+            }
+        }
+    } else if uses_time {
+        return Err(
+            "This SegmentTemplate uses $Time$ but the manifest has no SegmentTimeline."
+                .to_string(),
+        );
+    } else if let Some(d) = t.duration {
+        // Number-based: ceil(manifest duration / segment duration).
+        // The last segment is the partial remainder; it is a real
+        // segment on the server, not an overshoot.
+        let seg_secs = d as f64 / t.timescale.max(1) as f64;
+        let total = duration_secs.ok_or_else(|| {
+            "Cannot determine how many segments this stream has: no SegmentTimeline and no manifest duration."
+                .to_string()
+        })?;
+        let count = (total / seg_secs).ceil() as u64;
+        if count == 0 {
+            return Err("This manifest's duration is zero.".to_string());
+        }
+        for n in 0..count {
+            let url = substitute_template(
+                media_tpl,
+                &rep.id,
+                rep.bandwidth,
+                Some(t.start_number + n),
+                None,
+            )?;
+            segments.push(Segment {
+                url: resolve(base, &url),
+                range: None,
+            });
+        }
+    } else {
+        return Err(
+            "This SegmentTemplate has neither a duration nor a SegmentTimeline, so its segments cannot be counted."
+                .to_string(),
+        );
+    }
+    Ok((init, segments))
+}
+
+fn list_segments(
+    list: &DashSegmentList,
+    base: &str,
+) -> Result<(Option<Segment>, Vec<Segment>), String> {
+    let init = list.initialization.as_ref().map(|i| Segment {
+        url: match &i.url {
+            Some(u) => resolve(base, u),
+            None => base.to_string(),
+        },
+        range: i.range,
+    });
+    let mut segments = Vec::new();
+    for s in &list.segments {
+        match (&s.media, s.range) {
+            (Some(m), _) => segments.push(Segment {
+                url: resolve(base, m),
+                range: None,
+            }),
+            (None, Some(r)) => segments.push(Segment {
+                url: base.to_string(),
+                range: Some(r),
+            }),
+            (None, None) => {
+                return Err(
+                    "A SegmentURL in this manifest has neither a media URL nor a byte range."
+                        .to_string(),
+                );
+            }
+        }
+    }
+    if segments.is_empty() {
+        return Err("This SegmentList contains no segments.".to_string());
+    }
+    Ok((init, segments))
+}
+
+/// The default representation for the no-UI path: best video at or
+/// below 1080p, else the best video; an audio-only manifest falls
+/// back to the best audio representation.
+fn pick_default_representation<'a>(
+    reps: &'a [DashRepresentation],
+) -> Option<&'a DashRepresentation> {
+    let best_video = |max_height: Option<u32>| {
+        reps.iter()
+            .filter(|r| r.is_video())
+            .filter(|r| max_height.is_none_or(|m| r.height.unwrap_or(0) <= m))
+            .max_by(|a, b| {
+                a.height
+                    .unwrap_or(0)
+                    .cmp(&b.height.unwrap_or(0))
+                    .then(a.bandwidth.unwrap_or(0).cmp(&b.bandwidth.unwrap_or(0)))
+            })
+    };
+    best_video(Some(1080))
+        .or_else(|| best_video(None))
+        .or_else(|| {
+            reps.iter()
+                .filter(|r| r.is_audio())
+                .max_by_key(|r| r.bandwidth.unwrap_or(0))
+        })
+}
+
+/// Choose a representation by id (or the default), plus the audio
+/// representation it must merge with when the chosen one is video
+/// and the manifest keeps audio separate. Returns
+/// (chosen, audio pair or None).
+fn choose_dash_representation<'a>(
+    manifest: &'a DashManifest,
+    representation_id: Option<&str>,
+) -> Result<(&'a DashRepresentation, Option<&'a DashRepresentation>), String> {
+    let chosen = match representation_id {
+        Some(id) => manifest
+            .representations
+            .iter()
+            .find(|r| r.id == id)
+            .ok_or_else(|| {
+                format!(
+                    "The selected quality ({id}) is no longer available for this stream. List the formats again and pick another."
+                )
+            })?,
+        None => pick_default_representation(&manifest.representations)
+            .ok_or_else(|| "No downloadable representation was found in this manifest.".to_string())?,
+    };
+    let audio = if chosen.is_video() {
+        manifest
+            .representations
+            .iter()
+            .filter(|r| r.is_audio())
+            .max_by_key(|r| r.bandwidth.unwrap_or(0))
+    } else {
+        None
+    };
+    Ok((chosen, audio))
+}
+
+/// List the qualities of a DASH manifest: one format per
+/// representation. Video representations in a manifest with a
+/// separate audio track are video-only (merged with the best audio
+/// on download); audio representations are audio-only.
+pub fn list_dash_formats(manifest_url: &str) -> Result<StreamInfo, String> {
     let manifest_url = validate_url(manifest_url)?;
-    let text = fetch_text(&manifest_url, referer)?;
+    let text = fetch_text(&manifest_url, &None)?;
     if text.contains("ContentProtection") || text.contains("cenc:") {
         return Err(
             "This DASH stream is DRM-protected (ContentProtection). FetchForge does not bypass DRM."
                 .to_string(),
         );
     }
-    if text.matches("<Period").count() > 1 {
-        return Err("Multi-period DASH manifests are not supported in this release".to_string());
+    let manifest = parse_dash_manifest(&text)?;
+    let has_audio = manifest
+        .representations
+        .iter()
+        .any(|r| r.is_audio());
+    let formats = manifest
+        .representations
+        .iter()
+        .map(|r| {
+            let is_video = r.is_video();
+            let is_audio = r.is_audio();
+            StreamFormat {
+                id: r.id.clone(),
+                ext: if is_audio && !is_video {
+                    "m4a"
+                } else {
+                    "mp4"
+                }
+                .to_string(),
+                is_video,
+                is_audio,
+                height: r.height,
+                width: r.width,
+                abr_kbps: if is_audio {
+                    r.bandwidth.map(|b| b as f64 / 1000.0)
+                } else {
+                    None
+                },
+                vbr_kbps: if is_video {
+                    r.bandwidth.map(|b| b as f64 / 1000.0)
+                } else {
+                    None
+                },
+                fps: r.frame_rate,
+                filesize: None,
+                needs_merge: is_video && has_audio,
+            }
+        })
+        .collect();
+    Ok(StreamInfo {
+        kind: StreamKind::Dash,
+        title: title_from_manifest_url(&manifest_url),
+        duration_secs: manifest.duration_secs.map(|d| d as u64),
+        manifest_url,
+        formats,
+    })
+}
+
+/// Options for a DASH download.
+#[derive(Debug, Clone)]
+pub struct DashDownloadOptions {
+    pub manifest_url: String,
+    /// Representation id to download; None means the default
+    /// (best video at or below 1080p).
+    pub representation_id: Option<String>,
+    /// Final directory (the caller applies category organisation).
+    pub destination_dir: PathBuf,
+    /// Full filename (stem + extension from the plan).
+    pub filename: String,
+    pub referer: Option<String>,
+}
+
+/// Download a DASH manifest: resolve ffmpeg when the manifest
+/// needs a merge, then assemble via [`download_dash_with`].
+pub fn download_dash(
+    data_dir: &Path,
+    opts: &DashDownloadOptions,
+    progress: &dyn Fn(Progress),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+) -> Result<PathBuf, String> {
+    // One manifest fetch to decide whether a merge is needed; the
+    // assembly fetch is a second cheap GET of the same small file.
+    let manifest_url = validate_url(&opts.manifest_url)?;
+    let text = fetch_text(&manifest_url, &opts.referer)?;
+    if text.contains("ContentProtection") || text.contains("cenc:") {
+        return Err(
+            "This DASH stream is DRM-protected (ContentProtection). FetchForge does not bypass DRM."
+                .to_string(),
+        );
     }
-    // Full DASH segment assembly (initialisation + media segments, template
-    // substitution, per-representation choice) is implemented in the desktop
-    // app's media module in a later milestone; this engine entry point
-    // deliberately refuses rather than emitting a corrupt file.
-    Err(
-        "DASH segment assembly is not yet implemented for this manifest shape. \
-         Direct video files and HLS are supported; see docs/FEATURE_MATRIX.md."
-            .to_string(),
-    )
+    let manifest = parse_dash_manifest(&text)?;
+    let (_, audio) =
+        choose_dash_representation(&manifest, opts.representation_id.as_deref())?;
+    let ffmpeg = if audio.is_some() {
+        Some(crate::ffmpeg::ensure_ffmpeg(data_dir)?)
+    } else {
+        None
+    };
+    download_dash_with(ffmpeg.as_deref(), opts, progress, paused, cancelled)
+}
+
+/// The testable core of [`download_dash`]: ffmpeg is explicit, so
+/// tests can substitute a stub or the system ffmpeg. Assembles the
+/// chosen representation (initialisation + media segments, in
+/// order) into one file; when the manifest keeps audio separate,
+/// downloads the best audio representation too and merges both
+/// with ffmpeg (stream copy, no re-encode). Without ffmpeg a merge
+/// is refused with a clear error instead of producing a silent
+/// video.
+pub fn download_dash_with(
+    ffmpeg: Option<&Path>,
+    opts: &DashDownloadOptions,
+    progress: &dyn Fn(Progress),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+) -> Result<PathBuf, String> {
+    let manifest_url = validate_url(&opts.manifest_url)?;
+    let text = fetch_text(&manifest_url, &opts.referer)?;
+    if text.contains("ContentProtection") || text.contains("cenc:") {
+        return Err(
+            "This DASH stream is DRM-protected (ContentProtection). FetchForge does not bypass DRM."
+                .to_string(),
+        );
+    }
+    let manifest = parse_dash_manifest(&text)?;
+    let (chosen, audio) =
+        choose_dash_representation(&manifest, opts.representation_id.as_deref())?;
+    if audio.is_some() && ffmpeg.is_none() {
+        return Err(
+            "This quality keeps its audio on a separate track, which needs ffmpeg to merge. \
+             Install ffmpeg (or pick a combined quality) and try again."
+                .to_string(),
+        );
+    }
+    let clean = crate::filename::sanitize_filename(&opts.filename);
+    std::fs::create_dir_all(&opts.destination_dir).map_err(|e| e.to_string())?;
+    let final_path = crate::filename::unique_path(&opts.destination_dir, &clean);
+    let video_part = part_path_for(&final_path);
+    let (init, mut segments) =
+        dash_segments(chosen, &manifest_url, manifest.duration_secs)?;
+    if let Some(init) = init {
+        segments.insert(0, init);
+    }
+    let video_bytes = download_segments(
+        &segments,
+        &video_part,
+        &opts.referer,
+        0,
+        progress,
+        paused,
+        cancelled,
+    )?;
+    let Some(audio_rep) = audio else {
+        std::fs::rename(&video_part, &final_path).map_err(|e| e.to_string())?;
+        return Ok(final_path);
+    };
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = std::fs::remove_file(&video_part);
+        return Err("__CANCELLED__".to_string());
+    }
+    if paused.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("__PAUSED__".to_string());
+    }
+    let audio_part = final_path.with_file_name(format!(
+        "{}.audio.part",
+        final_path.file_name().unwrap().to_string_lossy()
+    ));
+    let (audio_init, mut audio_segments) =
+        dash_segments(audio_rep, &manifest_url, manifest.duration_secs)?;
+    if let Some(init) = audio_init {
+        audio_segments.insert(0, init);
+    }
+    download_segments(
+        &audio_segments,
+        &audio_part,
+        &opts.referer,
+        video_bytes,
+        progress,
+        paused,
+        cancelled,
+    )?;
+    let ffmpeg = ffmpeg.expect("audio merge checked ffmpeg above");
+    let merged = crate::ffmpeg::merge_av(ffmpeg, &video_part, &audio_part, &final_path);
+    let _ = std::fs::remove_file(&video_part);
+    let _ = std::fs::remove_file(&audio_part);
+    merged?;
+    Ok(final_path)
 }
 
 #[cfg(test)]
@@ -1341,6 +2302,391 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("ffmpeg"), "error: {err}");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_iso8601_duration_values() {
+        assert_eq!(parse_iso8601_duration("PT634.566S"), Some(634.566));
+        assert_eq!(parse_iso8601_duration("PT10M30.5S"), Some(630.5));
+        assert_eq!(parse_iso8601_duration("PT2H3M"), Some(7380.0));
+        assert_eq!(parse_iso8601_duration("P1DT2H"), Some(93600.0));
+        assert_eq!(parse_iso8601_duration("PT0S"), Some(0.0));
+        // Years/months/weeks are not supported.
+        assert_eq!(parse_iso8601_duration("P1M"), None);
+        assert_eq!(parse_iso8601_duration("P1Y"), None);
+        assert_eq!(parse_iso8601_duration("abc"), None);
+        assert_eq!(parse_iso8601_duration("PT"), Some(0.0));
+    }
+
+    #[test]
+    fn substitute_template_handles_variables_padding_and_escapes() {
+        let sub = |t: &str, n: Option<u64>, time: Option<u64>| {
+            substitute_template(t, "v720", Some(4000000), n, time)
+        };
+        assert_eq!(
+            sub("$RepresentationID$/$RepresentationID$_$Number$.m4v", Some(3), None).unwrap(),
+            "v720/v720_3.m4v"
+        );
+        assert_eq!(
+            sub("seg_$Time$.m4v", None, Some(20000)).unwrap(),
+            "seg_20000.m4v"
+        );
+        assert_eq!(
+            sub("seg_$Number%03d$.m4v", Some(7), None).unwrap(),
+            "seg_007.m4v"
+        );
+        assert_eq!(sub("100$$-off.m4v", None, None).unwrap(), "100$-off.m4v");
+        assert_eq!(
+            sub("$Bandwidth$.m4v", None, None).unwrap(),
+            "4000000.m4v"
+        );
+        assert!(sub("$Nope$.m4v", None, None).is_err());
+        assert!(sub("$Number.m4v", Some(1), None).is_err());
+        assert!(sub("$Number$.m4v", None, None).is_err());
+    }
+
+    /// Trimmed from the real Big Buck Bunny test manifest
+    /// (dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd): same
+    /// shapes — BaseURL, Number-based SegmentTemplate, separate
+    /// audio AdaptationSet — with 2 video + 1 audio representations
+    /// and an 8 s duration to keep segment counts small.
+    const BBB_MPD: &str = r#"<MPD mediaPresentationDuration="PT8S" minBufferTime="PT2.00S" type="static" xmlns="urn:mpeg:dash:schema:mpd:2011">
+ <BaseURL>./</BaseURL>
+ <Period>
+  <AdaptationSet mimeType="video/mp4" contentType="video">
+   <SegmentTemplate duration="120" timescale="30" media="$RepresentationID$/$RepresentationID$_$Number$.m4v" startNumber="1" initialization="$RepresentationID$/$RepresentationID$_0.m4v"/>
+   <Representation id="v360" codecs="avc1.64001e" bandwidth="1000000" width="640" height="360" frameRate="30"/>
+   <Representation id="v720" codecs="avc1.64001f" bandwidth="4000000" width="1280" height="720" frameRate="30000/1001"/>
+  </AdaptationSet>
+  <AdaptationSet mimeType="audio/mp4" contentType="audio">
+   <SegmentTemplate duration="192512" timescale="48000" media="$RepresentationID$/$RepresentationID$_$Number$.m4a" startNumber="1" initialization="$RepresentationID$/$RepresentationID$_0.m4a"/>
+   <Representation id="a64k" codecs="mp4a.40.5" bandwidth="67071" audioSamplingRate="48000">
+    <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"/>
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>"#;
+
+    #[test]
+    fn parse_dash_manifest_template_number() {
+        let m = parse_dash_manifest(BBB_MPD).unwrap();
+        assert_eq!(m.duration_secs, Some(8.0));
+        assert_eq!(m.representations.len(), 3);
+        let v720 = m
+            .representations
+            .iter()
+            .find(|r| r.id == "v720")
+            .unwrap();
+        assert_eq!((v720.width, v720.height), (Some(1280), Some(720)));
+        assert_eq!(v720.bandwidth, Some(4_000_000));
+        // frameRate may be a ratio: 30000/1001 ≈ 29.97.
+        assert!((v720.frame_rate.unwrap() - 29.97).abs() < 0.01);
+        assert_eq!(v720.mime_type, "video/mp4");
+        assert!(v720.is_video());
+        assert!(!v720.is_audio());
+        assert_eq!(v720.base_url.as_deref(), Some("./"));
+        let tpl = v720.template.as_ref().unwrap();
+        assert_eq!(tpl.timescale, 30);
+        assert_eq!(tpl.duration, Some(120));
+        assert_eq!(tpl.start_number, 1);
+        assert!(tpl.timeline.is_empty());
+        let a = m.representations.iter().find(|r| r.id == "a64k").unwrap();
+        assert!(a.is_audio());
+        // Default: best video at or below 1080p (720p, not 360p).
+        assert_eq!(pick_default_representation(&m.representations).unwrap().id, "v720");
+        // Segments for 8 s at 4 s each: init + 2 media segments.
+        let (init, segs) =
+            dash_segments(v720, "https://example.com/bbb/bbb.mpd", m.duration_secs).unwrap();
+        assert_eq!(
+            init.unwrap().url,
+            "https://example.com/bbb/v720/v720_0.m4v"
+        );
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].url, "https://example.com/bbb/v720/v720_1.m4v");
+        assert_eq!(segs[1].url, "https://example.com/bbb/v720/v720_2.m4v");
+    }
+
+    const TIMELINE_MPD: &str = r#"<MPD type="static" mediaPresentationDuration="PT30S" xmlns="urn:mpeg:dash:schema:mpd:2011">
+ <Period>
+  <AdaptationSet mimeType="video/mp4" contentType="video">
+   <SegmentTemplate timescale="1000" media="seg_$Time$.m4v" initialization="init.m4v">
+    <SegmentTimeline>
+     <S t="0" d="10000" r="1"/>
+     <S d="10000"/>
+    </SegmentTimeline>
+   </SegmentTemplate>
+   <Representation id="v1" bandwidth="1000000" width="640" height="360"/>
+  </AdaptationSet>
+ </Period>
+</MPD>"#;
+
+    #[test]
+    fn parse_dash_manifest_timeline_and_time_template() {
+        let m = parse_dash_manifest(TIMELINE_MPD).unwrap();
+        let rep = &m.representations[0];
+        let tpl = rep.template.as_ref().unwrap();
+        assert_eq!(tpl.timeline.len(), 2);
+        assert_eq!(tpl.timeline[0].repeat, 1);
+        // S(t=0,d=10000,r=1) -> t=0,10000; S(d=10000) -> t=20000.
+        let (init, segs) =
+            dash_segments(rep, "https://example.com/x.mpd", m.duration_secs).unwrap();
+        assert_eq!(init.unwrap().url, "https://example.com/init.m4v");
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[0].url, "https://example.com/seg_0.m4v");
+        assert_eq!(segs[1].url, "https://example.com/seg_10000.m4v");
+        assert_eq!(segs[2].url, "https://example.com/seg_20000.m4v");
+    }
+
+    const LIST_MPD: &str = r#"<MPD type="static" mediaPresentationDuration="PT10S" xmlns="urn:mpeg:dash:schema:mpd:2011">
+ <Period>
+  <AdaptationSet mimeType="video/mp4" contentType="video">
+   <SegmentList timescale="1" duration="5">
+    <Initialization sourceURL="init.mp4"/>
+    <SegmentURL media="seg1.m4v"/>
+    <SegmentURL mediaRange="100-199"/>
+   </SegmentList>
+   <Representation id="v1" bandwidth="1000000" width="640" height="360">
+    <BaseURL>file.mp4</BaseURL>
+   </Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>"#;
+
+    #[test]
+    fn parse_dash_manifest_segment_list() {
+        let m = parse_dash_manifest(LIST_MPD).unwrap();
+        let rep = &m.representations[0];
+        assert_eq!(rep.base_url.as_deref(), Some("file.mp4"));
+        let (init, segs) =
+            dash_segments(rep, "https://example.com/list.mpd", m.duration_secs).unwrap();
+        assert_eq!(init.unwrap().url, "https://example.com/init.mp4");
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].url, "https://example.com/seg1.m4v");
+        assert_eq!(segs[0].range, None);
+        // A mediaRange segment is a byte range of the BaseURL file.
+        assert_eq!(segs[1].url, "https://example.com/file.mp4");
+        assert_eq!(segs[1].range, Some((100, 199)));
+    }
+
+    #[test]
+    fn parse_dash_manifest_refusals() {
+        let drm = "<MPD type=\"static\" xmlns=\"urn:mpeg:dash:schema:mpd:2011\"><Period><AdaptationSet><ContentProtection/></AdaptationSet></Period></MPD>";
+        assert!(parse_dash_manifest(drm).unwrap_err().contains("DRM"));
+        let live = BBB_MPD.replace("type=\"static\"", "type=\"dynamic\"");
+        assert!(parse_dash_manifest(&live).unwrap_err().contains("live"));
+        let multi = BBB_MPD.replace("</Period>", "</Period><Period></Period>");
+        assert!(parse_dash_manifest(&multi).unwrap_err().contains("Multi-period"));
+        let no_period = "<MPD type=\"static\" xmlns=\"urn:mpeg:dash:schema:mpd:2011\"></MPD>";
+        assert!(parse_dash_manifest(no_period).is_err());
+        let no_reps = "<MPD type=\"static\" xmlns=\"urn:mpeg:dash:schema:mpd:2011\"><Period></Period></MPD>";
+        assert!(parse_dash_manifest(no_reps).is_err());
+        // $Time$ without a timeline: the template still uses $Time$
+        // but the timeline is commented out. Parsing succeeds;
+        // segment computation must fail clearly.
+        let no_timeline = TIMELINE_MPD
+            .replace("<SegmentTimeline>", "<!--")
+            .replace("</SegmentTimeline>", "-->");
+        let m = parse_dash_manifest(&no_timeline).unwrap();
+        let err = dash_segments(&m.representations[0], "https://example.com/x.mpd", m.duration_secs)
+            .unwrap_err();
+        assert!(err.contains("$Time$"), "error: {err}");
+    }
+
+    #[test]
+    fn list_dash_formats_lists_representations() {
+        let mut files = HashMap::new();
+        files.insert("/bbb.mpd".to_string(), BBB_MPD.as_bytes().to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let info = list_dash_formats(&format!("http://127.0.0.1:{port}/bbb.mpd")).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(info.kind, StreamKind::Dash);
+        assert_eq!(info.duration_secs, Some(8));
+        assert_eq!(info.formats.len(), 3);
+        let v720 = info.formats.iter().find(|f| f.id == "v720").unwrap();
+        assert_eq!(v720.height, Some(720));
+        assert!(v720.is_video && !v720.is_audio);
+        assert!(v720.needs_merge); // separate audio track exists
+        assert_eq!(v720.ext, "mp4");
+        let a = info.formats.iter().find(|f| f.id == "a64k").unwrap();
+        assert!(a.is_audio && !a.is_video);
+        assert_eq!(a.ext, "m4a");
+        assert!(!a.needs_merge);
+    }
+
+    #[test]
+    fn download_dash_with_assembles_template_segments() {
+        let mut files = HashMap::new();
+        // Video-only manifest (no audio set): no merge, plain concat.
+        let mpd = r#"<MPD type="static" mediaPresentationDuration="PT8S" xmlns="urn:mpeg:dash:schema:mpd:2011">
+ <Period><AdaptationSet mimeType="video/mp4" contentType="video">
+  <SegmentTemplate duration="120" timescale="30" media="v_$Number$.m4v" startNumber="1" initialization="v_init.m4v"/>
+  <Representation id="v1" bandwidth="1000000" width="640" height="360"/>
+ </AdaptationSet></Period></MPD>"#;
+        files.insert("/v.mpd".to_string(), mpd.as_bytes().to_vec());
+        files.insert("/v_init.m4v".to_string(), b"INIT-".to_vec());
+        files.insert("/v_1.m4v".to_string(), b"SEG-ONE-".to_vec());
+        files.insert("/v_2.m4v".to_string(), b"SEG-TWO".to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let dir = unique_temp_dir("dash-dl");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let opts = DashDownloadOptions {
+            manifest_url: format!("http://127.0.0.1:{port}/v.mpd"),
+            representation_id: Some("v1".to_string()),
+            destination_dir: dir.clone(),
+            filename: "clip.mp4".to_string(),
+            referer: None,
+        };
+        let out = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"INIT-SEG-ONE-SEG-TWO");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_dash_with_segment_list_ranges() {
+        let mut files = HashMap::new();
+        files.insert("/list.mpd".to_string(), LIST_MPD.as_bytes().to_vec());
+        files.insert("/init.mp4".to_string(), b"INIT!".to_vec());
+        files.insert("/seg1.m4v".to_string(), b"SEG1".to_vec());
+        let mut file_bytes = vec![b'A'; 100];
+        file_bytes.extend(vec![b'B'; 100]);
+        file_bytes.extend(vec![b'C'; 100]);
+        files.insert("/file.mp4".to_string(), file_bytes);
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let dir = unique_temp_dir("dash-list");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let opts = DashDownloadOptions {
+            manifest_url: format!("http://127.0.0.1:{port}/list.mpd"),
+            representation_id: Some("v1".to_string()),
+            destination_dir: dir.clone(),
+            filename: "clip.mp4".to_string(),
+            referer: None,
+        };
+        let out = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        // init + seg1 + bytes 100..199 of file.mp4 (100 B's). The
+        // test server ignores Range and returns the whole file, so
+        // this also proves the 200-response slicing path.
+        let mut expected = b"INIT!SEG1".to_vec();
+        expected.extend(vec![b'B'; 100]);
+        assert_eq!(std::fs::read(&out).unwrap(), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_dash_with_merges_separate_audio() {
+        // Needs a real ffmpeg; skip where none exists.
+        let ffmpeg = match crate::ffmpeg::find_on_path("ffmpeg") {
+            Some(p) => p,
+            None => return,
+        };
+        let dir = unique_temp_dir("dash-merge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |args: &[&str]| {
+            use std::process::{Command, Stdio};
+            Command::new(&ffmpeg)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let vmp4 = dir.join("v.mp4");
+        let am4a = dir.join("a.m4a");
+        assert!(mk(&[
+            "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", vmp4.to_str().unwrap()
+        ]));
+        assert!(mk(&[
+            "-y", "-f", "lavfi", "-i", "sine=frequency=440:d=1",
+            "-c:a", "aac", am4a.to_str().unwrap()
+        ]));
+        let vbytes = std::fs::read(&vmp4).unwrap();
+        let abytes = std::fs::read(&am4a).unwrap();
+        let (v0, v1) = vbytes.split_at(vbytes.len() / 2);
+        let (a0, a1) = abytes.split_at(abytes.len() / 2);
+        // 1 s manifest, 1 s segments: init + 1 segment per track.
+        let mpd = r#"<MPD type="static" mediaPresentationDuration="PT1S" xmlns="urn:mpeg:dash:schema:mpd:2011">
+ <Period>
+  <AdaptationSet mimeType="video/mp4" contentType="video">
+   <SegmentTemplate duration="1" timescale="1" media="v_$Number$.m4v" startNumber="1" initialization="v_init.m4v"/>
+   <Representation id="v1" bandwidth="1000000" width="64" height="64"/>
+  </AdaptationSet>
+  <AdaptationSet mimeType="audio/mp4" contentType="audio">
+   <SegmentTemplate duration="1" timescale="1" media="a_$Number$.m4a" startNumber="1" initialization="a_init.m4a"/>
+   <Representation id="a1" bandwidth="64000"/>
+  </AdaptationSet>
+ </Period></MPD>"#;
+        let mut files = HashMap::new();
+        files.insert("/v.mpd".to_string(), mpd.as_bytes().to_vec());
+        files.insert("/v_init.m4v".to_string(), v0.to_vec());
+        files.insert("/v_1.m4v".to_string(), v1.to_vec());
+        files.insert("/a_init.m4a".to_string(), a0.to_vec());
+        files.insert("/a_1.m4a".to_string(), a1.to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let opts = DashDownloadOptions {
+            manifest_url: format!("http://127.0.0.1:{port}/v.mpd"),
+            representation_id: Some("v1".to_string()),
+            destination_dir: dir.clone(),
+            filename: "merged.mp4".to_string(),
+            referer: None,
+        };
+        let out =
+            download_dash_with(Some(&ffmpeg), &opts, &|_| {}, &paused, &cancelled).unwrap();
+        assert!(out.is_file());
+        assert!(std::fs::metadata(&out).unwrap().len() > 0);
+        // No ffmpeg -> the same manifest is refused, not silently
+        // downloaded as a silent video.
+        let err = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled).unwrap_err();
+        assert!(err.contains("ffmpeg"), "error: {err}");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_dash_with_refuses_drm() {
+        let mpd = "<MPD type=\"static\" xmlns=\"urn:mpeg:dash:schema:mpd:2011\"><Period><AdaptationSet><ContentProtection schemeIdUri=\"urn:uuid:edef8ba9\"/></AdaptationSet></Period></MPD>";
+        let mut files = HashMap::new();
+        files.insert("/drm.mpd".to_string(), mpd.as_bytes().to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let dir = unique_temp_dir("dash-drm");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let opts = DashDownloadOptions {
+            manifest_url: format!("http://127.0.0.1:{port}/drm.mpd"),
+            representation_id: None,
+            destination_dir: dir.clone(),
+            filename: "x.mp4".to_string(),
+            referer: None,
+        };
+        let err = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled).unwrap_err();
+        assert!(err.contains("DRM"), "error: {err}");
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);

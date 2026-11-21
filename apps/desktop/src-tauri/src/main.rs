@@ -9,10 +9,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use fetchforge_engine::{
-    category_for_filename, download, download_hls_variant, download_media, drive_direct_url,
-    drive_file_id, ensure_ffmpeg, find_ytdlp, generate_download_id, list_formats,
-    plan_media_download, probe, sanitize_filename, stop_reason, DownloadOptions, DownloadRecord,
-    MediaDownloadOptions, MediaInfo, Status, Store,
+    category_for_filename, download, download_dash, download_hls_variant, download_media,
+    drive_direct_url, drive_file_id, ensure_ffmpeg, find_ytdlp, generate_download_id,
+    list_formats, plan_media_download, probe, sanitize_filename, stop_reason,
+    DashDownloadOptions, DownloadOptions, DownloadRecord, MediaDownloadOptions, MediaInfo,
+    Status, Store,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -451,12 +452,15 @@ fn run_download(state: &Arc<State>, id: &str, job: &Job) {
     // Stream downloads (HLS/DASH) run through media.rs; yt-dlp
     // media downloads (a format was chosen) run through yt-dlp;
     // everything else takes the direct path, exactly as before.
-    // DASH records cannot exist yet (planning refuses .mpd with a
-    // clear message until the DASH assembly lands); the arm below
-    // fails them honestly rather than misrouting them.
+    // An unknown stream kind fails honestly rather than being
+    // misrouted to the wrong engine.
     match rec.stream_kind.as_deref() {
         Some("hls") => {
             run_stream_hls_download(state, &rec, job);
+            return;
+        }
+        Some("dash") => {
+            run_stream_dash_download(state, &rec, job);
             return;
         }
         Some(other) => {
@@ -658,6 +662,74 @@ fn run_stream_hls_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) 
         &rec.filename,
         &None,
         ffmpeg.as_deref(),
+        &progress,
+        &job.paused,
+        &job.cancelled,
+    ) {
+        Ok(final_path) => {
+            let mut store = state.store.lock().unwrap();
+            if let Some(mut r) = store.get(&id).cloned() {
+                r.status = Status::Completed;
+                r.destination = final_path.to_string_lossy().to_string();
+                if let Some(name) = final_path.file_name() {
+                    r.filename = name.to_string_lossy().to_string();
+                }
+                r.error = None;
+                r.updated_unix = now_unix();
+                store.upsert(r);
+                let _ = store.save();
+            }
+        }
+        Err(e) => {
+            if let Some(reason) = stop_reason(&e) {
+                match reason {
+                    fetchforge_engine::download::StopReason::Paused => {
+                        set_status(state, &id, Status::Paused, None)
+                    }
+                    fetchforge_engine::download::StopReason::Cancelled => {
+                        set_status(state, &id, Status::Cancelled, None)
+                    }
+                }
+            } else {
+                set_status(state, &id, Status::Failed, Some(e));
+            }
+        }
+    }
+}
+
+/// Run a DASH download (media.rs). Mirrors the bridge's
+/// run_stream_dash: the record's format_id is the chosen
+/// representation id (None means the default), and ffmpeg is
+/// resolved inside the engine only when the manifest keeps audio
+/// separate from the chosen video representation.
+fn run_stream_dash_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
+    let id = rec.id.clone();
+    set_status(state, &id, Status::Downloading, None);
+    let dir = state
+        .download_dir
+        .join(category_for_filename(&rec.filename));
+    let opts = DashDownloadOptions {
+        manifest_url: rec.url.clone(),
+        representation_id: rec.format_id.clone(),
+        destination_dir: dir,
+        filename: rec.filename.clone(),
+        referer: None,
+    };
+    let id2 = id.clone();
+    let state2 = Arc::clone(state);
+    let progress = move |p: fetchforge_engine::Progress| {
+        let mut store = state2.store.lock().unwrap();
+        if let Some(mut r) = store.get(&id2).cloned() {
+            r.downloaded_bytes = p.downloaded;
+            r.total_bytes = p.total.or(r.total_bytes);
+            r.updated_unix = now_unix();
+            store.upsert(r);
+            let _ = store.save();
+        }
+    };
+    match download_dash(
+        &state.data_dir,
+        &opts,
         &progress,
         &job.paused,
         &job.cancelled,

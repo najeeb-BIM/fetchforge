@@ -15,10 +15,11 @@
 //!   fetchforge-bridge print-token [--data-dir DIR]
 
 use fetchforge_engine::{
-    category_for_filename, download, download_hls_variant, download_media, drive_direct_url,
-    drive_file_id, ensure_ffmpeg, find_ytdlp, generate_download_id, generate_secure_token,
-    list_formats, plan_media_download, probe, sanitize_filename, stop_reason, DownloadOptions,
-    DownloadRecord, MediaDownloadOptions, Status, Store,
+    category_for_filename, download, download_dash, download_hls_variant, download_media,
+    drive_direct_url, drive_file_id, ensure_ffmpeg, find_ytdlp, generate_download_id,
+    generate_secure_token, list_formats, plan_media_download, probe, sanitize_filename,
+    stop_reason, DashDownloadOptions, DownloadOptions, DownloadRecord, MediaDownloadOptions,
+    Status, Store,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -581,11 +582,11 @@ impl App {
         // Stream downloads (HLS/DASH) run through media.rs; yt-dlp
         // media downloads (a format was chosen) run through yt-dlp;
         // everything else takes the direct path, exactly as before.
-        // DASH records cannot exist yet (planning refuses .mpd with
-        // a clear message until the DASH assembly lands); the arm
-        // below fails them honestly rather than misrouting them.
+        // An unknown stream kind fails honestly rather than being
+        // misrouted to the wrong engine.
         match rec.stream_kind.as_deref() {
             Some("hls") => return self.run_stream_hls(&rec, job),
+            Some("dash") => return self.run_stream_dash(&rec, job),
             Some(other) => {
                 self.set_status(
                     id,
@@ -796,6 +797,79 @@ impl App {
             &rec.filename,
             &None,
             ffmpeg.as_deref(),
+            &progress,
+            &job.paused,
+            &job.cancelled,
+        ) {
+            Ok(final_path) => {
+                let mut store = self.store.lock().unwrap();
+                if let Some(mut r) = store.get(&id).cloned() {
+                    r.status = Status::Completed;
+                    r.destination = final_path.to_string_lossy().to_string();
+                    if let Some(name) = final_path.file_name() {
+                        r.filename = name.to_string_lossy().to_string();
+                    }
+                    r.downloaded_bytes = r.total_bytes.unwrap_or(r.downloaded_bytes);
+                    r.error = None;
+                    r.updated_unix = now_unix();
+                    store.upsert(r);
+                    let _ = store.save();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(reason) = stop_reason(&e) {
+                    match reason {
+                        fetchforge_engine::download::StopReason::Paused => {
+                            self.set_status(&id, Status::Paused, None);
+                        }
+                        fetchforge_engine::download::StopReason::Cancelled => {
+                            self.set_status(&id, Status::Cancelled, None);
+                        }
+                    }
+                    Ok(())
+                } else {
+                    self.set_status(&id, Status::Failed, Some(e));
+                    Err("download failed".to_string())
+                }
+            }
+        }
+    }
+
+    /// Run a DASH download (media.rs). The record's format_id is the
+    /// chosen representation id (None means the default). ffmpeg is
+    /// resolved inside the engine only when the manifest keeps audio
+    /// separate from the chosen video representation.
+    fn run_stream_dash(&self, rec: &DownloadRecord, job: &Job) -> Result<(), String> {
+        let id = rec.id.clone();
+        self.set_status(&id, Status::Downloading, None);
+        let mut dir = PathBuf::from(&self.settings.download_dir);
+        if self.settings.organise_by_category {
+            dir = dir.join(category_for_filename(&rec.filename));
+        }
+        let opts = DashDownloadOptions {
+            manifest_url: rec.url.clone(),
+            representation_id: rec.format_id.clone(),
+            destination_dir: dir,
+            filename: rec.filename.clone(),
+            referer: None,
+        };
+        let app_id = id.clone();
+        let store_clone = &self.store;
+        let progress = |p: fetchforge_engine::Progress| {
+            let mut store = store_clone.lock().unwrap();
+            if let Some(r) = store.get(&app_id).cloned() {
+                let mut r = r;
+                r.downloaded_bytes = p.downloaded;
+                r.total_bytes = p.total.or(r.total_bytes);
+                r.updated_unix = now_unix();
+                store.upsert(r);
+                let _ = store.save();
+            }
+        };
+        match download_dash(
+            &self.data_dir,
+            &opts,
             &progress,
             &job.paused,
             &job.cancelled,

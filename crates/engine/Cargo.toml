@@ -17,5 +17,9 @@ url = "2"
 # (first-use ffmpeg provisioning). Deflate only: the gyan zip uses
 # deflate, and the other codecs would only bloat the binary.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Parsing DASH manifests (MPD is XML; attribute order, self-closing
+# tags and namespaces vary, so a real parser beats string scanning).
+# No default features: MPDs are UTF-8, encoding_rs is not needed.
+quick-xml = { version = "0.38", default-features = false }
 
 [dev-dependencies]

@@ -45,10 +45,15 @@ crates/engine/
   filename.rs   Windows sanitising, Content-Disposition, unique paths
   category.rs   extension -> Video/Audio/Documents/Images/Archives/Software/Other
   download.rs   probe, single-stream resume, segmented, retry, limiter
-  media.rs      HLS (clear only), DASH (refuses DRM/unsupported shapes)
+  media.rs      HLS + DASH (clear only): manifest parsing, variant /
+                representation listing, segment assembly, resume;
+                refuses DRM/live/multi-period honestly
   extract.rs    yt-dlp wrapper: format listing, quality choice, media
-                download (+ ffmpeg merge), tool provisioning (yt-dlp /
-                ffmpeg lookup, pinned first-use download, SHA-256)
+                download (+ ffmpeg merge); routes .m3u8/.mpd URLs to
+                media.rs (never to yt-dlp)
+  ffmpeg.rs     ffmpeg lookup, pinned first-use download (SHA-256),
+                stream-copy merge of separate video+audio tracks
+                (extract.rs keeps the yt-dlp provisioning side)
   state.rs      JSON store, atomic save, recover_interrupted()
 crates/bridge/
   main.rs       loopback HTTP API, token auth, origin check, native host
@@ -89,9 +94,12 @@ it, merging separate streams with ffmpeg when needed.
   single-stream download resumes via Range. See FEATURE_MATRIX.md.
 - Segmented progress is reported at segment completion, not per chunk.
 - No scheduler yet (no timed start/stop). Queue priority is FIFO.
-- DASH segment assembly is not implemented; it refuses instead of
-  producing a corrupt file. HLS clear playlists work in the engine but
-  are not yet exposed through the bridge/UI.
+- DASH covers clear single-period manifests with SegmentTemplate
+  (Number or SegmentTimeline) or SegmentList; multi-period, live
+  (dynamic) and DRM-protected manifests are refused honestly. HLS
+  covers clear master/media playlists; encrypted (EXT-X-KEY) and
+  live playlists are refused (a live playlist is downloaded only as
+  the finite snapshot listed at fetch time, never re-fetched).
 - yt-dlp is pinned (2026.10.26) and bundled; a newer yt-dlp ships with
   the next app release. ffmpeg (Windows) downloads once on first merge
   (~114 MB); on Linux/macOS a system ffmpeg is required for merges.

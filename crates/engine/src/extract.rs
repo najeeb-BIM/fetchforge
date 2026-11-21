@@ -238,6 +238,7 @@ fn format_label(
     fps: Option<f64>,
     filesize: Option<u64>,
     filesize_approx: bool,
+    needs_merge: bool,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if format_id == "source" {
@@ -271,7 +272,16 @@ fn format_label(
                 parts.push("video + audio".to_string());
             }
         }
-        FormatKind::VideoOnly => parts.push("video only (merged with best audio)".to_string()),
+        FormatKind::VideoOnly => {
+            // Only promise a merge when one actually happens: a DASH
+            // video representation in a manifest with no audio track
+            // downloads as-is (video only, no merge).
+            if needs_merge {
+                parts.push("video only (merged with best audio)".to_string())
+            } else {
+                parts.push("video only".to_string())
+            }
+        }
         FormatKind::AudioOnly => {
             if let Some(a) = abr {
                 parts.push(format!("{a:.0} kbps"));
@@ -387,6 +397,7 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
                 fps,
                 filesize,
                 filesize_approx,
+                needs_merge,
             );
             formats.push(MediaFormat {
                 format_id: format_id.to_string(),
@@ -414,7 +425,7 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
             let filesize = value.get("filesize").and_then(|v| v.as_u64());
             formats.push(MediaFormat {
                 format_id: opt_str(value, "format_id").unwrap_or("0").to_string(),
-                label: format_label("0", FormatKind::Combined, &ext, None, None, None, None, filesize, false),
+                label: format_label("0", FormatKind::Combined, &ext, None, None, None, None, filesize, false, false),
                 ext,
                 kind: FormatKind::Combined,
                 height: None,
@@ -751,6 +762,7 @@ fn stream_info_to_media_info(info: &crate::media::StreamInfo) -> MediaInfo {
                     f.fps,
                     f.filesize,
                     false,
+                    f.needs_merge,
                 ),
                 ext: f.ext.clone(),
                 kind,
@@ -2033,6 +2045,48 @@ exit 0
         assert_eq!(plan.format_id, format!("http://127.0.0.1:{port}/low.m3u8"));
         // Unknown format id is a clear error.
         assert!(plan_media_download(&dir, &url, Some("nope"), None).is_err());
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn plan_stream_download_dash_picks_default_video_with_merge() {
+        // DASH manifest with separate audio: default is the best
+        // video at or below 1080p (720p), needs_merge, .mp4.
+        let mpd = r#"<MPD type="static" mediaPresentationDuration="PT8S" xmlns="urn:mpeg:dash:schema:mpd:2011">
+ <Period>
+  <AdaptationSet mimeType="video/mp4" contentType="video">
+   <SegmentTemplate duration="120" timescale="30" media="$RepresentationID$/$RepresentationID$_$Number$.m4v" startNumber="1" initialization="$RepresentationID$/$RepresentationID$_0.m4v"/>
+   <Representation id="v360" codecs="avc1.64001e" bandwidth="1000000" width="640" height="360" frameRate="30"/>
+   <Representation id="v720" codecs="avc1.64001f" bandwidth="4000000" width="1280" height="720" frameRate="30"/>
+  </AdaptationSet>
+  <AdaptationSet mimeType="audio/mp4" contentType="audio">
+   <SegmentTemplate duration="192512" timescale="48000" media="$RepresentationID$/$RepresentationID$_$Number$.m4a" startNumber="1" initialization="$RepresentationID$/$RepresentationID$_0.m4a"/>
+   <Representation id="a64k" codecs="mp4a.40.5" bandwidth="67071"/>
+  </AdaptationSet>
+ </Period></MPD>"#;
+        let mut files = std::collections::HashMap::new();
+        files.insert("/bbb.mpd".to_string(), mpd.as_bytes().to_vec());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_files(files, stop.clone());
+        let url = format!("http://127.0.0.1:{port}/bbb.mpd");
+        let dir = std::env::temp_dir().join("fetchforge-test-dash-plan");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let info = list_formats(&dir, &url).unwrap();
+        assert_eq!(info.extractor, "DASH");
+        assert_eq!(info.formats.len(), 3);
+        let plan = plan_media_download(&dir, &url, None, None).unwrap();
+        assert_eq!(plan.format_id, "v720");
+        assert!(plan.filename.ends_with(".mp4"), "filename: {}", plan.filename);
+        assert!(plan.needs_merge);
+        assert_eq!(plan.stream_kind, Some(crate::media::StreamKind::Dash));
+        assert_eq!(plan.selector, "");
+        // Audio-only choice: .m4a, no merge.
+        let plan = plan_media_download(&dir, &url, Some("a64k"), None).unwrap();
+        assert_eq!(plan.format_id, "a64k");
+        assert!(plan.filename.ends_with(".m4a"), "filename: {}", plan.filename);
+        assert!(!plan.needs_merge);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
     }

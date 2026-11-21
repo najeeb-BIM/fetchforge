@@ -63,8 +63,8 @@ PARTIAL = implemented but with a stated limit. NOT YET = not in v0.2.0.
 | Google Drive public files | DONE | yt-dlp Drive extractor; direct uc-download fallback when extraction fails (accepted only when the probe is non-HTML) |
 | Audio/video merging (ffmpeg) | DONE | Video-only formats merge with best audio; ffmpeg downloaded once on first merge (Windows, SHA-256-verified), system ffmpeg preferred |
 | Live streams | NOT YET | Refused with a plain explanation |
-| HLS clear playlists | PARTIAL | Engine function works; not yet exposed via bridge/UI |
-| DASH | NOT YET | Refuses DRM/unsupported shapes honestly; no segment assembly |
+| HLS clear playlists | DONE | Master/variant parsing, quality picker, separate-audio merge via ffmpeg; resume via segment sidecar |
+| DASH clear single-period manifests | DONE | SegmentTemplate (Number + SegmentTimeline) and SegmentList (media + mediaRange); separate-audio merge via ffmpeg; DRM/multi-period/live refused honestly |
 | DRM / paywall bypass | NEVER | Refused by design |
 
 ## Packaging

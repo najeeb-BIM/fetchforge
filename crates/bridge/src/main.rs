@@ -271,7 +271,21 @@ impl App {
             url: clean_url.clone(),
             ..Default::default()
         };
-        let (filename, total, resumable) = match probe(&probe_opts) {
+        // A web page is not a downloadable file: a YouTube watch page (or
+        // any HTML page) would otherwise be saved as a useless file named
+        // after the URL path. Refuse it here so the probe-error branch
+        // below records a Failed row with this reason.
+        let probe_result = probe(&probe_opts).and_then(|p| {
+            if p.content_type
+                .as_deref()
+                .is_some_and(|ct| ct.starts_with("text/html"))
+            {
+                Err("This link is a web page, not a downloadable file. FetchForge downloads direct file links; video pages such as YouTube are not supported yet.".to_string())
+            } else {
+                Ok(p)
+            }
+        });
+        let (filename, total, resumable) = match probe_result {
             Ok(p) => (
                 filename
                     .as_deref()
@@ -707,14 +721,12 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
         return;
     }
     if method == "GET" && path == "/downloads" {
-        let list: Vec<DownloadRecord> = app
-            .store
-            .lock()
-            .unwrap()
-            .all()
-            .into_iter()
-            .cloned()
-            .collect();
+        let list: Vec<DownloadRecord> = {
+            let mut store = app.store.lock().unwrap();
+            // Pick up downloads added by the desktop app since launch.
+            store.reload_from_disk();
+            store.all().into_iter().cloned().collect()
+        };
         let body = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
         let _ = stream.write_all(http_response(200, &body).as_bytes());
         return;

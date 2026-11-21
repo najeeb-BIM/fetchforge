@@ -73,8 +73,8 @@
   // ---- Detector registry (Phase 7 plug-in point) ----
   //
   // A detector is { kind, selector, overlay, extract }:
-  //   kind     - item kind reported to the app ("video" | "audio";
-  //              Phase 7 adds "image" and "model")
+  //   kind     - item kind reported to the app ("video" | "audio" |
+  //              "image" | "model")
   //   selector - CSS selector for candidate elements
   //   overlay  - true when detected elements get the download button
   //   extract  - (el) => item | null; item is { kind, url, viaPage,
@@ -129,6 +129,128 @@
   // Video/audio only in this wave; image + 3D detectors arrive in Phase 7.
   registerDetector({ kind: "video", selector: "video", overlay: true, extract: extractHtmlMedia("video") });
   registerDetector({ kind: "audio", selector: "audio", overlay: false, extract: extractHtmlMedia("audio") });
+
+  // ---- Image + 3D detection (Phase 7) ----
+  //
+  // No overlay button on images: a button on every image would spam
+  // galleries. Images and 3D assets flow through the existing
+  // reportMedia path into the popup list and the Media Detector panel
+  // (Phase 9), where the user picks them. CSS background-image is
+  // deliberately NOT detected: it is mostly page furniture (icons,
+  // sprites, ads) and cannot be told apart from real content.
+  // WebGL apps that fetch models from JS are not DOM-detectable and
+  // are not claimed to be.
+
+  // Parse a srcset attribute into [{ url, width, density }].
+  // Malformed entries are skipped, never fatal.
+  function parseSrcset(srcset) {
+    const out = [];
+    for (const part of String(srcset).split(",")) {
+      const tokens = part.trim().split(/\s+/).filter(Boolean);
+      if (!tokens.length) continue;
+      const entry = { url: tokens[0], width: null, density: null };
+      for (const t of tokens.slice(1)) {
+        const w = /^(\d+)w$/.exec(t);
+        if (w) { entry.width = parseInt(w[1], 10); continue; }
+        const d = /^(\d+(?:\.\d+)?)x$/.exec(t);
+        if (d) entry.density = parseFloat(d[1]);
+      }
+      out.push(entry);
+    }
+    return out;
+  }
+
+  // The full-resolution URL across one or more srcsets: largest width
+  // wins, else highest density, else the first candidate. Ties prefer
+  // the later candidate (srcsets are normally smallest-first). This
+  // mirrors the Rust parse_srcset / pick_best_srcset_url in the
+  // engine, so the extension and the desktop agree on "full size".
+  function pickBestSrcsetUrl(srcsets) {
+    let best = null;
+    for (const srcset of srcsets) {
+      for (const c of parseSrcset(srcset)) {
+        if (!best) { best = c; continue; }
+        if (c.width != null && best.width != null) {
+          if (c.width >= best.width) best = c;
+        } else if (c.width != null && best.width == null) {
+          best = c;
+        } else if (c.width == null && best.width == null
+          && c.density != null && (best.density == null || c.density >= best.density)) {
+          best = c;
+        }
+      }
+    }
+    return best ? best.url : null;
+  }
+
+  function extractImage(el) {
+    if (!isVisible(el)) return null;
+    // Best candidate: the largest srcset entry across the <img> and
+    // its <picture> <source> elements, else the browser's chosen
+    // source (currentSrc), else src / data-src (lazy-loaded images).
+    // srcset wins over currentSrc: currentSrc is the resolution the
+    // page chose for this viewport, not the full-resolution original.
+    const srcsets = [];
+    const imgSrcset = el.getAttribute && el.getAttribute("srcset");
+    if (imgSrcset) srcsets.push(imgSrcset);
+    const picture = el.closest ? el.closest("picture") : null;
+    if (picture && picture.querySelectorAll) {
+      const sources = picture.querySelectorAll("source[srcset]");
+      for (const s of sources) {
+        const ss = s.getAttribute && s.getAttribute("srcset");
+        if (ss) srcsets.push(ss);
+      }
+    }
+    let raw = pickBestSrcsetUrl(srcsets)
+      || el.currentSrc
+      || (el.getAttribute && (el.getAttribute("src") || el.getAttribute("data-src")));
+    if (!raw) return null;
+    const u = resolveUrl(raw);
+    if (!u || u.startsWith("data:") || u.startsWith("blob:")) return null;
+    if (!/^https?:\/\//i.test(u)) return null;
+    return {
+      kind: "image",
+      url: u,
+      viaPage: false,
+      title: (el.getAttribute && el.getAttribute("alt")) || mediaTitle(el),
+      filename: fileNameFromUrl(u),
+    };
+  }
+
+  // 3D model file extensions (same list as the engine's threed.rs).
+  const MODEL_EXT_RE = /\.(glb|gltf|obj|fbx|stl|usdz)([?#]|$)/i;
+
+  function extractModelViewer(el) {
+    if (!isVisible(el)) return null;
+    const raw = el.getAttribute && el.getAttribute("src");
+    const u = raw && resolveUrl(raw);
+    if (!u || !MODEL_EXT_RE.test(u)) return null;
+    return {
+      kind: "model",
+      url: u,
+      viaPage: false,
+      title: mediaTitle(el),
+      filename: fileNameFromUrl(u),
+    };
+  }
+
+  function extractModelLink(el) {
+    if (!isVisible(el)) return null;
+    const raw = el.getAttribute && el.getAttribute("href");
+    const u = raw && resolveUrl(raw);
+    if (!u || !MODEL_EXT_RE.test(u)) return null;
+    return {
+      kind: "model",
+      url: u,
+      viaPage: false,
+      title: mediaTitle(el),
+      filename: fileNameFromUrl(u),
+    };
+  }
+
+  registerDetector({ kind: "image", selector: "img", overlay: false, extract: extractImage });
+  registerDetector({ kind: "model", selector: "model-viewer", overlay: false, extract: extractModelViewer });
+  registerDetector({ kind: "model", selector: "a[href]", overlay: false, extract: extractModelLink });
 
   // Full media list for the popup and for reporting, deduplicated by URL.
   function collectMedia() {

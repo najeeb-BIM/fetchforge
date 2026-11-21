@@ -15,8 +15,10 @@
 //!   fetchforge-bridge print-token [--data-dir DIR]
 
 use fetchforge_engine::{
-    category_for_filename, download, generate_download_id, generate_secure_token, probe,
-    sanitize_filename, stop_reason, DownloadOptions, DownloadRecord, Status, Store,
+    category_for_filename, download, download_media, drive_direct_url, drive_file_id,
+    find_ytdlp, generate_download_id, generate_secure_token, list_formats,
+    plan_media_download, probe, sanitize_filename, stop_reason, DownloadOptions, DownloadRecord,
+    MediaDownloadOptions, Status, Store,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -263,6 +265,7 @@ impl App {
         self: &Arc<Self>,
         url: &str,
         filename: Option<String>,
+        format_id: Option<String>,
     ) -> Result<DownloadRecord, String> {
         let clean_url = fetchforge_engine::validate_url(url)?;
         // Probe first so we can record a real filename / size / resumability
@@ -271,31 +274,50 @@ impl App {
             url: clean_url.clone(),
             ..Default::default()
         };
-        // A web page is not a downloadable file: a YouTube watch page (or
-        // any HTML page) would otherwise be saved as a useless file named
-        // after the URL path. Refuse it here so the probe-error branch
-        // below records a Failed row with this reason.
-        let probe_result = probe(&probe_opts).and_then(|p| {
-            if p.content_type
-                .as_deref()
-                .is_some_and(|ct| ct.starts_with("text/html"))
-            {
-                Err("This link is a web page, not a downloadable file. FetchForge downloads direct file links; video pages such as YouTube are not supported yet.".to_string())
-            } else {
-                Ok(p)
-            }
-        });
-        let (filename, total, resumable) = match probe_result {
-            Ok(p) => (
-                filename
+        let probe_result = probe(&probe_opts);
+        // A web page is not a downloadable file — but since v0.2.0 it is
+        // no longer refused outright: a page whose probe returns text/html
+        // (YouTube, Vimeo, a public Google Drive file, any video page) goes
+        // through media extraction instead, and the user picks a quality
+        // (or the extension path takes the recorded default). Direct file
+        // links behave exactly as before.
+        let is_page = probe_result
+            .as_ref()
+            .is_ok_and(|p| {
+                p.content_type
                     .as_deref()
-                    .map(sanitize_filename)
-                    .or(p.filename.as_deref().map(sanitize_filename))
-                    .unwrap_or_else(|| "download".to_string()),
-                p.content_length,
-                p.accept_ranges,
-            ),
+                    .is_some_and(|ct| ct.starts_with("text/html"))
+            });
+        if is_page {
+            return self.add_media_download(&clean_url, filename, format_id);
+        }
+        match probe_result {
+            Ok(p) => {
+                let (filename, total, resumable) = (
+                    filename
+                        .as_deref()
+                        .map(sanitize_filename)
+                        .or(p.filename.as_deref().map(sanitize_filename))
+                        .unwrap_or_else(|| "download".to_string()),
+                    p.content_length,
+                    p.accept_ranges,
+                );
+                self.add_direct_record(&clean_url, filename, total, resumable)
+            }
             Err(e) => {
+                // Probe failed. Some video pages refuse HEAD/GET probes
+                // (403 to non-browser user agents) while yt-dlp reads
+                // them fine, so try media extraction as a fallback —
+                // but ONLY if yt-dlp is already installed. A failed
+                // probe on a dead direct link must never trigger a
+                // 23 MB first-use yt-dlp download.
+                if find_ytdlp(&self.data_dir).is_ok() {
+                    if let Ok(rec) =
+                        self.try_media_download(&clean_url, filename.clone(), format_id.clone())
+                    {
+                        return Ok(rec);
+                    }
+                }
                 // Still record the failure so the user sees it, with the reason.
                 let id = generate_download_id();
                 let rec = DownloadRecord {
@@ -311,12 +333,148 @@ impl App {
                     error: Some(e),
                     created_unix: now_unix(),
                     updated_unix: now_unix(),
+                    format_id: None,
+                    needs_merge: false,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
-                return Ok(rec);
+                Ok(rec)
             }
-        };
+        }
+    }
+
+    /// Media path: extract the page, pick a format, queue the download.
+    /// `format_id` is the user's picker choice; None means the recorded
+    /// default (extension path). On extraction failure, a Google Drive
+    /// link gets one direct-download fallback (see below); anything else
+    /// records a Failed row with the extraction error.
+    fn add_media_download(
+        self: &Arc<Self>,
+        clean_url: &str,
+        filename: Option<String>,
+        format_id: Option<String>,
+    ) -> Result<DownloadRecord, String> {
+        match self.try_media_download(clean_url, filename.clone(), format_id) {
+            Ok(rec) => Ok(rec),
+            Err(e) => {
+                // Google Drive fallback: yt-dlp's Drive extractor can
+                // break while the file itself is still publicly
+                // downloadable. Rewrite to the direct uc URL and probe
+                // it; only a NON-HTML probe result is a real file
+                // (large files get Google's virus-scan warning page
+                // instead, which must never be saved as a download).
+                if let Some(file_id) = drive_file_id(clean_url) {
+                    let direct = drive_direct_url(&file_id);
+                    let probe_opts = DownloadOptions {
+                        url: direct.clone(),
+                        ..Default::default()
+                    };
+                    if let Ok(p) = probe(&probe_opts) {
+                        if !p.content_type
+                            .as_deref()
+                            .is_some_and(|ct| ct.starts_with("text/html"))
+                        {
+                            let fname = filename
+                                .as_deref()
+                                .map(sanitize_filename)
+                                .or(p.filename.as_deref().map(sanitize_filename))
+                                .unwrap_or_else(|| "download".to_string());
+                            return self.add_direct_record(
+                                &direct,
+                                fname,
+                                p.content_length,
+                                p.accept_ranges,
+                            );
+                        }
+                    }
+                }
+                let id = generate_download_id();
+                let rec = DownloadRecord {
+                    id: id.clone(),
+                    url: clean_url.to_string(),
+                    filename: filename.unwrap_or_else(|| "download".to_string()),
+                    destination: self.settings.download_dir.clone(),
+                    category: "Other".to_string(),
+                    status: Status::Failed,
+                    total_bytes: None,
+                    downloaded_bytes: 0,
+                    resumable: false,
+                    error: Some(e),
+                    created_unix: now_unix(),
+                    updated_unix: now_unix(),
+                    format_id: None,
+                    needs_merge: false,
+                };
+                self.store.lock().unwrap().upsert(rec.clone());
+                let _ = self.store.lock().unwrap().save();
+                Ok(rec)
+            }
+        }
+    }
+
+    /// Plan a media download and queue it. Err means extraction failed
+    /// (the caller decides what Failed row to record).
+    fn try_media_download(
+        self: &Arc<Self>,
+        clean_url: &str,
+        filename: Option<String>,
+        format_id: Option<String>,
+    ) -> Result<DownloadRecord, String> {
+        let plan = plan_media_download(
+            &self.data_dir,
+            clean_url,
+            format_id.as_deref(),
+            filename.as_deref(),
+        )?;
+        // Same idempotent-add rule as direct downloads: an already-active
+        // job for the same URL + filename is returned, never duplicated.
+        {
+            let mut store = self.store.lock().unwrap();
+            for existing in store.all() {
+                if existing.url == clean_url
+                    && existing.filename == plan.filename
+                    && existing.destination == self.settings.download_dir
+                    && (existing.status == Status::Queued || existing.status == Status::Downloading)
+                {
+                    return Ok(existing.clone());
+                }
+            }
+            let id = generate_download_id();
+            let rec = DownloadRecord {
+                id: id.clone(),
+                url: clean_url.to_string(),
+                filename: plan.filename.clone(),
+                destination: self.settings.download_dir.clone(),
+                category: category_for_filename(&plan.filename).to_string(),
+                status: Status::Queued,
+                total_bytes: plan.total_bytes,
+                downloaded_bytes: 0,
+                // yt-dlp resumes from its own .part files, so a media
+                // download interrupted by app close can be resumed.
+                resumable: true,
+                error: None,
+                created_unix: now_unix(),
+                updated_unix: now_unix(),
+                format_id: Some(plan.format_id),
+                needs_merge: plan.needs_merge,
+            };
+            store.upsert(rec.clone());
+            let _ = store.save();
+            drop(store);
+            self.spawn_worker(id);
+            Ok(rec)
+        }
+    }
+
+    /// Queue a direct file download (the pre-0.2.0 path, unchanged
+    /// except for the new record fields).
+    fn add_direct_record(
+        self: &Arc<Self>,
+        clean_url: &str,
+        filename: String,
+        total: Option<u64>,
+        resumable: bool,
+    ) -> Result<DownloadRecord, String> {
         // Idempotent add (safe to run twice): if the same URL + filename
         // is already Queued or Downloading, return that job instead of
         // starting a second worker. Without this, two workers derive the
@@ -338,7 +496,7 @@ impl App {
             let id = generate_download_id();
             let rec = DownloadRecord {
                 id: id.clone(),
-                url: clean_url.clone(),
+                url: clean_url.to_string(),
                 filename: filename.clone(),
                 destination: self.settings.download_dir.clone(),
                 category: category_for_filename(&filename).to_string(),
@@ -349,6 +507,8 @@ impl App {
                 error: None,
                 created_unix: now_unix(),
                 updated_unix: now_unix(),
+                format_id: None,
+                needs_merge: false,
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -396,6 +556,11 @@ impl App {
             Some(r) => r.clone(),
             None => return Err("unknown download".to_string()),
         };
+        // Media downloads (a format was chosen) run through yt-dlp;
+        // everything else takes the direct path, exactly as before.
+        if rec.format_id.is_some() {
+            return self.run_media(&rec, job);
+        }
         self.set_status(id, Status::Downloading, None);
         let opts = DownloadOptions {
             url: rec.url.clone(),
@@ -454,6 +619,87 @@ impl App {
         }
     }
 
+    /// Run a media download (yt-dlp). The filename stem comes from the
+    /// record, so a resume re-runs yt-dlp with the same output template
+    /// and picks up its own .part files. On success the record's
+    /// filename is corrected to the real file name: a merge may pick a
+    /// different container than the planned extension.
+    fn run_media(&self, rec: &DownloadRecord, job: &Job) -> Result<(), String> {
+        let id = rec.id.clone();
+        self.set_status(&id, Status::Downloading, None);
+        let stem = std::path::Path::new(&rec.filename)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "video".to_string());
+        let ext = std::path::Path::new(&rec.filename)
+            .extension()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "mp4".to_string());
+        let opts = MediaDownloadOptions {
+            url: rec.url.clone(),
+            format_id: rec.format_id.clone().unwrap_or_default(),
+            needs_merge: rec.needs_merge,
+            destination_dir: PathBuf::from(&self.settings.download_dir),
+            filename_stem: stem,
+            expected_ext: ext,
+            expected_total: rec.total_bytes,
+            organise_by_category: self.settings.organise_by_category,
+        };
+        let app_id = id.clone();
+        let store_clone = &self.store;
+        let progress = |p: fetchforge_engine::Progress| {
+            let mut store = store_clone.lock().unwrap();
+            if let Some(r) = store.get(&app_id).cloned() {
+                let mut r = r;
+                r.downloaded_bytes = p.downloaded;
+                r.total_bytes = p.total.or(r.total_bytes);
+                r.updated_unix = now_unix();
+                store.upsert(r);
+                let _ = store.save();
+            }
+        };
+        match download_media(
+            &self.data_dir,
+            &opts,
+            &progress,
+            &job.paused,
+            &job.cancelled,
+        ) {
+            Ok(final_path) => {
+                let mut store = self.store.lock().unwrap();
+                if let Some(mut r) = store.get(&id).cloned() {
+                    r.status = Status::Completed;
+                    r.destination = final_path.to_string_lossy().to_string();
+                    if let Some(name) = final_path.file_name() {
+                        r.filename = name.to_string_lossy().to_string();
+                    }
+                    r.downloaded_bytes = r.total_bytes.unwrap_or(r.downloaded_bytes);
+                    r.error = None;
+                    r.updated_unix = now_unix();
+                    store.upsert(r);
+                    let _ = store.save();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(reason) = stop_reason(&e) {
+                    match reason {
+                        fetchforge_engine::download::StopReason::Paused => {
+                            self.set_status(&id, Status::Paused, None);
+                        }
+                        fetchforge_engine::download::StopReason::Cancelled => {
+                            self.set_status(&id, Status::Cancelled, None);
+                        }
+                    }
+                    Ok(())
+                } else {
+                    self.set_status(&id, Status::Failed, Some(e));
+                    Err("download failed".to_string())
+                }
+            }
+        }
+    }
+
     fn set_status(&self, id: &str, status: Status, error: Option<String>) {
         let mut store = self.store.lock().unwrap();
         if let Some(mut r) = store.get(id).cloned() {
@@ -472,6 +718,14 @@ impl App {
 struct AddRequest {
     url: String,
     filename: Option<String>,
+    /// Media downloads only: the yt-dlp format id picked in the format
+    /// picker. Absent means "pick the default" (extension path).
+    format_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FormatsRequest {
+    url: String,
 }
 
 fn generate_token() -> String {
@@ -739,10 +993,33 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
     if method == "POST" && path == "/downloads" {
         let req: Result<AddRequest, _> = serde_json::from_str(&body);
         match req {
-            Ok(r) => match app.add_download(&r.url, r.filename) {
+            Ok(r) => match app.add_download(&r.url, r.filename, r.format_id) {
                 Ok(rec) => {
                     let b = serde_json::to_string(&rec).unwrap();
                     let _ = stream.write_all(http_response(201, &b).as_bytes());
+                }
+                Err(e) => {
+                    let b = serde_json::json!({"error": e}).to_string();
+                    let _ = stream.write_all(http_response(400, &b).as_bytes());
+                }
+            },
+            Err(_) => {
+                let _ = stream
+                    .write_all(http_response(400, r#"{"error":"Invalid JSON body"}"#).as_bytes());
+            }
+        }
+        return;
+    }
+    // Media formats (token required): list the qualities available for
+    // a video page so the UI can show a picker. The chosen format id is
+    // then passed to POST /downloads as `format_id`.
+    if method == "POST" && path == "/media/formats" {
+        let req: Result<FormatsRequest, _> = serde_json::from_str(&body);
+        match req {
+            Ok(r) => match list_formats(&app.data_dir, &r.url) {
+                Ok(info) => {
+                    let b = serde_json::to_string(&info).unwrap();
+                    let _ = stream.write_all(http_response(200, &b).as_bytes());
                 }
                 Err(e) => {
                     let b = serde_json::json!({"error": e}).to_string();
@@ -799,6 +1076,136 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Minimal loopback HTTP client (plain TcpStream, no new dependency —
+/// the same approach as the desktop app's bridge_post). Returns
+/// (status, body). Used by the native host to talk to the bridge.
+fn loopback_http(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&str>,
+) -> Result<(u16, String), String> {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| format!("Bridge not reachable ({e})"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let body = body.unwrap_or("");
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    if let Some(t) = token {
+        req.push_str(&format!("X-FetchForge-Token: {t}\r\n"));
+    }
+    if !body.is_empty() {
+        req.push_str("Content-Type: application/json\r\n");
+    }
+    req.push_str("\r\n");
+    req.push_str(body);
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("Bridge request failed ({e})"))?;
+    let mut raw = String::new();
+    stream
+        .read_to_string(&mut raw)
+        .map_err(|e| format!("Bridge response failed ({e})"))?;
+    let (head, resp_body) = match raw.split_once("\r\n\r\n") {
+        Some((h, b)) => (h, b.to_string()),
+        None => ("", raw),
+    };
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    Ok((status, resp_body))
+}
+
+/// True when something answering like the FetchForge bridge is
+/// listening on `port` (GET /health, no token needed). A foreign
+/// process squatting on the port does not count: the body must name
+/// FetchForge.
+fn bridge_health(port: u16) -> bool {
+    match loopback_http(port, "GET", "/health", None, None) {
+        Ok((200, body)) => body.contains("\"app\"") && body.contains("FetchForge"),
+        _ => false,
+    }
+}
+
+/// Forward an addDownload request to the long-running bridge over
+/// loopback HTTP. The token is re-read from the token file at call
+/// time (it is the shared secret between this host and the bridge;
+/// re-reading keeps a rotated token working).
+fn forward_add_to_bridge(
+    data_dir: &std::path::Path,
+    port: u16,
+    url: &str,
+    filename: Option<&str>,
+) -> Result<DownloadRecord, String> {
+    let token = std::fs::read_to_string(data_dir.join("bridge-token.txt"))
+        .map_err(|_| "Bridge token file not found.".to_string())?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("Bridge token file is empty.".to_string());
+    }
+    let body = serde_json::json!({"url": url, "filename": filename}).to_string();
+    let (status, resp) = loopback_http(port, "POST", "/downloads", Some(token), Some(&body))?;
+    if status != 201 {
+        let detail: String = resp.chars().take(200).collect();
+        return Err(format!("Bridge returned HTTP {status}: {detail}"));
+    }
+    serde_json::from_str(&resp).map_err(|e| format!("Bridge returned bad JSON ({e})"))
+}
+
+/// Start the bridge (this same binary, `serve` mode) as a detached
+/// background process and wait until it answers /health (up to ~5 s).
+/// Detached so it survives this host process exiting: on Windows the
+/// child gets CREATE_NO_WINDOW (no console flash) + DETACHED_PROCESS;
+/// on Unix a spawned child is not killed when its parent exits.
+/// Stderr goes to bridge.log in the data dir, like the app-spawned
+/// bridge. Only used when no bridge is already listening.
+fn spawn_detached_bridge(data_dir: &std::path::Path, port: u16) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("Cannot find own executable ({e})"))?;
+    let log_path = data_dir.join("bridge.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok();
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("serve")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW (0x08000000) + DETACHED_PROCESS (0x00000008).
+        cmd.creation_flags(0x08000000 | 0x00000008);
+    }
+    if let Some(f) = log_file {
+        cmd.stderr(f);
+    } else {
+        cmd.stderr(std::process::Stdio::null());
+    }
+    cmd.spawn()
+        .map_err(|e| format!("Could not start the bridge ({e})"))?;
+    for _ in 0..10 {
+        if bridge_health(port) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Err("The bridge was started but did not answer within 5 seconds. See bridge.log in the FetchForge data folder.".to_string())
+}
+
 fn native_host(app: &Arc<App>) {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -831,9 +1238,48 @@ fn native_host(app: &Arc<App>) {
                     .get("filename")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                match app.add_download(url, filename) {
-                    Ok(rec) => serde_json::json!({"type": "added", "download": rec}),
-                    Err(e) => serde_json::json!({"type": "error", "error": e}),
+                // A download started from the extension must survive
+                // this host process exiting: Chrome/Firefox terminate
+                // the native host after its sendNativeMessage reply,
+                // so an in-process download would be killed
+                // mid-download. Forward to the long-running bridge
+                // instead; start one if none is listening; only as a
+                // last resort run in-process, with a warning the
+                // extension can show.
+                //   1. Bridge already running (normal case: the app is
+                //      open) -> forward, reply carries "via": "bridge".
+                //   2. No bridge -> spawn a detached bridge, wait for
+                //      /health, then forward ("bridge_started": true).
+                //      The bridge keeps running after the browser
+                //      closes, so the download completes; when the app
+                //      later starts, its own bridge child fails to bind
+                //      (port taken) and logs it, while the existing
+                //      bridge keeps serving the same data dir.
+                //   3. Bridge cannot be started (port squatted by a
+                //      foreign process, spawn failure) -> in-process
+                //      add with a warning. The download is recorded
+                //      and may complete if the host stays alive; if it
+                //      is killed, the record is recovered as Paused on
+                //      next app start (media downloads are resumable)
+                //      and the user can resume it. Refusing outright
+                //      would be worse: the extension would then hand
+                //      the URL to the browser's own downloader, which
+                //      saves a YouTube page as a useless .html file.
+                match forward_add_to_bridge(&app.data_dir, DEFAULT_PORT, url, filename.as_deref()) {
+                    Ok(rec) => {
+                        serde_json::json!({"type": "added", "download": rec, "via": "bridge"})
+                    }
+                    Err(_first_err) => {
+                        match spawn_detached_bridge(&app.data_dir, DEFAULT_PORT).and_then(|()| {
+                            forward_add_to_bridge(&app.data_dir, DEFAULT_PORT, url, filename.as_deref())
+                        }) {
+                            Ok(rec) => serde_json::json!({"type": "added", "download": rec, "via": "bridge", "bridge_started": true}),
+                            Err(_second_err) => match app.add_download(url, filename, None) {
+                                Ok(rec) => serde_json::json!({"type": "added", "download": rec, "via": "in-process", "warning": "The FetchForge bridge is not running, so this download started inside the browser connection and may stop if the browser closes it. Open the FetchForge app to keep downloads running."}),
+                                Err(e) => serde_json::json!({"type": "error", "error": e}),
+                            },
+                        }
+                    }
                 }
             }
             _ => serde_json::json!({"type": "error", "error": "Unknown message type"}),
@@ -901,5 +1347,160 @@ fn main() {
             }
             Err(_) => continue,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    fn test_data_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bridge-token.txt"), "test-token-123").unwrap();
+        dir
+    }
+
+    /// A one-shot stub bridge: accepts one connection, checks the
+    /// request, answers with `response`, and reports what it saw.
+    fn stub_server(response: String) -> (u16, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = vec![0u8; 8192];
+            let mut request = Vec::new();
+            // Read until the full body arrives (Content-Length) or EOF.
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        request.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&request).to_string();
+                        if let Some(head) = text.split("\r\n\r\n").next() {
+                            let len: usize = head
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse().ok())
+                                })
+                                .unwrap_or(0);
+                            if text.len() >= head.len() + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            String::from_utf8_lossy(&request).to_string()
+        });
+        (port, handle)
+    }
+
+    fn record_json() -> String {
+        // Deliberately omits format_id / needs_merge: old records
+        // must still deserialize (serde defaults).
+        r#"{"id":"dl-1","url":"https://example.com/x.zip","filename":"x.zip","destination":"/tmp","category":"Archives","status":"queued","total_bytes":10,"downloaded_bytes":0,"resumable":true,"error":null,"created_unix":1700000000,"updated_unix":1700000000}"#.to_string()
+    }
+
+    #[test]
+    fn forward_add_posts_token_and_url_to_bridge() {
+        let dir = test_data_dir("fetchforge-test-forward");
+        let response = format!(
+            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            record_json().len(),
+            record_json()
+        );
+        let (port, handle) = stub_server(response);
+        let rec = forward_add_to_bridge(&dir, port, "https://example.com/x.zip", Some("x.zip"))
+            .unwrap();
+        assert_eq!(rec.id, "dl-1");
+        assert_eq!(rec.filename, "x.zip");
+        assert_eq!(rec.format_id, None, "old record JSON must load with defaults");
+        let request = handle.join().unwrap();
+        assert!(
+            request.contains("POST /downloads HTTP/1.1"),
+            "request: {request}"
+        );
+        assert!(
+            request.contains("X-FetchForge-Token: test-token-123"),
+            "token header missing: {request}"
+        );
+        assert!(
+            request.contains("https://example.com/x.zip"),
+            "url missing: {request}"
+        );
+    }
+
+    #[test]
+    fn forward_add_fails_fast_when_bridge_is_down() {
+        let dir = test_data_dir("fetchforge-test-forward-down");
+        // A port with (almost certainly) nothing listening: bind, drop.
+        let port = TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let start = std::time::Instant::now();
+        let err = forward_add_to_bridge(&dir, port, "https://example.com/x.zip", None).unwrap_err();
+        assert!(err.contains("not reachable"), "error: {err}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn forward_add_rejects_wrong_status() {
+        let dir = test_data_dir("fetchforge-test-forward-401");
+        let body = r#"{"error":"Missing or invalid bridge token"}"#;
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (port, _handle) = stub_server(response);
+        let err = forward_add_to_bridge(&dir, port, "https://example.com/x.zip", None).unwrap_err();
+        assert!(err.contains("401"), "error: {err}");
+    }
+
+    #[test]
+    fn bridge_health_checks_body_not_just_status() {
+        let good_body = r#"{"app":"FetchForge","version":"0.2.0","bridge":true}"#;
+        let good = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            good_body.len(),
+            good_body
+        );
+        let (port, _h) = stub_server(good);
+        assert!(bridge_health(port));
+        // A foreign process answering 200 with other content is NOT a bridge.
+        let bad_body = r#"{"hello":"world"}"#;
+        let bad = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            bad_body.len(),
+            bad_body
+        );
+        let (port, _h) = stub_server(bad);
+        assert!(!bridge_health(port));
+    }
+
+    #[test]
+    fn add_request_accepts_optional_format_id() {
+        let r: AddRequest =
+            serde_json::from_str(r#"{"url":"https://example.com/x.zip"}"#).unwrap();
+        assert_eq!(r.format_id, None);
+        let r: AddRequest = serde_json::from_str(
+            r#"{"url":"https://www.youtube.com/watch?v=x","filename":"v.mp4","format_id":"22"}"#,
+        )
+        .unwrap();
+        assert_eq!(r.format_id.as_deref(), Some("22"));
+        assert_eq!(r.filename.as_deref(), Some("v.mp4"));
     }
 }

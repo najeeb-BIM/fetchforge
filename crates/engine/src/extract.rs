@@ -1711,7 +1711,13 @@ mod tests {
 
     fn write_stub_ytdlp(dir: &Path, name: &str, script: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, script).unwrap();
+        // Write + sync + close before the stub is ever executed: on
+        // some filesystems an exec immediately after a write can hit
+        // ETXTBSY ("Text file busy") if the write is still in flight.
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1720,9 +1726,20 @@ mod tests {
         path
     }
 
+    /// Per-process unique temp dir: the cancel test orphans a `sleep`
+    /// grandchild, so a fixed dir name could collide with a leftover
+    /// from an earlier test run.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "fetchforge-test-{}-{}",
+            tag,
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn list_formats_with_uses_stub_ytdlp() {
-        let dir = std::env::temp_dir().join("fetchforge-test-stub-list");
+        let dir = unique_temp_dir("stub-list");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let json_path = dir.join("info.json");
@@ -1742,7 +1759,7 @@ mod tests {
 
     #[test]
     fn list_formats_with_maps_stub_error() {
-        let dir = std::env::temp_dir().join("fetchforge-test-stub-err");
+        let dir = unique_temp_dir("stub-err");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let stub = write_stub_ytdlp(
@@ -1756,7 +1773,7 @@ mod tests {
 
     #[test]
     fn download_media_with_stub_reports_progress_and_final_path() {
-        let dir = std::env::temp_dir().join("fetchforge-test-stub-dl");
+        let dir = unique_temp_dir("stub-dl");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let stub = write_stub_ytdlp(
@@ -1814,7 +1831,7 @@ exit 0
 
     #[test]
     fn download_media_with_cancel_kills_stub() {
-        let dir = std::env::temp_dir().join("fetchforge-test-stub-cancel");
+        let dir = unique_temp_dir("stub-cancel");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Stub that would sleep 60 s if not killed.

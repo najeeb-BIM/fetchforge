@@ -429,7 +429,7 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building FetchForge");
     // F08: kill the bridge on app exit, so it never outlives the app.
-    app.run(|_app, event| {
+    app.run(move |_app, event| {
         if let tauri::RunEvent::Exit = event {
             if let Some(mut child) = state_for_exit.bridge_child.lock().unwrap().take() {
                 let _ = child.kill();

@@ -1,5 +1,15 @@
 # Test report — v0.1.0 (run 2026-10-26, verification round 2 same day)
 
+> v0.2.0 addendum (2026-11-21): the v0.2.0 full-system test run is
+> recorded in `docs/v02-phases/PHASE_10_TESTING.md` — 103 unit /
+> integration tests passing, all shell e2e suites re-run (direct
+> links, HLS/DASH, real YouTube/Drive extraction, image/3D,
+> native-host forwarding, pause/resume, hostile servers, token
+> hygiene), two fixes (probe error now surfaces yt-dlp's error;
+> stale shell checks updated), and the list of what could NOT be
+> verified here (real browser, Windows build/installer). Everything
+> below this note is the unmodified v0.1.0 record.
+
 Environment: Ubuntu 24.04 x64, Rust stable 1.99.1 (installed during
 this build; initial 1.82 could not build current crates.io deps),
 Node 24, Python 3.12. No Windows, no NSIS, no Wine, no browser.

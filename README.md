@@ -16,13 +16,22 @@ browsing history, download history, or user data leaves the machine.
   video+audio streams are merged with ffmpeg (downloaded once, verified,
   only when a merge is needed). yt-dlp is bundled with the installer;
   no DRM is ever bypassed, and live streams are refused.
+- **Images and 3D models** — image downloads take the full-resolution
+  URL from srcset (original format only, never upscaled); 3D models
+  (GLB/GLTF/OBJ/FBX/STL/USDZ) download as files, and glTF bundles
+  bring their .bin/texture dependencies with the folder structure
+  preserved. Broken models fail with a plain explanation.
 - **Desktop app shell (Tauri 2 + vanilla HTML/JS)** — dashboard with
   active / queued / completed / failed, progress, pause / resume /
-  cancel, search and filtering, format picker for video pages. The Tauri
+  cancel, search and filtering, format picker for video pages. IDM-style
+  tabs (Dashboard, Media Detector, Video / Images / 3D, Queue,
+  History) and multi-select batch download. The Tauri
   shell shares the same engine as the bridge.
 - **Browser extensions (Chrome / Edge / Chromium, Firefox)** — context
   menu "Download with FetchForge", popup with paste-a-link and bridge
-  token setup. Native messaging first, loopback bridge second, browser
+  token setup, plus on-page media detection: a download button over
+  videos, a per-tab badge, and a "Media on this page" list with batch
+  download. Native messaging first, loopback bridge second, browser
   downloader as fallback.
 - **Localhost bridge** — loopback-only HTTP API on 127.0.0.1:18443 with
   a per-install token, plus a native-messaging host mode. The native

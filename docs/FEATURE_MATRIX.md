@@ -1,8 +1,10 @@
 # Feature matrix — v0.2.0
 
-Status key: DONE = implemented and tested as noted in TEST_REPORT.md
-(v0.1.0) or the v0.2.0 test run (engine + bridge unit tests, stub
-yt-dlp tests, native-forwarding shell test).
+Status key: DONE = implemented and tested as noted in
+docs/v02-phases/PHASE_10_TESTING.md (the v0.2.0 full-system test
+run: 103 unit/integration tests, all shell e2e suites incl. real
+YouTube/Drive extraction, HLS/DASH, image/3D, native forwarding).
+The v0.1.0 evidence is in TEST_REPORT.md.
 PARTIAL = implemented but with a stated limit. NOT YET = not in v0.2.0.
 
 ## Desktop app
@@ -10,6 +12,8 @@ PARTIAL = implemented but with a stated limit. NOT YET = not in v0.2.0.
 | Feature | Status | Note |
 |---|---|---|
 | Dashboard: active / queued / completed / failed | DONE | Tauri UI + bridge list API |
+| IDM-style tabs (Dashboard, Media Detector, Video / Images / 3D, Queue, History) | DONE | Filtered views over the download list; Media Detector lists detected media from GET /media/detected |
+| Batch download (multi-select) | DONE | Checkboxes + "Download selected" in the Media Detector panel and the extension popup; page URLs take the auto-picked quality, never a per-item picker |
 | Format picker for video pages | DONE | Lists real available qualities (yt-dlp); user picks, or the recorded default for extension-sent URLs |
 | Progress, % , size, speed | PARTIAL | Engine reports bytes/sec; UI shows progress/size, speed column is a placeholder in the Tauri UI (bridge progress API carries bytes, UI refreshes every 2 s) |
 | Pause / resume / cancel / retry | DONE* | *Retry = re-add; in-app retry button is not yet wired. Pause/resume proven for single-stream (see TEST_REPORT) |
@@ -20,7 +24,7 @@ PARTIAL = implemented but with a stated limit. NOT YET = not in v0.2.0.
 | Default download directory | DONE | Settings, default Downloads |
 | Categories + auto-organisation | DONE | Extension-based folders |
 | Notifications on finish/fail | NOT YET | Planned via Tauri notification plugin |
-| Settings, startup prefs, log viewer | PARTIAL | Settings file; no log-viewer UI yet |
+| Settings, startup prefs, log viewer | PARTIAL | Settings file via bridge (per-field API tested); no Settings panel in the UI (omitted in Phase 9 — no working backend to wire it to); no log-viewer UI yet |
 | Persistent state + crash recovery | DONE | JSON store, atomic save, interrupted -> Paused/Failed |
 | Startup on login | NOT YET | Manual for now |
 
@@ -38,7 +42,7 @@ PARTIAL = implemented but with a stated limit. NOT YET = not in v0.2.0.
 | Integrity check | PARTIAL | Length verified against Content-Length; no checksum unless server supplies one |
 | Safe temp files, atomic finish | DONE | `.part` + rename |
 | Filename from headers/URL, Unicode, Windows rules | DONE | Unit-tested |
-| Non-Range server fallback | DONE | Restarts honestly, never claims resume |
+| Non-Range server fallback | DONE | Single GET, record says resumable=false; proven by tests/no_range_server.sh (SHA-256 match) |
 
 ## Browser integration
 
@@ -47,6 +51,10 @@ PARTIAL = implemented but with a stated limit. NOT YET = not in v0.2.0.
 | Chrome / Edge / Chromium extension | PARTIAL | Source complete, MV3; not tested in a real browser in this env (no browser installed) |
 | Firefox extension | PARTIAL | Source complete, MV3 (background.scripts, Firefox 109+); not tested in a real browser in this env (no browser installed) |
 | Context menu | DONE (source) | Link / video / audio contexts |
+| On-page media detection (content script) | DONE (source) | DOM-only: video/audio (incl. blob: via page URL), image srcset, 3D model elements; no webRequest, no `<all_urls>` |
+| Overlay download button on videos | DONE (source) | Shadow-DOM button on videos; images/3D flow to the popup list and Media Detector instead (no per-image button spam) |
+| Per-tab badge (detected count) | DONE (source) | Badge count from the background script |
+| Popup "Media on this page" list | DONE (source) | Per-item Download + multi-select batch download via the existing add path |
 | File-type filters | PARTIAL | Extension sends any link the user chooses; automatic filtering by type is not yet enforced |
 | Connected indicator | DONE (source) | Popup checks /health + token state |
 | Native messaging | PARTIAL | Host forwards addDownload to the long-running bridge (spawns one if needed) so downloads survive the host exiting; verified on Linux with a real native message, end-to-end in a real browser NOT tested here |
@@ -59,6 +67,8 @@ PARTIAL = implemented but with a stated limit. NOT YET = not in v0.2.0.
 | Feature | Status | Note |
 |---|---|---|
 | Direct MP4/WebM/etc. links | DONE | Ordinary engine downloads |
+| Images (JPG/PNG/WebP/GIF/SVG/AVIF) | DONE | srcset full-resolution pick, original format only, never upscaled; extension-less image URLs classified by probed image/* content type |
+| 3D models (GLB/GLTF/OBJ/FBX/STL/USDZ) | DONE | Single files as direct downloads; glTF bundles resolve + download .bin/texture dependencies with folder structure preserved; broken glTF / unreachable dependency fails honestly |
 | Video pages (YouTube, Vimeo, generic) | DONE | yt-dlp extraction; real qualities listed; default = best combined ≤1080p, else best video ≤1080p merged with best audio |
 | Google Drive public files | DONE | yt-dlp Drive extractor; direct uc-download fallback when extraction fails (accepted only when the probe is non-HTML) |
 | Audio/video merging (ffmpeg) | DONE | Video-only formats merge with best audio; ffmpeg downloaded once on first merge (Windows, SHA-256-verified), system ffmpeg preferred |

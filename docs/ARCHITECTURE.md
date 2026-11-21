@@ -43,7 +43,7 @@ popularity:
 crates/engine/
   validate.rs   only http/https, no host, no embedded credentials
   filename.rs   Windows sanitising, Content-Disposition, unique paths
-  category.rs   extension -> Video/Audio/Documents/Images/Archives/Software/Other
+  category.rs   extension -> Video/Audio/Documents/Images/3D/Archives/Software/Other
   download.rs   probe, single-stream resume, segmented, retry, limiter
   media.rs      HLS + DASH (clear only): manifest parsing, variant /
                 representation listing, segment assembly, resume;
@@ -51,6 +51,11 @@ crates/engine/
   extract.rs    yt-dlp wrapper: format listing, quality choice, media
                 download (+ ffmpeg merge); routes .m3u8/.mpd URLs to
                 media.rs (never to yt-dlp)
+  image.rs      image classification (extension + image/* content
+                type), srcset full-resolution pick; original format
+                only, never upscaled
+  threed.rs     3D models (GLB/GLTF/OBJ/FBX/STL/USDZ); glTF bundles
+                resolve + download dependencies, folder preserved
   ffmpeg.rs     ffmpeg lookup, pinned first-use download (SHA-256),
                 stream-copy merge of separate video+audio tracks
                 (extract.rs keeps the yt-dlp provisioning side)
@@ -58,14 +63,23 @@ crates/engine/
 crates/bridge/
   main.rs       loopback HTTP API, token auth, origin check, native host
                 (forwards addDownload to the bridge, spawns one if
-                needed), queue gate (max_simultaneous), worker threads
+                needed), queue gate (max_simultaneous), worker threads,
+                detected-media store (POST/GET /media/detected,
+                detected.json, capped at 200 items)
 apps/desktop/
   src/          index.html (inlined script is the source of truth),
-                styles.css (Tauri or bridge mode)
+                styles.css (Tauri or bridge mode); IDM-style tabs
+                (Dashboard, Media Detector, Video/Images/3D views,
+                Queue, History) + batch download
   src-tauri/    Tauri commands -> engine (built on Windows only)
 extensions/
   chromium/     Manifest V3 (Chrome, Edge, other Chromium)
-  firefox/      Manifest V2 (Firefox 109+), same background/popup source
+  firefox/      Manifest V3 (Firefox 109+, background.scripts), same
+                background/popup source as Chromium
+  content.js    (both) DOM media detection: video/audio via query +
+                MutationObserver, image srcset, 3D model elements;
+                overlay download button on videos, per-tab badge,
+                reports to the background script
 installer/      fetchforge.nsi, native-host manifests (paths patched at build)
 scripts/        build-windows.ps1
 .github/workflows/windows-build.yml
@@ -85,7 +99,16 @@ Completed. The desktop app reads the same `downloads.json` store.
 A probe returning text/html (a video page) goes through media
 extraction instead: yt-dlp lists formats, the user picks a quality
 (or the extension path takes the recorded default), yt-dlp downloads
-it, merging separate streams with ffmpeg when needed.
+it, merging separate streams with ffmpeg when needed. Image and 3D
+URLs are classified in the same add path (by extension and, for
+extension-less image URLs, by probed image/* content type) and take
+the direct path with category Images / 3D; a .gltf URL is planned
+first (its .bin + texture dependencies are resolved and probed)
+and downloaded as a bundle with its folder structure preserved.
+The extension's content script reports detected media to the
+background script, which POSTs it to /media/detected; the desktop
+app's Media Detector panel lists it (GET /media/detected) and batch
+download sends each selected item through the same add path.
 
 ## Known design limits (v0.2.0)
 
@@ -104,3 +127,7 @@ it, merging separate streams with ffmpeg when needed.
   the next app release. ffmpeg (Windows) downloads once on first merge
   (~114 MB); on Linux/macOS a system ffmpeg is required for merges.
 - Live streams are refused; DRM content is refused, never bypassed.
+- The extension's on-page behaviour (overlay button, badge, popup
+  media list) is code-reviewed and syntax-checked, not yet verified
+  in a real browser; neither is the Windows Tauri compile or the
+  NSIS installer run. See docs/v02-phases/PHASE_10_TESTING.md.

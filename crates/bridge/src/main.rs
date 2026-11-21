@@ -15,11 +15,12 @@
 //!   fetchforge-bridge print-token [--data-dir DIR]
 
 use fetchforge_engine::{
-    category_for_filename, download, download_dash, download_hls_variant, download_media,
-    drive_direct_url, drive_file_id, ensure_ffmpeg, find_ytdlp, generate_download_id,
-    generate_secure_token, list_formats, plan_media_download, probe, sanitize_filename,
-    stop_reason, DashDownloadOptions, DownloadOptions, DownloadRecord, MediaDownloadOptions,
-    Status, Store,
+    category_for_filename, download, download_dash, download_gltf_bundle, download_hls_variant,
+    download_media, drive_direct_url, drive_file_id, ensure_ffmpeg, ensure_image_extension,
+    fetch_gltf_plan, find_ytdlp, generate_download_id, generate_secure_token, is_gltf_url,
+    is_image_content_type, list_formats, plan_media_download, probe, sanitize_filename,
+    stop_reason, DashDownloadOptions, DownloadOptions, DownloadRecord, GltfDownloadOptions,
+    MediaDownloadOptions, Status, Store,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -342,6 +343,16 @@ impl App {
         if fetchforge_engine::is_manifest_url(&clean_url) {
             return self.add_media_download(&clean_url, filename, format_id);
         }
+        // glTF models (.gltf) carry dependencies (buffers, textures)
+        // that must be downloaded with the model and kept in the same
+        // folder structure (spec §6). They go to the 3D engine, never
+        // the direct path, which would save the .gltf alone and leave
+        // a broken model. Single-file models (GLB, OBJ, ...) need no
+        // special routing: they take the direct path below with
+        // category "3D".
+        if is_gltf_url(&clean_url) {
+            return self.add_gltf_download(&clean_url, filename);
+        }
         // Probe first so we can record a real filename / size / resumability
         // and fail fast on 404 / denied links instead of queueing a dead job.
         let probe_opts = DownloadOptions {
@@ -374,7 +385,7 @@ impl App {
                 }) {
                     return self.add_media_download(&clean_url, filename, format_id);
                 }
-                let (filename, total, resumable) = (
+                let (mut filename, total, resumable) = (
                     filename
                         .as_deref()
                         .map(sanitize_filename)
@@ -383,6 +394,18 @@ impl App {
                     p.content_length,
                     p.accept_ranges,
                 );
+                // Extension-less image URLs (e.g. a photo served as
+                // /photo?id=123) get their extension from the probed
+                // content type, so the file opens and categorises as
+                // an image instead of landing in "Other" with no
+                // extension. A name that already has an extension is
+                // never rewritten.
+                if p.content_type
+                    .as_deref()
+                    .is_some_and(is_image_content_type)
+                {
+                    filename = ensure_image_extension(&filename, p.content_type.as_deref());
+                }
                 self.add_direct_record(&clean_url, filename, total, resumable)
             }
             Err(e) => {
@@ -471,6 +494,92 @@ impl App {
                         }
                     }
                 }
+                let id = generate_download_id();
+                let rec = DownloadRecord {
+                    id: id.clone(),
+                    url: clean_url.to_string(),
+                    filename: filename.unwrap_or_else(|| "download".to_string()),
+                    destination: self.settings.download_dir.clone(),
+                    category: "Other".to_string(),
+                    status: Status::Failed,
+                    total_bytes: None,
+                    downloaded_bytes: 0,
+                    resumable: false,
+                    error: Some(e),
+                    created_unix: now_unix(),
+                    updated_unix: now_unix(),
+                    format_id: None,
+                    needs_merge: false,
+                    format_selector: None,
+                    stream_kind: None,
+                };
+                self.store.lock().unwrap().upsert(rec.clone());
+                let _ = self.store.lock().unwrap().save();
+                Ok(rec)
+            }
+        }
+    }
+
+    /// glTF path: plan the model + dependencies at add time (fetch
+    /// the JSON, resolve and probe every dependency), then queue the
+    /// bundle download. A plan failure records a Failed row with the
+    /// reason instead of queueing a job that would fail halfway
+    /// through. The worker re-plans from the URL at run time, so the
+    /// record itself needs no dependency list stored on it.
+    fn add_gltf_download(
+        self: &Arc<Self>,
+        clean_url: &str,
+        filename: Option<String>,
+    ) -> Result<DownloadRecord, String> {
+        match fetch_gltf_plan(clean_url) {
+            Ok(plan) => {
+                let record_filename = filename
+                    .as_deref()
+                    .map(sanitize_filename)
+                    .unwrap_or_else(|| plan.filename.clone());
+                // Same idempotent-add rule as the other paths.
+                {
+                    let mut store = self.store.lock().unwrap();
+                    for existing in store.all() {
+                        if existing.url == clean_url
+                            && existing.filename == record_filename
+                            && existing.destination == self.settings.download_dir
+                            && (existing.status == Status::Queued
+                                || existing.status == Status::Downloading)
+                        {
+                            return Ok(existing.clone());
+                        }
+                    }
+                    let id = generate_download_id();
+                    let rec = DownloadRecord {
+                        id: id.clone(),
+                        url: clean_url.to_string(),
+                        filename: record_filename,
+                        destination: self.settings.download_dir.clone(),
+                        category: "3D".to_string(),
+                        status: Status::Queued,
+                        total_bytes: plan.total_bytes,
+                        downloaded_bytes: 0,
+                        // The bundle downloader skips files already
+                        // present at their target, so an interrupted
+                        // bundle can be resumed by re-adding it.
+                        resumable: true,
+                        error: None,
+                        created_unix: now_unix(),
+                        updated_unix: now_unix(),
+                        format_id: None,
+                        needs_merge: false,
+                        format_selector: None,
+                        stream_kind: Some("gltf".to_string()),
+                    };
+                    store.upsert(rec.clone());
+                    let _ = store.save();
+                    drop(store);
+                    self.spawn_worker(id);
+                    Ok(rec)
+                }
+            }
+            Err(e) => {
                 let id = generate_download_id();
                 let rec = DownloadRecord {
                     id: id.clone(),
@@ -653,6 +762,15 @@ impl App {
         match rec.stream_kind.as_deref() {
             Some("hls") => return self.run_stream_hls(&rec, job),
             Some("dash") => return self.run_stream_dash(&rec, job),
+            // SCOPE NOTE (Phase 7): the brief scoped bridge/tauri
+            // changes to add-path classification only, but a `.gltf`
+            // bundle cannot be downloaded at add time without losing
+            // progress, pause, and resume — and it cannot run through
+            // the direct path, which downloads one file. This arm is
+            // the same shape as the hls/dash arms (plan at add,
+            // execute in the worker, dispatch on stream_kind), and the
+            // bulk of the work lives in the engine (threed.rs).
+            Some("gltf") => return self.run_gltf(&rec, job),
             Some(other) => {
                 self.set_status(
                     id,
@@ -935,6 +1053,82 @@ impl App {
         };
         match download_dash(
             &self.data_dir,
+            &opts,
+            &progress,
+            &job.paused,
+            &job.cancelled,
+        ) {
+            Ok(final_path) => {
+                let mut store = self.store.lock().unwrap();
+                if let Some(mut r) = store.get(&id).cloned() {
+                    r.status = Status::Completed;
+                    r.destination = final_path.to_string_lossy().to_string();
+                    if let Some(name) = final_path.file_name() {
+                        r.filename = name.to_string_lossy().to_string();
+                    }
+                    r.downloaded_bytes = r.total_bytes.unwrap_or(r.downloaded_bytes);
+                    r.error = None;
+                    r.updated_unix = now_unix();
+                    store.upsert(r);
+                    let _ = store.save();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(reason) = stop_reason(&e) {
+                    match reason {
+                        fetchforge_engine::download::StopReason::Paused => {
+                            self.set_status(&id, Status::Paused, None);
+                        }
+                        fetchforge_engine::download::StopReason::Cancelled => {
+                            self.set_status(&id, Status::Cancelled, None);
+                        }
+                    }
+                    Ok(())
+                } else {
+                    self.set_status(&id, Status::Failed, Some(e));
+                    Err("download failed".to_string())
+                }
+            }
+        }
+    }
+
+    /// Run a `.gltf` bundle download (threed.rs). The plan is rebuilt
+    /// from the URL at run time, so a resume always works from the
+    /// current file, and files already complete at their target are
+    /// skipped by the bundle downloader.
+    fn run_gltf(&self, rec: &DownloadRecord, job: &Job) -> Result<(), String> {
+        let id = rec.id.clone();
+        self.set_status(&id, Status::Downloading, None);
+        let plan = match fetch_gltf_plan(&rec.url) {
+            Ok(p) => p,
+            Err(e) => {
+                self.set_status(&id, Status::Failed, Some(e));
+                return Err("download failed".to_string());
+            }
+        };
+        let opts = GltfDownloadOptions {
+            destination_dir: PathBuf::from(&self.settings.download_dir),
+            max_segments: self.settings.max_segments,
+            max_retries: self.settings.max_retries,
+            bandwidth_kbps: self.settings.bandwidth_kbps,
+        };
+        let app_id = id.clone();
+        let store_clone = &self.store;
+        let progress = |p: fetchforge_engine::Progress| {
+            let mut store = store_clone.lock().unwrap();
+            if let Some(r) = store.get(&app_id).cloned() {
+                let mut r = r;
+                r.downloaded_bytes = p.downloaded;
+                r.total_bytes = p.total.or(r.total_bytes);
+                r.updated_unix = now_unix();
+                store.upsert(r);
+                let _ = store.save();
+            }
+        };
+        match download_gltf_bundle(
+            &plan,
+            &rec.filename,
             &opts,
             &progress,
             &job.paused,

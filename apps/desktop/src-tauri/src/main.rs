@@ -9,11 +9,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use fetchforge_engine::{
-    category_for_filename, download, download_dash, download_hls_variant, download_media,
-    drive_direct_url, drive_file_id, ensure_ffmpeg, find_ytdlp, generate_download_id,
+    category_for_filename, download, download_dash, download_gltf_bundle, download_hls_variant,
+    download_media, drive_direct_url, drive_file_id, ensure_ffmpeg, ensure_image_extension,
+    fetch_gltf_plan, find_ytdlp, generate_download_id, is_gltf_url, is_image_content_type,
     list_formats, plan_media_download, probe, sanitize_filename, stop_reason,
-    DashDownloadOptions, DownloadOptions, DownloadRecord, MediaDownloadOptions, MediaInfo,
-    Status, Store,
+    DashDownloadOptions, DownloadOptions, DownloadRecord, GltfDownloadOptions,
+    MediaDownloadOptions, MediaInfo, Status, Store,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -209,6 +210,15 @@ async fn add_download(
     if fetchforge_engine::is_manifest_url(&clean) {
         return add_media_download(&state, &clean, filename, format_id);
     }
+    // glTF models (.gltf) carry dependencies (buffers, textures)
+    // that must be downloaded with the model and kept in the same
+    // folder structure (spec §6). They go to the 3D engine, never
+    // the direct path, which would save the .gltf alone and leave
+    // a broken model. Single-file models (GLB, OBJ, ...) take the
+    // direct path below with category "3D".
+    if is_gltf_url(&clean) {
+        return add_gltf_download(&state, &clean, filename);
+    }
     let probe_opts = DownloadOptions {
         url: clean.clone(),
         ..Default::default()
@@ -236,7 +246,7 @@ async fn add_download(
             }) {
                 return add_media_download(&state, &clean, filename, format_id);
             }
-            let (filename, total, resumable) = (
+            let (mut filename, total, resumable) = (
                 filename
                     .as_deref()
                     .map(sanitize_filename)
@@ -245,6 +255,18 @@ async fn add_download(
                 p.content_length,
                 p.accept_ranges,
             );
+            // Extension-less image URLs (e.g. a photo served as
+            // /photo?id=123) get their extension from the probed
+            // content type, so the file opens and categorises as
+            // an image instead of landing in "Other" with no
+            // extension. A name that already has an extension is
+            // never rewritten.
+            if p.content_type
+                .as_deref()
+                .is_some_and(is_image_content_type)
+            {
+                filename = ensure_image_extension(&filename, p.content_type.as_deref());
+            }
             queue_direct_download(&state, clean, filename, total, resumable)
         }
         Err(e) => {
@@ -341,6 +363,78 @@ fn add_media_download(
             ))
         }
     }
+}
+
+/// glTF path for the desktop app (mirrors the bridge): plan the
+/// model + dependencies at add time, queue the bundle download. A
+/// plan failure records a Failed row with the reason.
+fn add_gltf_download(
+    state: &Arc<State>,
+    clean_url: &str,
+    filename: Option<String>,
+) -> Result<DownloadRecord, String> {
+    match try_gltf_download(state, clean_url, filename.clone()) {
+        Ok(rec) => Ok(rec),
+        Err(e) => Ok(failed_record(
+            state,
+            clean_url.to_string(),
+            filename,
+            e,
+        )),
+    }
+}
+
+fn try_gltf_download(
+    state: &Arc<State>,
+    clean_url: &str,
+    filename: Option<String>,
+) -> Result<DownloadRecord, String> {
+    let plan = fetch_gltf_plan(clean_url)?;
+    let record_filename = filename
+        .as_deref()
+        .map(sanitize_filename)
+        .unwrap_or_else(|| plan.filename.clone());
+    // Same idempotent-add rule as the other paths.
+    {
+        let store = state.store.lock().unwrap();
+        for existing in store.all() {
+            if existing.url == clean_url
+                && existing.filename == record_filename
+                && existing.destination == state.download_dir.to_string_lossy().to_string()
+                && (existing.status == Status::Queued || existing.status == Status::Downloading)
+            {
+                return Ok(existing.clone());
+            }
+        }
+    }
+    let id = generate_download_id();
+    let rec = DownloadRecord {
+        id: id.clone(),
+        url: clean_url.to_string(),
+        filename: record_filename,
+        destination: state.download_dir.to_string_lossy().to_string(),
+        category: "3D".to_string(),
+        status: Status::Queued,
+        total_bytes: plan.total_bytes,
+        downloaded_bytes: 0,
+        // The bundle downloader skips files already present at their
+        // target, so an interrupted bundle can be resumed by re-adding it.
+        resumable: true,
+        error: None,
+        created_unix: now_unix(),
+        updated_unix: now_unix(),
+        format_id: None,
+        needs_merge: false,
+        format_selector: None,
+        stream_kind: Some("gltf".to_string()),
+    };
+    {
+        let mut store = state.store.lock().unwrap();
+        store.upsert(rec.clone());
+        let _ = store.save();
+    }
+    spawn_download_worker(state, id);
+    Ok(rec)
 }
 
 fn try_media_download(
@@ -509,6 +603,15 @@ fn run_download(state: &Arc<State>, id: &str, job: &Job) {
         }
         Some("dash") => {
             run_stream_dash_download(state, &rec, job);
+            return;
+        }
+        // SCOPE NOTE (Phase 7): same as the bridge — a `.gltf` bundle
+        // cannot be downloaded at add time without losing progress,
+        // pause, and resume, and it cannot run through the direct
+        // path, which downloads one file. This arm mirrors the
+        // hls/dash arms; the work lives in the engine (threed.rs).
+        Some("gltf") => {
+            run_gltf_download(state, &rec, job);
             return;
         }
         Some(other) => {
@@ -777,6 +880,76 @@ fn run_stream_dash_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job)
     };
     match download_dash(
         &state.data_dir,
+        &opts,
+        &progress,
+        &job.paused,
+        &job.cancelled,
+    ) {
+        Ok(final_path) => {
+            let mut store = state.store.lock().unwrap();
+            if let Some(mut r) = store.get(&id).cloned() {
+                r.status = Status::Completed;
+                r.destination = final_path.to_string_lossy().to_string();
+                if let Some(name) = final_path.file_name() {
+                    r.filename = name.to_string_lossy().to_string();
+                }
+                r.error = None;
+                r.updated_unix = now_unix();
+                store.upsert(r);
+                let _ = store.save();
+            }
+        }
+        Err(e) => {
+            if let Some(reason) = stop_reason(&e) {
+                match reason {
+                    fetchforge_engine::download::StopReason::Paused => {
+                        set_status(state, &id, Status::Paused, None)
+                    }
+                    fetchforge_engine::download::StopReason::Cancelled => {
+                        set_status(state, &id, Status::Cancelled, None)
+                    }
+                }
+            } else {
+                set_status(state, &id, Status::Failed, Some(e));
+            }
+        }
+    }
+}
+
+/// Run a `.gltf` bundle download (threed.rs). Mirrors the bridge's
+/// run_gltf: the plan is rebuilt from the URL at run time, so a
+/// resume always works from the current file.
+fn run_gltf_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
+    let id = rec.id.clone();
+    set_status(state, &id, Status::Downloading, None);
+    let plan = match fetch_gltf_plan(&rec.url) {
+        Ok(p) => p,
+        Err(e) => {
+            set_status(state, &id, Status::Failed, Some(e));
+            return;
+        }
+    };
+    let opts = GltfDownloadOptions {
+        destination_dir: state.download_dir.clone(),
+        max_segments: 4,
+        max_retries: 3,
+        bandwidth_kbps: None,
+    };
+    let id2 = id.clone();
+    let state2 = Arc::clone(state);
+    let progress = move |p: fetchforge_engine::Progress| {
+        let mut store = state2.store.lock().unwrap();
+        if let Some(mut r) = store.get(&id2).cloned() {
+            r.downloaded_bytes = p.downloaded;
+            r.total_bytes = p.total.or(r.total_bytes);
+            r.updated_unix = now_unix();
+            store.upsert(r);
+            let _ = store.save();
+        }
+    };
+    match download_gltf_bundle(
+        &plan,
+        &rec.filename,
         &opts,
         &progress,
         &job.paused,

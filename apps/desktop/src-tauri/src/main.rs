@@ -66,6 +66,19 @@ fn spawn_bridge(data_dir: &PathBuf) -> Option<std::process::Child> {
         .arg(data_dir)
         .arg("--port")
         .arg("18443");
+    // F08b: on Windows, start the bridge with no console window. The
+    // bridge used to open a blank black console next to the app, and
+    // closing it killed the bridge (and Pair with it). Windows-only;
+    // other platforms are unaffected.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW (0x08000000): no console window is created.
+        cmd.creation_flags(0x08000000);
+    }
+    // The bridge logs to bridge.log (stderr); its stdout is not used in
+    // serve mode, so discard it instead of inheriting the app's.
+    cmd.stdout(std::process::Stdio::null());
     if let Some(f) = log_file {
         cmd.stderr(f);
     }
@@ -118,19 +131,18 @@ fn download_dir() -> PathBuf {
 
 #[tauri::command]
 fn list_downloads(state: tauri::State<Arc<State>>) -> Vec<DownloadRecord> {
-    state
-        .store
-        .lock()
-        .unwrap()
-        .all()
-        .into_iter()
-        .cloned()
-        .collect()
+    let mut store = state.store.lock().unwrap();
+    // Pick up downloads added by the bridge (browser extension) since
+    // launch; without this the list never shows them until restart.
+    store.reload_from_disk();
+    store.all().into_iter().cloned().collect()
 }
 
+// Async so the blocking probe runs on Tauri's async runtime instead of
+// the IPC thread: a slow probe used to freeze the whole UI.
 #[tauri::command]
-fn add_download(
-    state: tauri::State<Arc<State>>,
+async fn add_download(
+    state: tauri::State<'_, Arc<State>>,
     url: String,
     filename: Option<String>,
 ) -> Result<DownloadRecord, String> {
@@ -139,7 +151,21 @@ fn add_download(
         url: clean.clone(),
         ..Default::default()
     };
-    let (filename, total, resumable) = match probe(&probe_opts) {
+    // A web page is not a downloadable file: a YouTube watch page (or
+    // any HTML page) would otherwise be saved as a useless file named
+    // after the URL path. Refuse it here so the probe-error branch
+    // below records a Failed row with this reason.
+    let probe_result = probe(&probe_opts).and_then(|p| {
+        if p.content_type
+            .as_deref()
+            .is_some_and(|ct| ct.starts_with("text/html"))
+        {
+            Err("This link is a web page, not a downloadable file. FetchForge downloads direct file links; video pages such as YouTube are not supported yet.".to_string())
+        } else {
+            Ok(p)
+        }
+    });
+    let (filename, total, resumable) = match probe_result {
         Ok(p) => (
             filename
                 .as_deref()
@@ -336,8 +362,13 @@ fn cancel_download(state: tauri::State<Arc<State>>, id: String) {
 // the warning, not a logic bug. Callers still pass &state.data_dir.
 fn bridge_post(_data_dir: &PathBuf, token: &str, path: &str) -> Result<String, String> {
     use std::net::TcpStream;
+    use std::time::Duration;
     let mut stream = TcpStream::connect("127.0.0.1:18443")
         .map_err(|e| format!("Bridge not reachable ({e}). Is FetchForge running?"))?;
+    // Never block forever: if the bridge accepts but never answers,
+    // fail visibly instead of hanging the UI.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:18443\r\nX-FetchForge-Token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
@@ -377,8 +408,10 @@ fn read_bridge_token(data_dir: &PathBuf) -> Result<String, String> {
     Ok(token)
 }
 
+// Async so the blocking loopback call runs off the IPC thread (see
+// add_download).
 #[tauri::command]
-fn pair_browser(state: tauri::State<Arc<State>>) -> Result<String, String> {
+async fn pair_browser(state: tauri::State<'_, Arc<State>>) -> Result<String, String> {
     let token = read_bridge_token(&state.data_dir)?;
     let body = bridge_post(&state.data_dir, &token, "/pair/generate")?;
     let v: serde_json::Value =
@@ -390,7 +423,7 @@ fn pair_browser(state: tauri::State<Arc<State>>) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn unpair_all_browsers(state: tauri::State<Arc<State>>) -> Result<(), String> {
+async fn unpair_all_browsers(state: tauri::State<'_, Arc<State>>) -> Result<(), String> {
     let token = read_bridge_token(&state.data_dir)?;
     let _ = bridge_post(&state.data_dir, &token, "/unpair-all")?;
     Ok(())

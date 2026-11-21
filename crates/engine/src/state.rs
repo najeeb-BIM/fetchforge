@@ -230,6 +230,32 @@ impl Store {
         fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
         Ok(())
     }
+    /// Re-read the state file and merge any records this process does
+    /// not know about (for example, downloads added by the bridge while
+    /// the app was running). Same rule as `save`: a record wins only if
+    /// it is newer than the one already held. A missing or corrupt file
+    /// is ignored here; `save` still refuses to overwrite corrupt state.
+    pub fn reload_from_disk(&mut self) {
+        let Ok(text) = fs::read_to_string(&self.path) else {
+            return;
+        };
+        let Ok(disk_records): Result<BTreeMap<String, DownloadRecord>, _> =
+            serde_json::from_str(&text)
+        else {
+            return;
+        };
+        for (id, disk_rec) in disk_records {
+            match self.records.get(&id) {
+                None => {
+                    self.records.insert(id, disk_rec);
+                }
+                Some(ours) if disk_rec.updated_unix > ours.updated_unix => {
+                    self.records.insert(id, disk_rec);
+                }
+                Some(_) => {}
+            }
+        }
+    }
     pub fn upsert(&mut self, rec: DownloadRecord) {
         self.records.insert(rec.id.clone(), rec);
     }
@@ -390,6 +416,27 @@ mod tests {
         assert!(disk.contains_key("one"), "one must survive");
         assert!(disk.contains_key("two"), "two must survive B's save");
         assert!(disk.contains_key("three"), "three must survive");
+    }
+
+    #[test]
+    fn reload_from_disk_picks_up_other_process_records() {
+        let dir = std::env::temp_dir().join("fetchforge-test-store-reload");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("downloads.json");
+        let mut a = Store::load(path.clone());
+        a.upsert(rec("one"));
+        a.save().unwrap();
+        // B loads when only "one" exists.
+        let mut b = Store::load(path.clone());
+        // A adds "two" and saves. B does not see it on its own...
+        a.upsert(rec("two"));
+        a.save().unwrap();
+        assert!(b.get("two").is_none(), "B must not see two before reload");
+        // ...but reload_from_disk picks it up without losing "one".
+        b.reload_from_disk();
+        assert!(b.get("one").is_some(), "one must survive reload");
+        assert!(b.get("two").is_some(), "two must appear after reload");
     }
 
     #[test]

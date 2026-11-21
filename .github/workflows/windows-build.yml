@@ -17,7 +17,9 @@ jobs:
         with:
           node-version: 20
       - name: Install NSIS
-        run: choco install nsis -y
+        run: |
+          choco install nsis -y
+          Add-Content $env:GITHUB_PATH "C:\Program Files (x86)\NSIS"
       - name: Install Tauri CLI
         run: cargo install tauri-cli --locked
       - name: Run tests

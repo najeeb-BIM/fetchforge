@@ -52,6 +52,13 @@ pub struct DownloadRecord {
     /// existed (the worker then rebuilds a plain selector).
     #[serde(default)]
     pub format_selector: Option<String>,
+    /// HLS/DASH downloads only: `"hls"` or `"dash"`. The worker
+    /// dispatches on this: a set value means the download runs
+    /// through media.rs (manifest parsing + segment assembly),
+    /// while None with a `format_id` means a yt-dlp download.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub stream_kind: Option<String>,
 }
 
 pub struct Store {
@@ -340,6 +347,7 @@ mod tests {
             format_id: None,
             needs_merge: false,
             format_selector: None,
+            stream_kind: None,
         });
         s.save().unwrap();
         let mut s2 = Store::load(path);
@@ -364,6 +372,7 @@ mod tests {
             format_id: None,
             needs_merge: false,
             format_selector: None,
+            stream_kind: None,
         }
     }
 

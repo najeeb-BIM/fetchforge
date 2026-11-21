@@ -709,10 +709,93 @@ pub fn list_formats_with(ytdlp: &Path, url: &str) -> Result<MediaInfo, String> {
 }
 
 /// List formats for a page, resolving (and if needed downloading)
-/// yt-dlp first.
+/// yt-dlp first. HLS (.m3u8) and DASH (.mpd) URLs never reach
+/// yt-dlp: their manifests are parsed directly by media.rs, so a
+/// stream lists its qualities even with no yt-dlp installed.
 pub fn list_formats(data_dir: &Path, url: &str) -> Result<MediaInfo, String> {
+    if crate::media::is_manifest_url(url) {
+        let info = crate::media::list_stream_formats(url)?;
+        return Ok(stream_info_to_media_info(&info));
+    }
     let ytdlp = ensure_ytdlp(data_dir)?;
     list_formats_with(&ytdlp, url)
+}
+
+/// Convert a parsed HLS/DASH stream into the same MediaInfo shape
+/// yt-dlp extraction produces, so the picker and the default-choice
+/// rule work identically for streams and video pages.
+fn stream_info_to_media_info(info: &crate::media::StreamInfo) -> MediaInfo {
+    let mut formats: Vec<MediaFormat> = info
+        .formats
+        .iter()
+        .map(|f| {
+            let kind = match (f.is_video, f.is_audio) {
+                (true, true) => FormatKind::Combined,
+                (true, false) => FormatKind::VideoOnly,
+                (false, true) => FormatKind::AudioOnly,
+                // A stream that is neither is not listable; treat
+                // it as audio-only so it cannot be mistaken for a
+                // watchable video (unreachable in practice: HLS and
+                // DASH formats always carry at least one track).
+                (false, false) => FormatKind::AudioOnly,
+            };
+            MediaFormat {
+                format_id: f.id.clone(),
+                label: format_label(
+                    &f.id,
+                    kind,
+                    &f.ext,
+                    f.height,
+                    f.width,
+                    f.abr_kbps,
+                    f.fps,
+                    f.filesize,
+                    false,
+                ),
+                ext: f.ext.clone(),
+                kind,
+                height: f.height,
+                width: f.width,
+                abr: f.abr_kbps,
+                vbr: f.vbr_kbps,
+                fps: f.fps,
+                filesize: f.filesize,
+                filesize_approx: false,
+                needs_merge: f.needs_merge,
+            }
+        })
+        .collect();
+    // Same best-first order as yt-dlp results: combined, then
+    // video-only, then audio-only; highest resolution first.
+    formats.sort_by(|a, b| {
+        let rank = |k: FormatKind| match k {
+            FormatKind::Combined => 0,
+            FormatKind::VideoOnly => 1,
+            FormatKind::AudioOnly => 2,
+        };
+        rank(a.kind)
+            .cmp(&rank(b.kind))
+            .then(b.height.unwrap_or(0).cmp(&a.height.unwrap_or(0)))
+            .then(
+                b.vbr
+                    .unwrap_or(0.0)
+                    .partial_cmp(&a.vbr.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+    let extractor = match info.kind {
+        crate::media::StreamKind::Hls => "HLS",
+        crate::media::StreamKind::Dash => "DASH",
+    };
+    let default_format_id = pick_default_format(&formats, extractor);
+    MediaInfo {
+        title: info.title.clone(),
+        extractor: extractor.to_string(),
+        duration_secs: info.duration_secs,
+        webpage_url: info.manifest_url.clone(),
+        formats,
+        default_format_id,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -735,8 +818,14 @@ pub struct MediaPlan {
     pub needs_merge: bool,
     /// Full yt-dlp `-f` selector for the chosen format, from
     /// [`format_selector`] — container-aware, so a merge stays in
-    /// the video's container when possible.
+    /// the video's container when possible. Empty for stream
+    /// downloads (HLS/DASH), which the worker dispatches on
+    /// `stream_kind` instead of a selector.
     pub selector: String,
+    /// HLS/DASH downloads only: which stream protocol this plan
+    /// is. None means a yt-dlp download (or a direct download,
+    /// which never produces a plan).
+    pub stream_kind: Option<crate::media::StreamKind>,
 }
 
 fn stem_for_title(title: &str) -> String {
@@ -761,15 +850,35 @@ fn stem_for_title(title: &str) -> String {
 /// Extract a page, pick a format (the requested one, or the default),
 /// and plan the download. `filename` overrides the title-derived
 /// name; its extension is replaced by the format's extension, since
-/// yt-dlp decides the real container.
+/// yt-dlp decides the real container. HLS/DASH manifest URLs plan
+/// from the parsed manifest instead (no yt-dlp involved).
 pub fn plan_media_download(
     data_dir: &Path,
     url: &str,
     format_id: Option<&str>,
     filename: Option<&str>,
 ) -> Result<MediaPlan, String> {
+    if crate::media::is_manifest_url(url) {
+        return plan_stream_download(url, format_id, filename);
+    }
     let info = list_formats(data_dir, url)?;
     plan_from_info(&info, format_id, filename)
+}
+
+/// Plan an HLS/DASH download from the parsed manifest: same
+/// MediaPlan shape as yt-dlp plans, but tagged with the stream
+/// protocol so the worker dispatches to media.rs instead of yt-dlp.
+fn plan_stream_download(
+    url: &str,
+    format_id: Option<&str>,
+    filename: Option<&str>,
+) -> Result<MediaPlan, String> {
+    let info = crate::media::list_stream_formats(url)?;
+    let media = stream_info_to_media_info(&info);
+    let mut plan = plan_from_info(&media, format_id, filename)?;
+    plan.stream_kind = Some(info.kind);
+    plan.selector = String::new();
+    Ok(plan)
 }
 
 fn plan_from_info(
@@ -832,6 +941,7 @@ fn plan_from_info(
         format_label: chosen.label.clone(),
         needs_merge: chosen.needs_merge,
         selector: format_selector(chosen),
+        stream_kind: None,
     })
 }
 
@@ -1742,5 +1852,188 @@ exit 0
         let err = download_media_with(&stub, None, &opts, &progress, &paused, &cancelled)
             .unwrap_err();
         assert!(err.contains("ffmpeg"), "error: {err}");
+    }
+
+    #[test]
+    fn stream_info_converts_to_media_info_with_default() {
+        use crate::media::{StreamFormat, StreamInfo, StreamKind};
+        let info = StreamInfo {
+            kind: StreamKind::Hls,
+            title: "clip".to_string(),
+            duration_secs: Some(120),
+            manifest_url: "https://example.com/clip/master.m3u8".to_string(),
+            formats: vec![
+                StreamFormat {
+                    id: "https://example.com/clip/low.m3u8".to_string(),
+                    ext: "ts".to_string(),
+                    is_video: true,
+                    is_audio: true,
+                    height: Some(360),
+                    width: Some(640),
+                    abr_kbps: None,
+                    vbr_kbps: Some(800.0),
+                    fps: None,
+                    filesize: None,
+                    needs_merge: false,
+                },
+                StreamFormat {
+                    id: "https://example.com/clip/high.m3u8".to_string(),
+                    ext: "mp4".to_string(),
+                    is_video: true,
+                    is_audio: false,
+                    height: Some(1080),
+                    width: Some(1920),
+                    abr_kbps: None,
+                    vbr_kbps: Some(6000.0),
+                    fps: Some(60.0),
+                    filesize: None,
+                    needs_merge: true,
+                },
+                StreamFormat {
+                    id: "https://example.com/clip/mid.m3u8".to_string(),
+                    ext: "ts".to_string(),
+                    is_video: true,
+                    is_audio: true,
+                    height: Some(720),
+                    width: Some(1280),
+                    abr_kbps: None,
+                    vbr_kbps: Some(2800.0),
+                    fps: Some(30.0),
+                    filesize: None,
+                    needs_merge: false,
+                },
+            ],
+        };
+        let media = stream_info_to_media_info(&info);
+        assert_eq!(media.extractor, "HLS");
+        assert_eq!(media.duration_secs, Some(120));
+        // Best-first: combined formats before the video-only one.
+        assert_eq!(media.formats[0].height, Some(720));
+        assert_eq!(media.formats[0].kind, FormatKind::Combined);
+        assert_eq!(media.formats[2].kind, FormatKind::VideoOnly);
+        assert!(media.formats[2].needs_merge);
+        // Default: best combined at or below 1080p (720p), not the
+        // 1080p video-only format (a merge is never the default
+        // when a combined format exists).
+        assert_eq!(
+            media.default_format_id.as_deref(),
+            Some("https://example.com/clip/mid.m3u8")
+        );
+        assert!(media.formats[0].label.contains("720p"), "label: {}", media.formats[0].label);
+    }
+
+    /// Loopback server for stream-routing tests: serves `files` by
+    /// path until `stop` is set. Returns the port and the thread.
+    fn serve_files(
+        files: std::collections::HashMap<String, Vec<u8>>,
+        stop: std::sync::Arc<AtomicBool>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    match files.get(&path) {
+                        Some(body) => {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(body);
+                        }
+                        None => {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        });
+        (port, handle)
+    }
+
+    const TEST_MASTER: &str = "#EXTM3U\n\
+        #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\n\
+        low.m3u8\n\
+        #EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720\n\
+        mid.m3u8\n";
+
+    const TEST_MEDIA: &str = "#EXTM3U\n#EXTINF:10,\nseg0.ts\n#EXT-X-ENDLIST\n";
+
+    #[test]
+    fn list_formats_routes_manifests_without_ytdlp() {
+        // The data dir is empty (no yt-dlp anywhere): if the
+        // manifest routed to yt-dlp, this would try a 3 MB GitHub
+        // download and fail. Routing to media.rs succeeds.
+        let dir = std::env::temp_dir().join("fetchforge-test-hls-noytdlp");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files = std::collections::HashMap::new();
+        files.insert("/master.m3u8".to_string(), TEST_MASTER.as_bytes().to_vec());
+        files.insert("/low.m3u8".to_string(), TEST_MEDIA.as_bytes().to_vec());
+        files.insert("/mid.m3u8".to_string(), TEST_MEDIA.as_bytes().to_vec());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_files(files, stop.clone());
+        let info = list_formats(&dir, &format!("http://127.0.0.1:{port}/master.m3u8")).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(info.extractor, "HLS");
+        assert_eq!(info.formats.len(), 2);
+        assert_eq!(info.duration_secs, Some(10));
+    }
+
+    #[test]
+    fn plan_stream_download_picks_default_and_explicit_format() {
+        let mut files = std::collections::HashMap::new();
+        files.insert("/master.m3u8".to_string(), TEST_MASTER.as_bytes().to_vec());
+        files.insert("/low.m3u8".to_string(), TEST_MEDIA.as_bytes().to_vec());
+        files.insert("/mid.m3u8".to_string(), TEST_MEDIA.as_bytes().to_vec());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_files(files, stop.clone());
+        let url = format!("http://127.0.0.1:{port}/master.m3u8");
+        let dir = std::env::temp_dir().join("fetchforge-test-hls-plan");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Default: best combined <= 1080p (720p mid), .ts, no merge,
+        // tagged as an HLS plan with an empty yt-dlp selector.
+        let plan = plan_media_download(&dir, &url, None, None).unwrap();
+        assert_eq!(plan.format_id, format!("http://127.0.0.1:{port}/mid.m3u8"));
+        assert!(plan.filename.ends_with(".ts"), "filename: {}", plan.filename);
+        assert!(!plan.needs_merge);
+        assert_eq!(plan.stream_kind, Some(crate::media::StreamKind::Hls));
+        assert_eq!(plan.selector, "");
+        // Explicit choice: the 360p variant.
+        let plan = plan_media_download(
+            &dir,
+            &url,
+            Some(&format!("http://127.0.0.1:{port}/low.m3u8")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.format_id, format!("http://127.0.0.1:{port}/low.m3u8"));
+        // Unknown format id is a clear error.
+        assert!(plan_media_download(&dir, &url, Some("nope"), None).is_err());
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
     }
 }

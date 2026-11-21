@@ -9,10 +9,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use fetchforge_engine::{
-    category_for_filename, download, download_media, drive_direct_url, drive_file_id,
-    find_ytdlp, generate_download_id, list_formats, plan_media_download, probe,
-    sanitize_filename, stop_reason, DownloadOptions, DownloadRecord, MediaDownloadOptions,
-    MediaInfo, Status, Store,
+    category_for_filename, download, download_hls_variant, download_media, drive_direct_url,
+    drive_file_id, ensure_ffmpeg, find_ytdlp, generate_download_id, list_formats,
+    plan_media_download, probe, sanitize_filename, stop_reason, DownloadOptions, DownloadRecord,
+    MediaDownloadOptions, MediaInfo, Status, Store,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -153,6 +153,13 @@ async fn add_download(
     format_id: Option<String>,
 ) -> Result<DownloadRecord, String> {
     let clean = fetchforge_engine::validate_url(&url)?;
+    // HLS (.m3u8) / DASH (.mpd) manifests go straight to the media
+    // path (manifest parsing + segment assembly in media.rs): a
+    // manifest must never reach the direct path, which would save
+    // the manifest text itself as a file.
+    if fetchforge_engine::is_manifest_url(&clean) {
+        return add_media_download(&state, &clean, filename, format_id);
+    }
     let probe_opts = DownloadOptions {
         url: clean.clone(),
         ..Default::default()
@@ -173,6 +180,13 @@ async fn add_download(
     }
     match probe_result {
         Ok(p) => {
+            // Extension-less manifests: the probe's content type
+            // says HLS/DASH, so this is a stream, not a file.
+            if p.content_type.as_deref().is_some_and(|ct| {
+                fetchforge_engine::stream_kind_of_content_type(ct).is_some()
+            }) {
+                return add_media_download(&state, &clean, filename, format_id);
+            }
             let (filename, total, resumable) = (
                 filename
                     .as_deref()
@@ -225,6 +239,7 @@ fn failed_record(
         format_id: None,
         needs_merge: false,
         format_selector: None,
+        stream_kind: None,
     };
     state.store.lock().unwrap().upsert(rec.clone());
     let _ = state.store.lock().unwrap().save();
@@ -323,6 +338,7 @@ fn try_media_download(
         format_id: Some(plan.format_id),
         needs_merge: plan.needs_merge,
         format_selector: Some(plan.selector),
+        stream_kind: plan.stream_kind.map(|k| k.as_str().to_string()),
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -377,6 +393,7 @@ fn queue_direct_download(
         format_id: None,
         needs_merge: false,
         format_selector: None,
+        stream_kind: None,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -431,8 +448,30 @@ fn run_download(state: &Arc<State>, id: &str, job: &Job) {
         Some(r) => r.clone(),
         None => return,
     };
-    // Media downloads (a format was chosen) run through yt-dlp;
+    // Stream downloads (HLS/DASH) run through media.rs; yt-dlp
+    // media downloads (a format was chosen) run through yt-dlp;
     // everything else takes the direct path, exactly as before.
+    // DASH records cannot exist yet (planning refuses .mpd with a
+    // clear message until the DASH assembly lands); the arm below
+    // fails them honestly rather than misrouting them.
+    match rec.stream_kind.as_deref() {
+        Some("hls") => {
+            run_stream_hls_download(state, &rec, job);
+            return;
+        }
+        Some(other) => {
+            set_status(
+                state,
+                id,
+                Status::Failed,
+                Some(format!(
+                    "Stream downloads of this kind ({other}) are not supported yet."
+                )),
+            );
+            return;
+        }
+        None => {}
+    }
     if rec.format_id.is_some() {
         run_media_download(state, &rec, job);
         return;
@@ -542,6 +581,83 @@ fn run_media_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
     match download_media(
         &state.data_dir,
         &opts,
+        &progress,
+        &job.paused,
+        &job.cancelled,
+    ) {
+        Ok(final_path) => {
+            let mut store = state.store.lock().unwrap();
+            if let Some(mut r) = store.get(&id).cloned() {
+                r.status = Status::Completed;
+                r.destination = final_path.to_string_lossy().to_string();
+                if let Some(name) = final_path.file_name() {
+                    r.filename = name.to_string_lossy().to_string();
+                }
+                r.error = None;
+                r.updated_unix = now_unix();
+                store.upsert(r);
+                let _ = store.save();
+            }
+        }
+        Err(e) => {
+            if let Some(reason) = stop_reason(&e) {
+                match reason {
+                    fetchforge_engine::download::StopReason::Paused => {
+                        set_status(state, &id, Status::Paused, None)
+                    }
+                    fetchforge_engine::download::StopReason::Cancelled => {
+                        set_status(state, &id, Status::Cancelled, None)
+                    }
+                }
+            } else {
+                set_status(state, &id, Status::Failed, Some(e));
+            }
+        }
+    }
+}
+
+/// Run an HLS download (media.rs). Mirrors the bridge's
+/// run_stream_hls: the record's format_id is the chosen variant
+/// playlist URL (or the manifest URL itself for a plain media
+/// playlist), and ffmpeg is resolved only when the variant needs a
+/// merge (separate audio track).
+fn run_stream_hls_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
+    let id = rec.id.clone();
+    set_status(state, &id, Status::Downloading, None);
+    let dir = state
+        .download_dir
+        .join(category_for_filename(&rec.filename));
+    let variant_uri = rec.format_id.clone().unwrap_or_else(|| rec.url.clone());
+    let ffmpeg = if rec.needs_merge {
+        match ensure_ffmpeg(&state.data_dir) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                set_status(state, &id, Status::Failed, Some(e));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let id2 = id.clone();
+    let state2 = Arc::clone(state);
+    let progress = move |p: fetchforge_engine::Progress| {
+        let mut store = state2.store.lock().unwrap();
+        if let Some(mut r) = store.get(&id2).cloned() {
+            r.downloaded_bytes = p.downloaded;
+            r.total_bytes = p.total.or(r.total_bytes);
+            r.updated_unix = now_unix();
+            store.upsert(r);
+            let _ = store.save();
+        }
+    };
+    match download_hls_variant(
+        &rec.url,
+        &variant_uri,
+        &dir,
+        &rec.filename,
+        &None,
+        ffmpeg.as_deref(),
         &progress,
         &job.paused,
         &job.cancelled,

@@ -15,10 +15,10 @@
 //!   fetchforge-bridge print-token [--data-dir DIR]
 
 use fetchforge_engine::{
-    category_for_filename, download, download_media, drive_direct_url, drive_file_id,
-    find_ytdlp, generate_download_id, generate_secure_token, list_formats,
-    plan_media_download, probe, sanitize_filename, stop_reason, DownloadOptions, DownloadRecord,
-    MediaDownloadOptions, Status, Store,
+    category_for_filename, download, download_hls_variant, download_media, drive_direct_url,
+    drive_file_id, ensure_ffmpeg, find_ytdlp, generate_download_id, generate_secure_token,
+    list_formats, plan_media_download, probe, sanitize_filename, stop_reason, DownloadOptions,
+    DownloadRecord, MediaDownloadOptions, Status, Store,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -268,6 +268,13 @@ impl App {
         format_id: Option<String>,
     ) -> Result<DownloadRecord, String> {
         let clean_url = fetchforge_engine::validate_url(url)?;
+        // HLS (.m3u8) / DASH (.mpd) manifests go straight to the
+        // media path (manifest parsing + segment assembly in
+        // media.rs): a manifest must never reach the direct path,
+        // which would save the manifest text itself as a file.
+        if fetchforge_engine::is_manifest_url(&clean_url) {
+            return self.add_media_download(&clean_url, filename, format_id);
+        }
         // Probe first so we can record a real filename / size / resumability
         // and fail fast on 404 / denied links instead of queueing a dead job.
         let probe_opts = DownloadOptions {
@@ -293,6 +300,13 @@ impl App {
         }
         match probe_result {
             Ok(p) => {
+                // Extension-less manifests: the probe's content type
+                // says HLS/DASH, so this is a stream, not a file.
+                if p.content_type.as_deref().is_some_and(|ct| {
+                    fetchforge_engine::stream_kind_of_content_type(ct).is_some()
+                }) {
+                    return self.add_media_download(&clean_url, filename, format_id);
+                }
                 let (filename, total, resumable) = (
                     filename
                         .as_deref()
@@ -336,6 +350,7 @@ impl App {
                     format_id: None,
                     needs_merge: false,
                     format_selector: None,
+                    stream_kind: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -406,6 +421,7 @@ impl App {
                     format_id: None,
                     needs_merge: false,
                     format_selector: None,
+                    stream_kind: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -460,6 +476,7 @@ impl App {
                 format_id: Some(plan.format_id),
                 needs_merge: plan.needs_merge,
                 format_selector: Some(plan.selector),
+                stream_kind: plan.stream_kind.map(|k| k.as_str().to_string()),
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -513,6 +530,7 @@ impl App {
                 format_id: None,
                 needs_merge: false,
                 format_selector: None,
+                stream_kind: None,
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -560,8 +578,26 @@ impl App {
             Some(r) => r.clone(),
             None => return Err("unknown download".to_string()),
         };
-        // Media downloads (a format was chosen) run through yt-dlp;
+        // Stream downloads (HLS/DASH) run through media.rs; yt-dlp
+        // media downloads (a format was chosen) run through yt-dlp;
         // everything else takes the direct path, exactly as before.
+        // DASH records cannot exist yet (planning refuses .mpd with
+        // a clear message until the DASH assembly lands); the arm
+        // below fails them honestly rather than misrouting them.
+        match rec.stream_kind.as_deref() {
+            Some("hls") => return self.run_stream_hls(&rec, job),
+            Some(other) => {
+                self.set_status(
+                    id,
+                    Status::Failed,
+                    Some(format!(
+                        "Stream downloads of this kind ({other}) are not supported yet."
+                    )),
+                );
+                return Err("download failed".to_string());
+            }
+            None => {}
+        }
         if rec.format_id.is_some() {
             return self.run_media(&rec, job);
         }
@@ -676,6 +712,90 @@ impl App {
         match download_media(
             &self.data_dir,
             &opts,
+            &progress,
+            &job.paused,
+            &job.cancelled,
+        ) {
+            Ok(final_path) => {
+                let mut store = self.store.lock().unwrap();
+                if let Some(mut r) = store.get(&id).cloned() {
+                    r.status = Status::Completed;
+                    r.destination = final_path.to_string_lossy().to_string();
+                    if let Some(name) = final_path.file_name() {
+                        r.filename = name.to_string_lossy().to_string();
+                    }
+                    r.downloaded_bytes = r.total_bytes.unwrap_or(r.downloaded_bytes);
+                    r.error = None;
+                    r.updated_unix = now_unix();
+                    store.upsert(r);
+                    let _ = store.save();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(reason) = stop_reason(&e) {
+                    match reason {
+                        fetchforge_engine::download::StopReason::Paused => {
+                            self.set_status(&id, Status::Paused, None);
+                        }
+                        fetchforge_engine::download::StopReason::Cancelled => {
+                            self.set_status(&id, Status::Cancelled, None);
+                        }
+                    }
+                    Ok(())
+                } else {
+                    self.set_status(&id, Status::Failed, Some(e));
+                    Err("download failed".to_string())
+                }
+            }
+        }
+    }
+
+    /// Run an HLS download (media.rs). The record's format_id is the
+    /// chosen variant playlist URL (or the manifest URL itself for a
+    /// plain media playlist). ffmpeg is resolved only when the
+    /// chosen variant needs a merge (separate audio track); a
+    /// resume re-runs the same variant and picks up the segment
+    /// sidecar left by the paused run.
+    fn run_stream_hls(&self, rec: &DownloadRecord, job: &Job) -> Result<(), String> {
+        let id = rec.id.clone();
+        self.set_status(&id, Status::Downloading, None);
+        let mut dir = PathBuf::from(&self.settings.download_dir);
+        if self.settings.organise_by_category {
+            dir = dir.join(category_for_filename(&rec.filename));
+        }
+        let variant_uri = rec.format_id.clone().unwrap_or_else(|| rec.url.clone());
+        let ffmpeg = if rec.needs_merge {
+            match ensure_ffmpeg(&self.data_dir) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    self.set_status(&id, Status::Failed, Some(e));
+                    return Err("download failed".to_string());
+                }
+            }
+        } else {
+            None
+        };
+        let app_id = id.clone();
+        let store_clone = &self.store;
+        let progress = |p: fetchforge_engine::Progress| {
+            let mut store = store_clone.lock().unwrap();
+            if let Some(r) = store.get(&app_id).cloned() {
+                let mut r = r;
+                r.downloaded_bytes = p.downloaded;
+                r.total_bytes = p.total.or(r.total_bytes);
+                r.updated_unix = now_unix();
+                store.upsert(r);
+                let _ = store.save();
+            }
+        };
+        match download_hls_variant(
+            &rec.url,
+            &variant_uri,
+            &dir,
+            &rec.filename,
+            &None,
+            ffmpeg.as_deref(),
             &progress,
             &job.paused,
             &job.cancelled,

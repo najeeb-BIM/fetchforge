@@ -390,7 +390,7 @@ Do this only if the run has a green tick.
    click **Extract**.
 5. Inside the extracted folder, you should SEE two files:
 
-   - `FetchForge-Setup-0.1.0-x64.exe` (the installer)
+   - `FetchForge-Setup-0.2.0-x64.exe` (the installer)
    - `FetchForge-portable-x64.zip` (the portable version)
 
 **Check the fingerprints before you install:**
@@ -400,7 +400,7 @@ Do this only if the run has a green tick.
    commands, one at a time:
 
    ```powershell
-   Get-FileHash .\FetchForge-Setup-0.1.0-x64.exe -Algorithm SHA256
+   Get-FileHash .\FetchForge-Setup-0.2.0-x64.exe -Algorithm SHA256
    Get-FileHash .\FetchForge-portable-x64.zip -Algorithm SHA256
    ```
 
@@ -421,7 +421,7 @@ Do this only if the run has a green tick.
 
 **About the Windows SmartScreen warning — please read this:**
 
-10. Double-click `FetchForge-Setup-0.1.0-x64.exe` to install
+10. Double-click `FetchForge-Setup-0.2.0-x64.exe` to install
     it.
 11. Windows may show a blue window that says "Windows
     protected your PC" and "Microsoft Defender SmartScreen

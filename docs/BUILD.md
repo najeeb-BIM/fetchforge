@@ -25,7 +25,7 @@ Windows app + installer (on Windows, from repo root):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
-# Outputs: installer/FetchForge-Setup-0.1.0-x64.exe
+# Outputs: installer/FetchForge-Setup-0.2.0-x64.exe
 #          dist/FetchForge-portable-x64.zip
 ```
 
@@ -34,7 +34,7 @@ Or via GitHub Actions: `.github/workflows/windows-build.yml`
 
 ## Signing
 
-The installer is **not signed** in v0.1.0. No certificate was
+The installer is **not signed** in v0.2.0. No certificate was
 available, and none is claimed. To sign: obtain a code-signing
 certificate, keep its private key out of source control, and sign both
 `FetchForge.exe` and the NSIS output with `signtool` before release,

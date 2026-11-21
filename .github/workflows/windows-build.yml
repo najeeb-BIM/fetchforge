@@ -31,10 +31,11 @@ jobs:
         shell: pwsh
         run: |
           $files = @(
-            "installer/FetchForge-Setup-0.1.0-x64.exe",
+            "installer/FetchForge-Setup-0.2.0-x64.exe",
             "dist/FetchForge-portable-x64.zip",
             "installer/stage/FetchForge.exe",
-            "installer/stage/fetchforge-bridge.exe"
+            "installer/stage/fetchforge-bridge.exe",
+            "installer/stage/yt-dlp.exe"
           )
           foreach ($f in $files) {
             if (-not (Test-Path $f)) { throw "Missing expected output file: $f" }
@@ -45,5 +46,5 @@ jobs:
         with:
           name: fetchforge-windows-x64
           path: |
-            installer/FetchForge-Setup-0.1.0-x64.exe
+            installer/FetchForge-Setup-0.2.0-x64.exe
             dist/FetchForge-portable-x64.zip

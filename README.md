@@ -3,25 +3,34 @@
 Original implementation, inspired by the practical features of IDM. No
 browsing history, download history, or user data leaves the machine.
 
-## What is in v0.1.0
+## What is in v0.2.0
 
 - **Download engine (Rust)** — HTTP/HTTPS, redirects, Range resume,
   segmented downloads for large files, retries with backoff, bandwidth
   limiting, safe Windows filenames, atomic `.part` → final rename,
   category folders, persistent JSON state with crash recovery.
+- **Media extraction (yt-dlp)** — video pages (YouTube, Vimeo, public
+  Google Drive files, generic video pages) list their real available
+  qualities; the user picks one in the format picker, or the extension
+  path takes the recorded default (best combined ≤1080p). Separate
+  video+audio streams are merged with ffmpeg (downloaded once, verified,
+  only when a merge is needed). yt-dlp is bundled with the installer;
+  no DRM is ever bypassed, and live streams are refused.
 - **Desktop app shell (Tauri 2 + vanilla HTML/JS)** — dashboard with
   active / queued / completed / failed, progress, pause / resume /
-  cancel, search and filtering. The Tauri shell shares the same engine
-  as the bridge.
+  cancel, search and filtering, format picker for video pages. The Tauri
+  shell shares the same engine as the bridge.
 - **Browser extensions (Chrome / Edge / Chromium, Firefox)** — context
   menu "Download with FetchForge", popup with paste-a-link and bridge
   token setup. Native messaging first, loopback bridge second, browser
   downloader as fallback.
 - **Localhost bridge** — loopback-only HTTP API on 127.0.0.1:18443 with
-  a per-install token, plus a native-messaging host mode.
+  a per-install token, plus a native-messaging host mode. The native
+  host forwards downloads to the long-running bridge (starting one if
+  needed), so a download survives the browser closing the host process.
 - **Installer** — per-user NSIS installer (no admin), Start Menu and
-  desktop shortcuts, native-host registration, clean uninstall with an
-  explicit choice about user data. Portable zip too.
+  desktop shortcuts, native-host registration, bundled yt-dlp, clean
+  uninstall with an explicit choice about user data. Portable zip too.
 
 ## Quick start (developer, any OS for engine/bridge)
 

@@ -42,12 +42,17 @@ crates/engine/
   category.rs   extension -> Video/Audio/Documents/Images/Archives/Software/Other
   download.rs   probe, single-stream resume, segmented, retry, limiter
   media.rs      HLS (clear only), DASH (refuses DRM/unsupported shapes)
+  extract.rs    yt-dlp wrapper: format listing, quality choice, media
+                download (+ ffmpeg merge), tool provisioning (yt-dlp /
+                ffmpeg lookup, pinned first-use download, SHA-256)
   state.rs      JSON store, atomic save, recover_interrupted()
 crates/bridge/
-  main.rs       loopback HTTP API, token auth, origin check, native host,
-                queue gate (max_simultaneous), worker threads
+  main.rs       loopback HTTP API, token auth, origin check, native host
+                (forwards addDownload to the bridge, spawns one if
+                needed), queue gate (max_simultaneous), worker threads
 apps/desktop/
-  src/          index.html, styles.css, app.js (Tauri or bridge mode)
+  src/          index.html (inlined script is the source of truth),
+                styles.css (Tauri or bridge mode)
   src-tauri/    Tauri commands -> engine (built on Windows only)
 extensions/
   chromium/     Manifest V3 (Chrome, Edge, other Chromium)
@@ -61,13 +66,19 @@ tests/          server.py (loopback Range server), e2e.sh, pause_resume.sh
 ## Data flow
 
 Browser extension -> (1) native messaging to `fetchforge-bridge
-native-host`, or (2) `POST http://127.0.0.1:18443/downloads` with
+native-host`, which forwards the request to the long-running bridge
+over loopback HTTP (spawning a detached bridge if none is listening),
+or (2) `POST http://127.0.0.1:18443/downloads` with
 `X-FetchForge-Token` -> bridge probes the URL, records a Queued job,
 spawns a worker (gated by max_simultaneous) -> engine downloads to
 `<Downloads>/<Category>/<name>.part` -> atomic rename -> record
 Completed. The desktop app reads the same `downloads.json` store.
+A probe returning text/html (a video page) goes through media
+extraction instead: yt-dlp lists formats, the user picks a quality
+(or the extension path takes the recorded default), yt-dlp downloads
+it, merging separate streams with ffmpeg when needed.
 
-## Known design limits (v0.1.0)
+## Known design limits (v0.2.0)
 
 - Segmented downloads are fresh-download only. A paused segmented
   download restarts cleanly (its part file is discarded); a paused
@@ -77,3 +88,7 @@ Completed. The desktop app reads the same `downloads.json` store.
 - DASH segment assembly is not implemented; it refuses instead of
   producing a corrupt file. HLS clear playlists work in the engine but
   are not yet exposed through the bridge/UI.
+- yt-dlp is pinned (2026.10.26) and bundled; a newer yt-dlp ships with
+  the next app release. ffmpeg (Windows) downloads once on first merge
+  (~114 MB); on Linux/macOS a system ffmpeg is required for merges.
+- Live streams are refused; DRM content is refused, never bypassed.

@@ -1,13 +1,16 @@
-# Feature matrix — v0.1.0
+# Feature matrix — v0.2.0
 
-Status key: DONE = implemented and tested as noted in TEST_REPORT.md.
-PARTIAL = implemented but with a stated limit. NOT YET = not in v0.1.0.
+Status key: DONE = implemented and tested as noted in TEST_REPORT.md
+(v0.1.0) or the v0.2.0 test run (engine + bridge unit tests, stub
+yt-dlp tests, native-forwarding shell test).
+PARTIAL = implemented but with a stated limit. NOT YET = not in v0.2.0.
 
 ## Desktop app
 
 | Feature | Status | Note |
 |---|---|---|
 | Dashboard: active / queued / completed / failed | DONE | Tauri UI + bridge list API |
+| Format picker for video pages | DONE | Lists real available qualities (yt-dlp); user picks, or the recorded default for extension-sent URLs |
 | Progress, % , size, speed | PARTIAL | Engine reports bytes/sec; UI shows progress/size, speed column is a placeholder in the Tauri UI (bridge progress API carries bytes, UI refreshes every 2 s) |
 | Pause / resume / cancel / retry | DONE* | *Retry = re-add; in-app retry button is not yet wired. Pause/resume proven for single-stream (see TEST_REPORT) |
 | Remove, search, filter, sort | PARTIAL | Search + status filter in UI; remove/sort not yet in UI |
@@ -46,8 +49,9 @@ PARTIAL = implemented but with a stated limit. NOT YET = not in v0.1.0.
 | Context menu | DONE (source) | Link / video / audio contexts |
 | File-type filters | PARTIAL | Extension sends any link the user chooses; automatic filtering by type is not yet enforced |
 | Connected indicator | DONE (source) | Popup checks /health + token state |
-| Native messaging | PARTIAL | Host code + manifests + installer registration complete; end-to-end in a real browser NOT tested here |
+| Native messaging | PARTIAL | Host forwards addDownload to the long-running bridge (spawns one if needed) so downloads survive the host exiting; verified on Linux with a real native message, end-to-end in a real browser NOT tested here |
 | Loopback bridge + token auth | DONE | Tested: health, 401 without token, add/list/pause/resume, native ping |
+| Media formats API (POST /media/formats) | DONE | Token auth, same as other bridge routes |
 | Fallback to browser downloader | DONE (source) | On any bridge/native failure |
 
 ## Media
@@ -55,6 +59,10 @@ PARTIAL = implemented but with a stated limit. NOT YET = not in v0.1.0.
 | Feature | Status | Note |
 |---|---|---|
 | Direct MP4/WebM/etc. links | DONE | Ordinary engine downloads |
+| Video pages (YouTube, Vimeo, generic) | DONE | yt-dlp extraction; real qualities listed; default = best combined ≤1080p, else best video ≤1080p merged with best audio |
+| Google Drive public files | DONE | yt-dlp Drive extractor; direct uc-download fallback when extraction fails (accepted only when the probe is non-HTML) |
+| Audio/video merging (ffmpeg) | DONE | Video-only formats merge with best audio; ffmpeg downloaded once on first merge (Windows, SHA-256-verified), system ffmpeg preferred |
+| Live streams | NOT YET | Refused with a plain explanation |
 | HLS clear playlists | PARTIAL | Engine function works; not yet exposed via bridge/UI |
 | DASH | NOT YET | Refuses DRM/unsupported shapes honestly; no segment assembly |
 | DRM / paywall bypass | NEVER | Refused by design |

@@ -4,13 +4,15 @@
 ; Requires, staged under installer/stage/ at build time:
 ;   stage/FetchForge.exe          (Tauri app binary, from cargo tauri build)
 ;   stage/fetchforge-bridge.exe   (cargo build --release -p fetchforge-bridge)
+;   stage/yt-dlp.exe              (pinned yt-dlp release, SHA-256-verified
+;                                  by the build script; the media engine)
 ;   stage/host-manifest-*.json    (placeholders patched by the build script;
 ;                                  the source manifests in installer/ are
 ;                                  NEVER overwritten with patched paths)
 ; This script is NOT signed. Do not claim a signed installer unless a
 ; code-signing certificate was actually applied and verified (see docs/BUILD.md).
 !define APPNAME "FetchForge"
-!define VERSION "0.1.0"
+!define VERSION "0.2.0"
 !define COMPANY "FetchForge"
 !define INSTDIR_USER "$LOCALAPPDATA\Programs\FetchForge"
 
@@ -34,6 +36,10 @@ Section "Install"
   SetOutPath "$INSTDIR"
   File "stage\FetchForge.exe"
   File "stage\fetchforge-bridge.exe"
+  ; yt-dlp sits next to the app and bridge binaries: the engine finds
+  ; it there (see crates/engine/src/extract.rs). ffmpeg is NOT
+  ; bundled (105 MB); the engine downloads it on first merge.
+  File "stage\yt-dlp.exe"
   ; Native-messaging host manifests, with a relative bridge path
   ; ("../fetchforge-bridge.exe", relative to this native-host folder)
   ; patched in by the build script (staged copies only, never the sources).
@@ -63,6 +69,7 @@ SectionEnd
 Section "Uninstall"
   Delete "$INSTDIR\FetchForge.exe"
   Delete "$INSTDIR\fetchforge-bridge.exe"
+  Delete "$INSTDIR\yt-dlp.exe"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir /r "$INSTDIR\native-host"
   Delete "$SMPROGRAMS\FetchForge\FetchForge.lnk"

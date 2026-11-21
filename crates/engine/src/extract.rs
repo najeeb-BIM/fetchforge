@@ -32,34 +32,24 @@
 //!   known-good, reproducible build. yt-dlp updates ship with app
 //!   updates (bump YTDLP_VERSION + the hashes below).
 //! * ffmpeg is DOWNLOADED ON FIRST USE, only when a merge is
-//!   actually needed. The Windows build (gyan.dev essentials,
-//!   ffmpeg 9.1) is a 119,467,219-byte zip whose ffmpeg.exe alone is
-//!   110,590,976 bytes (~105 MiB): bundling it would more than
-//!   double the installer for a tool many downloads never need
-//!   (combined single-file formats need no merge). A system ffmpeg
-//!   on PATH is used first when present, so users who already have
-//!   it pay nothing; otherwise the pinned zip is downloaded once,
-//!   SHA-256-verified, and only `bin/ffmpeg.exe` is extracted into
-//!   `<data-dir>/tools/ffmpeg/`. On non-Windows there is no pinned
-//!   binary: a system ffmpeg is required and the error says how to
-//!   install one (the product targets Windows; Linux/macOS users
-//!   install ffmpeg from their package manager).
+//!   actually needed — see ffmpeg.rs (FFmpegProcessor), which owns
+//!   ffmpeg provisioning and A/V merging.
 //!
-//! Lookup order for both tools:
-//!   1. `FETCHFORGE_YTDLP_PATH` / `FETCHFORGE_FFMPEG_PATH` env override
-//!      (dev and tests; an override that does not exist is an error,
-//!      never silently ignored).
+//! yt-dlp lookup order:
+//!   1. `FETCHFORGE_YTDLP_PATH` env override (dev and tests; an
+//!      override that does not exist is an error, never silently
+//!      ignored).
 //!   2. Next to the current executable (the bundled install layout).
 //!   3. `<data-dir>/tools/` (first-use download location).
 //!   4. PATH (a system install).
-//!   5. (ensure_* only) Download the pinned release, verify SHA-256.
+//!   5. (`ensure_ytdlp` only) Download the pinned release, verify
+//!      SHA-256.
 
 use crate::download::Progress;
 use crate::filename::{sanitize_filename, unique_path};
 use crate::validate::validate_url;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,17 +66,6 @@ pub const YTDLP_SHA256_WINDOWS: &str =
 pub const YTDLP_SHA256_UNIX: &str =
     "e51e69e89489f199530f13d32a4342da3ddb2cf34842f364603a066db05afbf3";
 
-/// Pinned ffmpeg release (Windows only, gyan.dev essentials build).
-/// Hash verified 2026-11-21 by downloading the 119,467,219-byte zip
-/// and comparing against the published .sha256 file. The URL is the
-/// versioned package URL, not the moving `ffmpeg-release-essentials`
-/// alias, so the pinned hash cannot go stale on a new ffmpeg release.
-pub const FFMPEG_VERSION: &str = "9.1";
-pub const FFMPEG_ZIP_URL_WINDOWS: &str =
-    "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.1-essentials_build.zip";
-pub const FFMPEG_ZIP_SHA256_WINDOWS: &str =
-    "b9bbbb3acece000cbeec994f856649354e52c773807841e78908374b24d658fd";
-
 /// How long `yt-dlp -J` may run before the extraction is abandoned.
 /// Extraction is usually a few seconds; 90 s covers slow sites and a
 /// cold first run without hanging the UI forever.
@@ -100,49 +79,6 @@ fn ytdlp_exe_name() -> &'static str {
     }
 }
 
-fn ffmpeg_exe_name() -> &'static str {
-    if cfg!(windows) {
-        "ffmpeg.exe"
-    } else {
-        "ffmpeg"
-    }
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-/// Test-only: download_verified hashes incrementally while
-/// streaming, so production code never hashes a whole file at once.
-#[cfg(test)]
-fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut h = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        match f.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => h.update(&buf[..n]),
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    Ok(to_hex(&h.finalize()))
-}
-
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let cand = dir.join(name);
-        if cand.is_file() {
-            return Some(cand);
-        }
-    }
-    None
-}
 
 /// Lookup only: no download. Used where a tool must already be
 /// present (for example, the probe-failure fallback in add_download,
@@ -172,7 +108,7 @@ pub fn find_ytdlp(data_dir: &Path) -> Result<PathBuf, String> {
     if tools.is_file() {
         return Ok(tools);
     }
-    if let Some(p) = find_on_path(ytdlp_exe_name()) {
+    if let Some(p) = crate::ffmpeg::find_on_path(ytdlp_exe_name()) {
         return Ok(p);
     }
     Err(
@@ -205,7 +141,7 @@ pub fn ensure_ytdlp(data_dir: &Path) -> Result<PathBuf, String> {
             let tools_dir = data_dir.join("tools");
             std::fs::create_dir_all(&tools_dir).map_err(|e| e.to_string())?;
             let dest = tools_dir.join(ytdlp_exe_name());
-            download_verified(
+            crate::ffmpeg::download_verified(
                 &url,
                 sha,
                 &dest,
@@ -219,166 +155,6 @@ pub fn ensure_ytdlp(data_dir: &Path) -> Result<PathBuf, String> {
             Ok(dest)
         }
     }
-}
-
-/// Lookup only: no download.
-pub fn find_ffmpeg(data_dir: &Path) -> Result<PathBuf, String> {
-    if let Ok(p) = std::env::var("FETCHFORGE_FFMPEG_PATH") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Ok(p);
-        }
-        return Err(format!(
-            "FETCHFORGE_FFMPEG_PATH is set to {} but that file does not exist.",
-            p.display()
-        ));
-    }
-    if let Some(p) = find_on_path(ffmpeg_exe_name()) {
-        return Ok(p);
-    }
-    let tools = data_dir
-        .join("tools")
-        .join("ffmpeg")
-        .join(ffmpeg_exe_name());
-    if tools.is_file() {
-        return Ok(tools);
-    }
-    Err("ffmpeg was not found on PATH or in the FetchForge tools folder.".to_string())
-}
-
-/// Lookup, downloading the pinned ffmpeg build (Windows only) when
-/// no ffmpeg is available. On non-Windows there is no pinned binary,
-/// so the error tells the user how to install one.
-pub fn ensure_ffmpeg(data_dir: &Path) -> Result<PathBuf, String> {
-    match find_ffmpeg(data_dir) {
-        Ok(p) => Ok(p),
-        Err(_) => {
-            if !cfg!(windows) {
-                return Err(
-                    "This quality needs ffmpeg to merge the separate video and audio streams, \
-                     and ffmpeg is not installed. Install it with your package manager \
-                     (for example: sudo apt install ffmpeg), or set FETCHFORGE_FFMPEG_PATH \
-                     to an ffmpeg binary, then try again."
-                        .to_string(),
-                );
-            }
-            let tools_dir = data_dir.join("tools").join("ffmpeg");
-            std::fs::create_dir_all(&tools_dir).map_err(|e| e.to_string())?;
-            let zip_path = tools_dir.join(format!("ffmpeg-{FFMPEG_VERSION}-essentials_build.zip"));
-            // One-time ~114 MB download; only the ffmpeg.exe inside
-            // (~105 MB) is kept, the zip is deleted afterwards.
-            download_verified(
-                FFMPEG_ZIP_URL_WINDOWS,
-                FFMPEG_ZIP_SHA256_WINDOWS,
-                &zip_path,
-                "ffmpeg (needed to merge video and audio)",
-            )?;
-            let dest = tools_dir.join("ffmpeg.exe");
-            match extract_ffmpeg_exe(&zip_path, &dest) {
-                Ok(()) => {
-                    let _ = std::fs::remove_file(&zip_path);
-                    Ok(dest)
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_file(&zip_path);
-                    Err(e)
-                }
-            }
-        }
-    }
-}
-
-/// Download `url` to `dest` (via a `.tmp` file + atomic rename),
-/// verifying the SHA-256 against `expected_sha256` before the rename.
-/// A hash mismatch deletes the download and is always an error: a
-/// mismatched binary is never executed.
-fn download_verified(
-    url: &str,
-    expected_sha256: &str,
-    dest: &Path,
-    what: &str,
-) -> Result<(), String> {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("FetchForge/0.2")
-        .timeout(Duration::from_secs(600))
-        .connect_timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut resp = client.get(url).send().map_err(|e| {
-        format!("Could not download {what}. Check your connection and try again. ({e})")
-    })?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Could not download {what}: the server answered HTTP {}. Try again later.",
-            resp.status()
-        ));
-    }
-    let tmp = dest.with_extension("tmp");
-    let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        match resp.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                hasher.update(&buf[..n]);
-                file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(format!(
-                    "Download of {what} failed halfway. Check your connection and try again. ({e})"
-                ));
-            }
-        }
-    }
-    drop(file);
-    let actual = to_hex(&hasher.finalize());
-    if actual != expected_sha256 {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!(
-            "Downloaded {what} did not match its expected checksum, so it was discarded and not used. \
-             Try again later; if this keeps happening, the release may have changed."
-        ));
-    }
-    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Extract only `*/bin/ffmpeg.exe` from a (hash-verified) gyan.dev
-/// essentials zip into `dest`. No other entry is read, and the
-/// destination path is fixed, so a hostile zip entry name cannot
-/// escape the tools folder (no ZipSlip: entry names are never used
-/// as output paths).
-fn extract_ffmpeg_exe(zip_path: &Path, dest: &Path) -> Result<(), String> {
-    let file = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| {
-        format!("The downloaded ffmpeg archive could not be opened ({e}). Try again.")
-    })?;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name = entry.name().to_string();
-        if name.to_ascii_lowercase().ends_with("/bin/ffmpeg.exe") {
-            let tmp = dest.with_extension("tmp");
-            let mut out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-            std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
-            drop(out);
-            // Sanity: a real ffmpeg.exe is ~105 MB. Anything tiny is
-            // not ffmpeg, whatever the zip claimed.
-            let size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-            if size < 1_000_000 {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(
-                    "The downloaded ffmpeg archive did not contain a usable ffmpeg.exe."
-                        .to_string(),
-                );
-            }
-            std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
-            return Ok(());
-        }
-    }
-    Err("The downloaded ffmpeg archive did not contain bin/ffmpeg.exe.".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,7 +906,7 @@ pub fn download_media(
 ) -> Result<PathBuf, String> {
     let ytdlp = ensure_ytdlp(data_dir)?;
     let ffmpeg = if opts.needs_merge {
-        Some(ensure_ffmpeg(data_dir)?)
+        Some(crate::ffmpeg::ensure_ffmpeg(data_dir)?)
     } else {
         None
     };
@@ -1469,6 +1245,7 @@ fn cleanup_media_partials(dir: &Path, stem: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::sync::atomic::AtomicBool;
 
     fn youtube_json() -> serde_json::Value {
@@ -1766,16 +1543,6 @@ mod tests {
         std::env::remove_var("FETCHFORGE_YTDLP_PATH");
         // Without the override, the tools-folder binary is found.
         assert_eq!(find_ytdlp(&dir).unwrap(), tools_ytdlp);
-        // ffmpeg: tools folder + env override.
-        let ff_dir = dir.join("tools").join("ffmpeg");
-        std::fs::create_dir_all(&ff_dir).unwrap();
-        let tools_ff = ff_dir.join(ffmpeg_exe_name());
-        std::fs::write(&tools_ff, b"fake").unwrap();
-        // PATH may contain a real ffmpeg on this machine; the env
-        // override test below is order-independent either way.
-        std::env::set_var("FETCHFORGE_FFMPEG_PATH", &tools_ff);
-        assert_eq!(find_ffmpeg(&dir).unwrap(), tools_ff);
-        std::env::remove_var("FETCHFORGE_FFMPEG_PATH");
         // Missing tools in an empty data dir: clear error (unless a
         // system ffmpeg exists on PATH, which is also a valid find).
         let empty = std::env::temp_dir().join("fetchforge-test-tools-empty");
@@ -1975,106 +1742,5 @@ exit 0
         let err = download_media_with(&stub, None, &opts, &progress, &paused, &cancelled)
             .unwrap_err();
         assert!(err.contains("ffmpeg"), "error: {err}");
-    }
-
-    #[test]
-    fn ffmpeg_zip_extraction_pulls_only_ffmpeg_exe() {
-        let dir = std::env::temp_dir().join("fetchforge-test-ffmpeg-zip");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let zip_path = dir.join("ffmpeg.zip");
-        {
-            let file = std::fs::File::create(&zip_path).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
-            let options = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated);
-            // A decoy entry that must NOT be extracted.
-            zip.start_file("ffmpeg-9.1-essentials_build/bin/ffprobe.exe", options)
-                .unwrap();
-            zip.write_all(b"NOT-FFMPEG").unwrap();
-            zip.start_file("ffmpeg-9.1-essentials_build/bin/ffmpeg.exe", options)
-                .unwrap();
-            // Over the 1 MB sanity floor.
-            let big = vec![b'F'; 1_000_001];
-            zip.write_all(&big).unwrap();
-            zip.finish().unwrap();
-        }
-        let dest = dir.join("ffmpeg.exe");
-        extract_ffmpeg_exe(&zip_path, &dest).unwrap();
-        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 1_000_001);
-        assert!(!dir.join("ffprobe.exe").exists());
-        // A zip without ffmpeg.exe is a clear error.
-        let zip_path2 = dir.join("no-ffmpeg.zip");
-        {
-            let file = std::fs::File::create(&zip_path2).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
-            let options =
-                zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-            zip.start_file("other.txt", options).unwrap();
-            zip.write_all(b"x").unwrap();
-            zip.finish().unwrap();
-        }
-        assert!(extract_ffmpeg_exe(&zip_path2, &dir.join("ffmpeg2.exe")).is_err());
-    }
-
-    #[test]
-    fn sha256_of_known_content() {
-        let dir = std::env::temp_dir().join("fetchforge-test-sha");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("a.bin");
-        std::fs::write(&p, b"abc").unwrap();
-        assert_eq!(
-            sha256_file(&p).unwrap(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    /// One-shot loopback HTTP server for download tests: serves `body`
-    /// once (plain HTTP, no TLS), then exits. Returns the URL.
-    fn serve_once(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
-        use std::net::TcpListener;
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(&body);
-                let _ = stream.flush();
-            }
-        });
-        (format!("http://127.0.0.1:{port}/tool.bin"), handle)
-    }
-
-    #[test]
-    fn download_verified_accepts_matching_hash_rejects_mismatch() {
-        let dir = std::env::temp_dir().join("fetchforge-test-dl-verified");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let body = b"fake-tool-binary-content".to_vec();
-        let mut h = Sha256::new();
-        h.update(&body);
-        let good_hash = to_hex(&h.finalize());
-        // Matching hash: file lands, temp file gone.
-        let (url, handle) = serve_once(body.clone());
-        let dest = dir.join("tool.bin");
-        download_verified(&url, &good_hash, &dest, "test tool").unwrap();
-        handle.join().unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), body);
-        assert!(!dir.join("tool.tmp").exists());
-        // Mismatching hash: error, nothing left behind (no dest, no tmp).
-        let (url, handle) = serve_once(body);
-        let dest2 = dir.join("tool2.bin");
-        let err = download_verified(&url, &"0".repeat(64), &dest2, "test tool").unwrap_err();
-        handle.join().unwrap();
-        assert!(err.contains("did not match"), "error: {err}");
-        assert!(!dest2.exists());
-        assert!(!dir.join("tool2.tmp").exists());
     }
 }

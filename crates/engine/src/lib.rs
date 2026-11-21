@@ -11,6 +11,7 @@
 pub mod category;
 pub mod download;
 pub mod extract;
+pub mod ffmpeg;
 pub mod filename;
 pub mod id;
 pub mod media;
@@ -22,10 +23,11 @@ pub mod validate;
 pub use category::category_for_filename;
 pub use download::{download, probe, stop_reason, DownloadOptions, Probe, Progress, StopReason};
 pub use extract::{
-    download_media, drive_direct_url, drive_file_id, ensure_ffmpeg, ensure_ytdlp, find_ffmpeg,
-    find_ytdlp, format_selector, list_formats, list_formats_with, parse_media_info,
-    plan_media_download, FormatKind, MediaDownloadOptions, MediaFormat, MediaInfo, MediaPlan,
+    download_media, drive_direct_url, drive_file_id, ensure_ytdlp, find_ytdlp, format_selector,
+    list_formats, list_formats_with, parse_media_info, plan_media_download, FormatKind,
+    MediaDownloadOptions, MediaFormat, MediaInfo, MediaPlan,
 };
+pub use ffmpeg::{ensure_ffmpeg, find_ffmpeg, merge_av};
 pub use filename::{sanitize_filename, unique_path};
 pub use id::generate_download_id;
 pub use media::{download_dash, download_hls};

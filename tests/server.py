@@ -9,6 +9,22 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = sys.argv[1]
 PORT = int(sys.argv[2])
 
+# Content types for the image/3D fixtures (Phase 7 e2e). Anything not
+# listed here is served without a Content-Type, as before, so existing
+# tests are unaffected. /photo is the extension-less image fixture:
+# it must still be recognised as an image by content type alone.
+def _content_type(path):
+    if path == "/photo":
+        return "image/jpeg"
+    ext = os.path.splitext(path)[1].lower()
+    return {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".webp": "image/webp", ".gif": "image/gif", ".svg": "image/svg+xml",
+        ".avif": "image/avif", ".gltf": "model/gltf+json",
+        ".glb": "model/gltf-binary", ".obj": "text/plain",
+        ".stl": "model/stl", ".bin": "application/octet-stream",
+    }.get(ext)
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -53,6 +69,9 @@ class H(BaseHTTPRequestHandler):
                 self.send_header("Accept-Ranges", "bytes")
                 self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
                 self.send_header("Content-Length", str(len(chunk)))
+                ct = _content_type(path)
+                if ct:
+                    self.send_header("Content-Type", ct)
                 self.end_headers()
                 if not head_only:
                     self._write_slow(chunk, slow)
@@ -60,6 +79,9 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(size))
+        ct = _content_type(path)
+        if ct:
+            self.send_header("Content-Type", ct)
         if path.endswith(".bin"):
             self.send_header("Content-Disposition", 'attachment; filename="big.bin"')
         self.end_headers()

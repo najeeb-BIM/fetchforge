@@ -269,16 +269,18 @@ async fn add_download(
             }
             queue_direct_download(&state, clean, filename, total, resumable)
         }
-        Err(e) => {
+        Err(mut e) => {
             // Probe failed: try media extraction as a fallback, but
             // ONLY if yt-dlp is already installed (see the bridge for
             // why a dead direct link must never trigger a first-use
-            // yt-dlp download).
+            // yt-dlp download). When extraction is tried and fails,
+            // its error diagnoses the problem (yt-dlp actually read
+            // the page) — the probe error is replaced by it, not
+            // recorded. Mirrors the bridge's probe-failure branch.
             if find_ytdlp(&state.data_dir).is_ok() {
-                if let Ok(rec) =
-                    try_media_download(&state, &clean, filename.clone(), format_id.clone())
-                {
-                    return Ok(rec);
+                match try_media_download(&state, &clean, filename.clone(), format_id.clone()) {
+                    Ok(rec) => return Ok(rec),
+                    Err(extract_err) => e = extract_err,
                 }
             }
             let rec = failed_record(&state, clean, filename, e);

@@ -202,8 +202,8 @@ const EMPTY_TEXT = {
   queue: "Queue is empty.",
   history: "No completed or failed downloads yet.",
 };
-// 3D files have no category of their own yet (Phase 7 may add one),
-// so the 3D view also matches on real filename extensions.
+// 3D downloads carry category "3D" (Phase 7); the extension match
+// stays as a safety net for older records and direct adds.
 const THREE_D_EXT = /\.(glb|gltf|obj|fbx|stl|usdz)$/i;
 function viewFilter(d) {
   switch (currentView) {

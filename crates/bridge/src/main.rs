@@ -408,18 +408,25 @@ impl App {
                 }
                 self.add_direct_record(&clean_url, filename, total, resumable)
             }
-            Err(e) => {
+            Err(mut e) => {
                 // Probe failed. Some video pages refuse HEAD/GET probes
                 // (403 to non-browser user agents) while yt-dlp reads
                 // them fine, so try media extraction as a fallback —
                 // but ONLY if yt-dlp is already installed. A failed
                 // probe on a dead direct link must never trigger a
                 // 23 MB first-use yt-dlp download.
+                //
+                // When extraction is tried and fails, its error is the
+                // one that diagnoses the problem: yt-dlp actually read
+                // the page (e.g. YouTube's "Sign in to confirm you're
+                // not a bot"), while the probe only knows the server
+                // refused it. Record the extraction error, not the
+                // probe error.
                 if find_ytdlp(&self.data_dir).is_ok() {
-                    if let Ok(rec) =
-                        self.try_media_download(&clean_url, filename.clone(), format_id.clone())
+                    match self.try_media_download(&clean_url, filename.clone(), format_id.clone())
                     {
-                        return Ok(rec);
+                        Ok(rec) => return Ok(rec),
+                        Err(extract_err) => e = extract_err,
                     }
                 }
                 // Still record the failure so the user sees it, with the reason.

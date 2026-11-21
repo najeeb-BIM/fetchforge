@@ -62,7 +62,7 @@
 //  - Bridge mode (dev / web preview): talks to http://127.0.0.1:18443
 //    with the per-install token stored in localStorage on this machine.
 const BRIDGE = "http://127.0.0.1:18443";
-const isTauri = !!(window.__TAURI__ && window.__TAURI__.core);
+// NOTE: do NOT declare isTauri - Tauri defines window.isTauri globally, and a const with the same name throws a SyntaxError that kills this whole script.
 const tokenBox = document.getElementById("tokenBox");
 if (!isTauri) tokenBox.hidden = false;
 

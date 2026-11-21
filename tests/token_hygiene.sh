@@ -6,11 +6,17 @@ cd "$(dirname "$0")/.."
 fail() { echo "FAIL: $1"; exit 1; }
 ok() { echo "PASS: $1"; }
 
-# 1. No content script in either manifest (token could never leak to a page that way).
+# 1. A content script is expected since Phase 4 (DOM media detection), but it
+# must never touch the token: no storage API, no token header. The token lives
+# only in background storage (see the content.js header comment).
 for m in extensions/chromium/manifest.json extensions/firefox/manifest.json; do
-  grep -q "content_scripts" "$m" && fail "content_scripts found in $m"
+  grep -q "content_scripts" "$m" || fail "content script missing in $m (Phase 4 detection)"
 done
-ok "no content_scripts in either manifest"
+for f in extensions/chromium/content.js extensions/firefox/content.js; do
+  grep -q "chrome\.storage\|browser\.storage" "$f" && fail "content script accesses storage in $f"
+  grep -q "X-FetchForge-Token" "$f" && fail "content script sets token header in $f"
+done
+ok "content script present and never touches the token"
 
 # 2. Only background.js may set the X-FetchForge-Token header.
 for f in extensions/chromium/popup.js extensions/firefox/popup.js; do
@@ -27,9 +33,12 @@ done
 ok "popup never shows the stored token"
 
 # 4. No token in any console.log, URL, or cookie in extension code.
+# Comment lines are skipped: prose such as "no cookies ... the token is
+# used here exactly as for downloads" (background.js) is not code.
 for f in extensions/chromium/background.js extensions/chromium/popup.js extensions/firefox/background.js extensions/firefox/popup.js; do
-  if grep -n "console\.log" "$f" | grep -qi "token"; then fail "token in console.log in $f"; fi
-  if grep -n "token" "$f" | grep -qi "location\|href\|cookie\|search"; then fail "token near URL/cookie in $f"; fi
+  code=$(grep -ni "token" "$f" | grep -vE "^[0-9]+:[[:space:]]*//")
+  if echo "$code" | grep -qi "console\.log"; then fail "token in console.log in $f"; fi
+  if echo "$code" | grep -qi "location\|href\|cookie\|search"; then fail "token near URL/cookie in $f"; fi
 done
 ok "no token in logs, URLs, or cookies in extension code"
 

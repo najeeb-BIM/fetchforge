@@ -11,9 +11,9 @@ ROOT=/tmp/ff-test-native
 rm -rf "$ROOT"
 mkdir -p "$ROOT/server" "$ROOT/data" "$ROOT/downloads"
 python3 -c "
-with open('$ROOT/server/small.bin','wb') as f:
+with open('$ROOT/server/small.dat','wb') as f:
     f.write(bytes((i*13)%256 for i in range(65536)))
-with open('$ROOT/server/small2.bin','wb') as f:
+with open('$ROOT/server/small2.dat','wb') as f:
     f.write(bytes((i*29)%256 for i in range(32768)))
 "
 python3 tests/server.py "$ROOT/server" 8766 > "$ROOT/server.log" 2>&1 &
@@ -83,25 +83,25 @@ echo "$REPLY"
 echo "$REPLY" | grep -q '"type":"pong"' || { echo "FAIL: ping did not pong"; exit 1; }
 
 echo "== native addDownload with bridge running (must forward) =="
-REPLY=$(native_send '{"type":"addDownload","url":"http://127.0.0.1:8766/small.bin"}' "$ROOT/data")
+REPLY=$(native_send '{"type":"addDownload","url":"http://127.0.0.1:8766/small.dat"}' "$ROOT/data")
 echo "$REPLY"
 echo "$REPLY" | grep -q '"type":"added"' || { echo "FAIL: addDownload was not added"; exit 1; }
 echo "$REPLY" | grep -q '"via":"bridge"' || { echo "FAIL: reply did not come via the bridge"; exit 1; }
-wait_completed "small.bin" || exit 1
-find "$ROOT/downloads" -name "small.bin" -exec sha256sum {} \;
-sha256sum "$ROOT/server/small.bin"
+wait_completed "small.dat" || exit 1
+find "$ROOT/downloads" -name "small.dat" -exec sha256sum {} \;
+sha256sum "$ROOT/server/small.dat"
 
 echo "== stop the bridge; native host must spawn a detached one =="
 kill $BRIDGE_PID 2>/dev/null; BRIDGE_PID=""; sleep 1
 curl -s --max-time 2 http://127.0.0.1:18443/health && { echo "FAIL: bridge still up"; exit 1; } || true
-REPLY=$(native_send '{"type":"addDownload","url":"http://127.0.0.1:8766/small2.bin"}' "$ROOT/data")
+REPLY=$(native_send '{"type":"addDownload","url":"http://127.0.0.1:8766/small2.dat"}' "$ROOT/data")
 echo "$REPLY"
 echo "$REPLY" | grep -q '"type":"added"' || { echo "FAIL: addDownload was not added (spawn path)"; exit 1; }
 echo "$REPLY" | grep -q '"bridge_started":true' || { echo "FAIL: reply did not report bridge_started"; exit 1; }
 sleep 1
 curl -s http://127.0.0.1:18443/health; echo
-wait_completed "small2.bin" || exit 1
-find "$ROOT/downloads" -name "small2.bin" -exec sha256sum {} \;
-sha256sum "$ROOT/server/small2.bin"
+wait_completed "small2.dat" || exit 1
+find "$ROOT/downloads" -name "small2.dat" -exec sha256sum {} \;
+sha256sum "$ROOT/server/small2.dat"
 
 echo "NATIVE HOST FORWARDING: ALL CHECKS PASSED"

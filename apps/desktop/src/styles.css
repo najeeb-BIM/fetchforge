@@ -28,3 +28,23 @@ progress{width:140px}.token-box{background:#1e293b;border:1px solid #334155;bord
 .format-row:last-child{border-bottom:0}
 .format-row input{accent-color:#22c55e}
 .merge-note{color:#facc15 !important}
+[hidden]{display:none !important}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.tabs button{background:#1e293b;color:#cbd5e1;border:1px solid #334155}
+.tabs button.active{background:#22c55e;color:#0f172a;border-color:#22c55e}
+.view h2{font-size:16px;margin:4px 0 8px}
+.dash-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:12px}
+.dash-card{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:12px}
+.dash-num{font-size:22px;font-weight:700;color:#4ade80}
+.dash-label{font-size:13px;color:#94a3b8}
+.dash-recent{list-style:none;margin:0 0 12px;padding:0}
+.dash-recent li{padding:6px 0;border-bottom:1px solid #334155;font-size:14px}
+.dash-recent li:last-child{border-bottom:0}
+.detector-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.det-list{display:flex;flex-direction:column;gap:8px}
+.det-row{display:flex;gap:10px;align-items:center;background:#1e293b;border:1px solid #334155;border-radius:8px;padding:10px 12px}
+.det-check{flex:none;accent-color:#22c55e;width:16px;height:16px}
+.det-info{flex:1;min-width:0}
+.det-title{font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.det-meta{font-size:12px;color:#94a3b8;margin-top:2px}
+#detEmpty{color:#94a3b8;font-size:14px}

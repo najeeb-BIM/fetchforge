@@ -26,6 +26,32 @@
     <button id="fpDownloadBtn">Download</button>
     <button id="fpCancelBtn" class="secondary">Cancel</button>
   </section>
+  <nav id="tabs" class="tabs" role="tablist" aria-label="FetchForge panels">
+    <button data-view="dashboard" role="tab" aria-selected="false">Dashboard</button>
+    <button data-view="downloads" role="tab" aria-selected="true" class="active">Downloads</button>
+    <button data-view="detector" role="tab" aria-selected="false">Media Detector</button>
+    <button data-view="video" role="tab" aria-selected="false">Video</button>
+    <button data-view="images" role="tab" aria-selected="false">Images</button>
+    <button data-view="3d" role="tab" aria-selected="false">3D</button>
+    <button data-view="queue" role="tab" aria-selected="false">Queue</button>
+    <button data-view="history" role="tab" aria-selected="false">History</button>
+    <button data-view="browser" role="tab" aria-selected="false">Browser Integration</button>
+  </nav>
+  <section id="view-dashboard" class="view" hidden>
+    <div id="dashCards" class="dash-cards"></div>
+    <h2>Recent activity</h2>
+    <ul id="dashRecent" class="dash-recent"></ul>
+    <p id="dashEmpty">No downloads yet.</p>
+  </section>
+  <section id="view-detector" class="view" hidden>
+    <div class="detector-controls">
+      <button id="detSelectAllBtn" class="secondary">Select all</button>
+      <button id="detDownloadBtn">Download selected</button>
+    </div>
+    <p id="detEmpty">No media detected yet. Open a page with video or audio in a paired browser and it will appear here.</p>
+    <div id="detList" class="det-list"></div>
+  </section>
+  <section id="view-downloads" class="view">
   <section class="controls">
     <input id="search" type="search" placeholder="Search downloads">
     <select id="filter">
@@ -46,7 +72,15 @@
     <button id="saveTokenBtn">Save token locally</button>
     <small>Used only to talk to the loopback bridge on this machine. In the Tauri app this box is hidden.</small>
   </section>
-  <section id="pairBox" class="pair-box">
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>File</th><th>Category</th><th>Status</th><th>Progress</th><th>Speed</th><th>Actions</th></tr></thead>
+    <tbody id="list"></tbody>
+  </table>
+  </div>
+  <p id="empty">No downloads yet. Paste a link above.</p>
+  </section>
+  <section id="pairBox" class="pair-box" hidden>
     <button id="pairBtn">Pair a browser</button>
     <button id="unpairBtn" class="secondary">Unpair all browsers</button>
     <small>Pairing code is valid for 60 seconds and can be used once. Type it into the browser extension popup, then click Pair there.</small>
@@ -56,13 +90,6 @@
       <span id="pairCountdown"></span>
     </div>
   </section>
-  <div class="table-wrap">
-  <table>
-    <thead><tr><th>File</th><th>Category</th><th>Status</th><th>Progress</th><th>Speed</th><th>Actions</th></tr></thead>
-    <tbody id="list"></tbody>
-  </table>
-  </div>
-  <p id="empty">No downloads yet. Paste a link above.</p>
 </main>
 <script>document.getElementById("status").textContent="INLINE JS WORKS";</script>
 <script>
@@ -146,6 +173,7 @@ async function api(path, method = "GET", body) {
     if (path === "/downloads" && method === "GET") return invokeTimed("list_downloads");
     if (path === "/downloads" && method === "POST") return invokeTimed("add_download", body, ADD_TIMEOUT_MS);
     if (path === "/media/formats" && method === "POST") return invokeTimed("media_formats", body, FORMATS_TIMEOUT_MS);
+    if (path === "/media/detected" && method === "GET") return invokeTimed("list_detected_media");
     const m = path.match(/^\/downloads\/(.+)\/(pause|resume|cancel)$/);
     if (m) return invokeTimed(m[2] + "_download", { id: m[1] });
     throw new Error("Unsupported Tauri call " + path);
@@ -158,14 +186,190 @@ async function api(path, method = "GET", body) {
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
+// ---- Panels (Phase 9) ----
+// Views: dashboard, downloads (the list), detector, video, images, 3d,
+// queue, history (all filtered views over the same list), browser
+// (the pairing section). Filtered views reuse the Downloads section
+// and its table; only Dashboard and Media Detector have their own.
+let currentView = "downloads";
+let detectedItems = [];
+let detectedError = null;
+const EMPTY_TEXT = {
+  downloads: "No downloads yet. Paste a link above.",
+  video: "No video downloads yet.",
+  images: "No image downloads yet.",
+  "3d": "No 3D downloads yet.",
+  queue: "Queue is empty.",
+  history: "No completed or failed downloads yet.",
+};
+// 3D files have no category of their own yet (Phase 7 may add one),
+// so the 3D view also matches on real filename extensions.
+const THREE_D_EXT = /\.(glb|gltf|obj|fbx|stl|usdz)$/i;
+function viewFilter(d) {
+  switch (currentView) {
+    case "video": return d.category === "Video" || d.stream_kind === "hls" || d.stream_kind === "dash";
+    case "images": return d.category === "Images";
+    case "3d": return d.category === "3D" || d.category === "Models" || THREE_D_EXT.test(d.filename);
+    case "queue": return d.status === "queued" || d.status === "downloading" || d.status === "paused";
+    case "history": return d.status === "completed" || d.status === "failed" || d.status === "cancelled";
+    default: return true;
+  }
+}
+function showView(v) {
+  currentView = v;
+  document.querySelectorAll("#tabs button").forEach((b) => {
+    const active = b.dataset.view === v;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  document.getElementById("view-dashboard").hidden = v !== "dashboard";
+  document.getElementById("view-detector").hidden = v !== "detector";
+  document.getElementById("view-downloads").hidden =
+    !(v === "downloads" || v === "video" || v === "images" || v === "3d" || v === "queue" || v === "history");
+  document.getElementById("pairBox").hidden = v !== "browser";
+  // A stale status filter would hide everything in a filtered view
+  // (e.g. "Failed" on the Queue tab), so filtered views start at All.
+  // The search box is a deliberate user query and is left alone.
+  if (v !== "downloads") document.getElementById("filter").value = "all";
+  document.getElementById("empty").textContent = EMPTY_TEXT[v] || EMPTY_TEXT.downloads;
+  refresh();
+}
+document.querySelectorAll("#tabs button").forEach((b) => { b.onclick = () => showView(b.dataset.view); });
+
+function renderDashboard(all) {
+  if (currentView !== "dashboard") return;
+  const count = (s) => all.filter((d) => d.status === s).length;
+  const cards = [
+    ["Total", all.length],
+    ["Downloading", count("downloading")],
+    ["Queued", count("queued")],
+    ["Completed", count("completed")],
+    ["Failed", count("failed")],
+    ["Detected media", detectedItems.length],
+  ];
+  const wrap = document.getElementById("dashCards");
+  wrap.textContent = "";
+  for (const [label, n] of cards) {
+    const card = document.createElement("div");
+    card.className = "dash-card";
+    const num = document.createElement("div");
+    num.className = "dash-num";
+    num.textContent = String(n);
+    const lab = document.createElement("div");
+    lab.className = "dash-label";
+    lab.textContent = label;
+    card.append(num, lab);
+    wrap.appendChild(card);
+  }
+  const recent = [...all].sort((a, b) => b.updated_unix - a.updated_unix).slice(0, 5);
+  const ul = document.getElementById("dashRecent");
+  ul.textContent = "";
+  document.getElementById("dashEmpty").hidden = recent.length > 0;
+  for (const d of recent) {
+    const li = document.createElement("li");
+    li.textContent = d.filename + " — " + d.status + (d.error ? " - " + d.error : "");
+    ul.appendChild(li);
+  }
+}
+
+// Media Detector panel: only confirmed metadata is shown (spec §8).
+// Every DetectedItem field except url is optional; an unknown field
+// is omitted, never guessed.
+function renderDetector() {
+  if (currentView !== "detector") return;
+  const list = document.getElementById("detList");
+  const empty = document.getElementById("detEmpty");
+  list.textContent = "";
+  if (detectedError) {
+    empty.hidden = false;
+    empty.textContent = "Could not load detected media: " + detectedError;
+    return;
+  }
+  empty.hidden = detectedItems.length > 0;
+  if (!detectedItems.length) {
+    empty.textContent = "No media detected yet. Open a page with video or audio in a paired browser and it will appear here.";
+  }
+  for (const item of detectedItems) {
+    const row = document.createElement("div");
+    row.className = "det-row";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.className = "det-check";
+    cb.dataset.url = item.url;
+    const info = document.createElement("div");
+    info.className = "det-info";
+    const title = document.createElement("div");
+    title.className = "det-title";
+    title.textContent = item.title || item.url;
+    const meta = document.createElement("div");
+    meta.className = "det-meta";
+    const parts = [];
+    if (item.kind) parts.push(item.kind);
+    if (item.mime_type) parts.push(item.mime_type);
+    if (item.size_bytes != null) parts.push(fmtBytes(item.size_bytes));
+    const dur = fmtDuration(item.duration_secs);
+    if (dur) parts.push(dur);
+    if (item.page_url) {
+      try { parts.push(new URL(item.page_url).hostname); } catch (_) { /* not a URL; omit */ }
+    }
+    if (item.detected_unix) parts.push(new Date(item.detected_unix * 1000).toLocaleString());
+    meta.textContent = parts.join(" · ");
+    info.append(title, meta);
+    const btn = document.createElement("button");
+    btn.className = "secondary";
+    btn.textContent = "Download";
+    btn.onclick = () => { addUrl(item.url, undefined); };
+    row.append(cb, info, btn);
+    list.appendChild(row);
+  }
+}
+document.getElementById("detSelectAllBtn").onclick = () => {
+  const boxes = document.querySelectorAll("#detList .det-check");
+  const allChecked = boxes.length > 0 && [...boxes].every((b) => b.checked);
+  boxes.forEach((b) => { b.checked = !allChecked; });
+};
+document.getElementById("detDownloadBtn").onclick = async () => {
+  const boxes = [...document.querySelectorAll("#detList .det-check:checked")];
+  if (!boxes.length) { setError("Select at least one detected item first.", "action"); return; }
+  const btn = document.getElementById("detDownloadBtn");
+  setBusy(btn, true, "Adding…");
+  let added = 0, failed = 0, firstError = "";
+  for (const b of boxes) {
+    try {
+      // Direct add, no picker: the Rust side auto-picks a quality for
+      // a page URL, so a batch never opens the picker once per item.
+      await api("/downloads", "POST", { url: b.dataset.url });
+      added += 1;
+    } catch (e) { failed += 1; if (!firstError) firstError = e.message; }
+  }
+  setBusy(btn, false);
+  // Refresh first, then report: refresh() ends by writing "N shown",
+  // so reporting before it would be overwritten before the user reads it.
+  await refresh();
+  clearError();
+  setStatus("Added " + added + " of " + boxes.length + " selected."
+    + (failed ? " " + failed + " failed: " + firstError : ""));
+};
 async function refresh() {
   try {
     const all = await api("/downloads");
+    // Detected media is fetched only for the views that show it, so
+    // the 2s cycle stays one call on the plain list views. A failure
+    // here must never break the download list (own try/catch).
+    if (currentView === "detector" || currentView === "dashboard") {
+      try {
+        detectedItems = await api("/media/detected");
+        detectedError = null;
+      } catch (e) { detectedError = e.message; }
+    }
     const q = document.getElementById("search").value.toLowerCase();
     const f = document.getElementById("filter").value;
     const rows = all.filter(d =>
+      viewFilter(d) &&
       (f === "all" || d.status === f) &&
       (d.filename.toLowerCase().includes(q) || d.url.toLowerCase().includes(q)));
+    renderDashboard(all);
+    renderDetector();
     const tbody = document.getElementById("list");
     tbody.textContent = "";
     document.getElementById("empty").hidden = rows.length > 0;
@@ -216,26 +420,25 @@ document.getElementById("refreshBtn").onclick = async () => {
 };
 document.getElementById("search").oninput = refresh;
 document.getElementById("filter").onchange = refresh;
-document.getElementById("addBtn").onclick = async () => {
-  const url = document.getElementById("url").value.trim();
-  const filename = document.getElementById("filename").value.trim() || undefined;
+// Add one URL through the same flow as the paste box: a media page
+// opens the quality picker, anything else is added directly. Shared
+// by the paste box and the Media Detector panel's per-item Download.
+async function addUrl(url, filename) {
   if (!url) return;
-  const btn = document.getElementById("addBtn");
-  setBusy(btn, true, "Adding…");
+  if (looksLikeMediaPage(url)) {
+    // Video page: list qualities and let the user pick one. If the
+    // listing fails (not a video page after all, private video,
+    // extraction error), fall through to a plain add: the Rust side
+    // auto-picks a quality or records the failure with its reason.
+    try {
+      const info = await api("/media/formats", "POST", { url });
+      showFormatPicker(info, url, filename);
+      clearError();
+      setStatus("Pick a quality, then click Download.");
+      return;
+    } catch (e) { /* fall through to a plain add */ }
+  }
   try {
-    if (looksLikeMediaPage(url)) {
-      // Video page: list qualities and let the user pick one. If the
-      // listing fails (not a video page after all, private video,
-      // extraction error), fall through to a plain add: the Rust side
-      // auto-picks a quality or records the failure with its reason.
-      try {
-        const info = await api("/media/formats", "POST", { url });
-        showFormatPicker(info, url, filename);
-        clearError();
-        setStatus("Pick a quality, then click Download.");
-        return;
-      } catch (e) { /* fall through to a plain add */ }
-    }
     await api("/downloads", "POST", { url, filename });
     clearError();
     setStatus("Added.");
@@ -249,7 +452,15 @@ document.getElementById("addBtn").onclick = async () => {
     } else {
       setError("Could not add download: " + e.message, "action");
     }
-  } finally { setBusy(btn, false); }
+  }
+}
+document.getElementById("addBtn").onclick = async () => {
+  const url = document.getElementById("url").value.trim();
+  const filename = document.getElementById("filename").value.trim() || undefined;
+  if (!url) return;
+  const btn = document.getElementById("addBtn");
+  setBusy(btn, true, "Adding…");
+  try { await addUrl(url, filename); } finally { setBusy(btn, false); }
 };
 // ---- Format picker (video pages) ----
 // A host-based hint only: the Rust side still auto-handles any page

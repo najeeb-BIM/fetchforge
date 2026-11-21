@@ -94,6 +94,54 @@ fn spawn_bridge(data_dir: &PathBuf) -> Option<std::process::Child> {
     }
 }
 
+/// One media item the extension detected on a page, read from the
+/// bridge's detected.json in the data dir (Phase 9 Media Detector
+/// panel). Local struct with serde derive in this file — the
+/// DetectedItem type lives in the bridge crate, which this crate does
+/// not depend on. Field-for-field the same shape as the bridge's, so
+/// the same JSON parses on both sides; every field except `url` is
+/// optional and omitted when unknown.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DetectedItem {
+    url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detected_unix: Option<u64>,
+}
+
+/// List media the extension detected, for the Media Detector panel.
+/// A missing file means no detections yet (empty list, not an error);
+/// a corrupt file is logged and also yields an empty list, mirroring
+/// the bridge's own detected.json handling.
+#[tauri::command]
+fn list_detected_media(state: tauri::State<Arc<State>>) -> Vec<DetectedItem> {
+    let path = state.data_dir.join("detected.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    match serde_json::from_str::<Vec<DetectedItem>>(&text) {
+        Ok(items) => items,
+        Err(e) => {
+            eprintln!(
+                "FetchForge WARNING: detected.json is not valid JSON ({e}); detected media list started empty"
+            );
+            Vec::new()
+        }
+    }
+}
+
 #[tauri::command]
 fn bridge_status(state: tauri::State<Arc<State>>) -> String {
     let mut guard = state.bridge_child.lock().unwrap();
@@ -900,6 +948,7 @@ fn main() {
             list_downloads,
             add_download,
             media_formats,
+            list_detected_media,
             pause_download,
             resume_download,
             cancel_download,

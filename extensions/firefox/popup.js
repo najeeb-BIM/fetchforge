@@ -49,11 +49,18 @@ async function refreshMedia() {
       return;
     }
     const items = r.items || [];
+    const batch = document.getElementById("mediaBatch");
+    if (batch) batch.style.display = items.length ? "block" : "none";
     if (!items.length) { mediaStatus.textContent = "No media found on this page."; return; }
     mediaStatus.textContent = items.length + (items.length === 1 ? " media item found:" : " media items found:");
     for (const item of items) {
       const row = document.createElement("div");
       row.className = "media-row";
+      const check = document.createElement("input");
+      check.type = "checkbox";
+      check.className = "media-check";
+      check.dataset.url = item.url;
+      if (item.filename) check.dataset.filename = item.filename;
       const label = document.createElement("span");
       label.className = "media-label";
       label.textContent = (item.kind === "audio" ? "Audio: " : "Video: ") + item.title + (item.viaPage ? " (via page link)" : "");
@@ -66,6 +73,7 @@ async function refreshMedia() {
         status.textContent = res && res.ok ? "Sent (or fell back to browser download)." : "Could not send.";
         btn.disabled = false;
       };
+      row.appendChild(check);
       row.appendChild(label);
       row.appendChild(btn);
       listEl.appendChild(row);
@@ -74,6 +82,29 @@ async function refreshMedia() {
     mediaStatus.textContent = "Could not reach this page. Reload the page and try again.";
   }
 }
+document.getElementById("mediaSelectAll").onclick = () => {
+  const boxes = document.querySelectorAll(".media-check");
+  const allChecked = boxes.length > 0 && [...boxes].every((b) => b.checked);
+  boxes.forEach((b) => { b.checked = !allChecked; });
+  document.getElementById("mediaSelectAll").checked = !allChecked;
+};
+document.getElementById("mediaDownloadSelected").onclick = async () => {
+  const boxes = [...document.querySelectorAll(".media-check:checked")];
+  if (!boxes.length) { status.textContent = "Select at least one media item first."; return; }
+  const btn = document.getElementById("mediaDownloadSelected");
+  btn.disabled = true;
+  let sent = 0;
+  for (const box of boxes) {
+    // Same sendUrl path as a per-item Download; a viaPage item sends
+    // the page URL and the app extracts it with its default quality.
+    const res = await sendMessage({ type: "sendUrl", url: box.dataset.url, filename: box.dataset.filename || undefined });
+    if (res && res.ok) sent += 1;
+  }
+  btn.disabled = false;
+  status.textContent = sent === boxes.length
+    ? "Sent " + sent + " item" + (sent === 1 ? "" : "s") + "."
+    : "Sent " + sent + " of " + boxes.length + " selected.";
+};
 async function refresh() {
   const s = await getStorage("token");
   const token = s.token;

@@ -214,6 +214,10 @@ struct App {
     store: Mutex<Store>,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     active: Mutex<usize>,
+    /// Media the extension detected on pages (POST /media/detected),
+    /// oldest first. Persisted to detected.json; a corrupt file
+    /// starts empty with a warning, never a crash.
+    detected: Mutex<Vec<DetectedItem>>,
 }
 
 impl App {
@@ -230,6 +234,18 @@ impl App {
         }
         store.recover_interrupted();
         let _ = store.save();
+        let detected = match std::fs::read_to_string(data_dir.join("detected.json")) {
+            Ok(text) => match serde_json::from_str::<Vec<DetectedItem>>(&text) {
+                Ok(items) => items.into_iter().take(MAX_DETECTED_ITEMS).collect(),
+                Err(_) => {
+                    eprintln!(
+                        "FetchForge WARNING: detected.json is not valid JSON; detected media list started empty"
+                    );
+                    Vec::new()
+                }
+            },
+            Err(_) => Vec::new(),
+        };
         Arc::new(Self {
             settings,
             data_dir,
@@ -238,7 +254,57 @@ impl App {
             store: Mutex::new(store),
             jobs: Mutex::new(HashMap::new()),
             active: Mutex::new(0),
+            detected: Mutex::new(detected),
         })
+    }
+
+    /// Store detected media items: dedupe by URL (a re-detection
+    /// replaces the old entry with fresh metadata and moves it to
+    /// the end), drop the oldest past the cap, persist best-effort.
+    /// Returns how many items were accepted (empty URLs are skipped).
+    fn store_detected(&self, items: Vec<DetectedItem>) -> usize {
+        let now = now_unix();
+        let mut accepted = 0usize;
+        let mut list = self.detected.lock().unwrap();
+        for mut item in items {
+            if item.url.trim().is_empty() {
+                continue;
+            }
+            if item.detected_unix.is_none() {
+                item.detected_unix = Some(now);
+            }
+            if let Some(pos) = list.iter().position(|d| d.url == item.url) {
+                list.remove(pos);
+            }
+            list.push(item);
+            accepted += 1;
+        }
+        while list.len() > MAX_DETECTED_ITEMS {
+            list.remove(0);
+        }
+        drop(list);
+        self.save_detected();
+        accepted
+    }
+
+    /// Best-effort persistence of the detected list (tmp file +
+    /// rename, like the store). A failed save is logged, never fatal:
+    /// detections are a cache the extension rebuilds.
+    fn save_detected(&self) {
+        let list = self.detected.lock().unwrap();
+        let text = match serde_json::to_string(&*list) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        drop(list);
+        let path = self.data_dir.join("detected.json");
+        let tmp = self.data_dir.join("detected.json.tmp");
+        if std::fs::write(&tmp, text).is_err() {
+            return;
+        }
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     /// Rotate the bridge token ("Unpair all browsers"): generate a new
@@ -937,6 +1003,42 @@ struct FormatsRequest {
     url: String,
 }
 
+/// One media item the extension detected on a page (Phase 4/8).
+/// Only confirmed metadata is stored: every field except `url` is
+/// optional and omitted when unknown, so a partial detection never
+/// invents a title, type or size. The bridge stores these for the
+/// future detected-media panel (Phase 9); storing an item never
+/// downloads anything on its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DetectedItem {
+    url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// The extension's word for the kind ("video", "audio", ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detected_unix: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct DetectedRequest {
+    items: Vec<DetectedItem>,
+}
+
+/// Maximum detected items kept in memory and on disk; older items
+/// are dropped first. The list is a recent-detections cache, not an
+/// archive — 200 is far more than a panel ever shows at once.
+const MAX_DETECTED_ITEMS: usize = 200;
+
 fn generate_token() -> String {
     // F04: OS CSPRNG only, on every platform. No time/pid fallback.
     // Refusing to start is safer than minting a predictable token.
@@ -1240,6 +1342,30 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
                     .write_all(http_response(400, r#"{"error":"Invalid JSON body"}"#).as_bytes());
             }
         }
+        return;
+    }
+    // Detected media (token required): the extension reports media
+    // it found on a page; the bridge stores it for the future
+    // detected-media panel (Phase 9). Storing never downloads.
+    if method == "POST" && path == "/media/detected" {
+        let req: Result<DetectedRequest, _> = serde_json::from_str(&body);
+        match req {
+            Ok(r) => {
+                let stored = app.store_detected(r.items);
+                let b = serde_json::json!({"stored": stored}).to_string();
+                let _ = stream.write_all(http_response(200, &b).as_bytes());
+            }
+            Err(_) => {
+                let _ = stream
+                    .write_all(http_response(400, r#"{"error":"Invalid JSON body"}"#).as_bytes());
+            }
+        }
+        return;
+    }
+    if method == "GET" && path == "/media/detected" {
+        let items: Vec<DetectedItem> = app.detected.lock().unwrap().clone();
+        let b = serde_json::json!({"items": items}).to_string();
+        let _ = stream.write_all(http_response(200, &b).as_bytes());
         return;
     }
     // /downloads/<id>/pause | resume | cancel
@@ -1711,5 +1837,69 @@ mod tests {
         .unwrap();
         assert_eq!(r.format_id.as_deref(), Some("22"));
         assert_eq!(r.filename.as_deref(), Some("v.mp4"));
+    }
+
+    fn detected(url: &str) -> DetectedItem {
+        DetectedItem {
+            url: url.to_string(),
+            page_url: None,
+            title: None,
+            kind: None,
+            mime_type: None,
+            size_bytes: None,
+            duration_secs: None,
+            detected_unix: None,
+        }
+    }
+
+    #[test]
+    fn detected_store_dedupes_by_url_and_skips_empty() {
+        let dir = test_data_dir("fetchforge-test-detected");
+        let app = App::new(dir.clone());
+        let mut first = detected("https://example.com/v.mp4");
+        first.title = Some("Old title".to_string());
+        assert_eq!(app.store_detected(vec![first, detected("")]), 1);
+        let mut second = detected("https://example.com/v.mp4");
+        second.title = Some("New title".to_string());
+        assert_eq!(app.store_detected(vec![second]), 1);
+        let list = app.detected.lock().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title.as_deref(), Some("New title"));
+        assert!(list[0].detected_unix.is_some(), "timestamp stamped");
+        // Persisted: a fresh App over the same data dir reloads it.
+        drop(list);
+        let app2 = App::new(dir);
+        let list = app2.detected.lock().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].url, "https://example.com/v.mp4");
+    }
+
+    #[test]
+    fn detected_store_caps_at_200_dropping_oldest() {
+        let dir = test_data_dir("fetchforge-test-detected-cap");
+        let app = App::new(dir);
+        let items: Vec<DetectedItem> = (0..205)
+            .map(|i| detected(&format!("https://example.com/{i}.mp4")))
+            .collect();
+        assert_eq!(app.store_detected(items), 205);
+        let list = app.detected.lock().unwrap();
+        assert_eq!(list.len(), MAX_DETECTED_ITEMS);
+        assert_eq!(list[0].url, "https://example.com/5.mp4");
+        assert_eq!(list[199].url, "https://example.com/204.mp4");
+    }
+
+    #[test]
+    fn detected_item_omits_unknown_fields() {
+        // Only confirmed metadata is serialized; unknown fields are
+        // absent, never null-invented.
+        let item = detected("https://example.com/v.mp4");
+        let json = serde_json::to_string(&item).unwrap();
+        assert_eq!(json, r#"{"url":"https://example.com/v.mp4"}"#);
+        // And a corrupt detected.json starts empty instead of
+        // crashing the bridge.
+        let dir = test_data_dir("fetchforge-test-detected-corrupt");
+        std::fs::write(dir.join("detected.json"), "{not json").unwrap();
+        let app = App::new(dir);
+        assert!(app.detected.lock().unwrap().is_empty());
     }
 }

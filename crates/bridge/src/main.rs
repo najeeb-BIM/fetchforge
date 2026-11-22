@@ -1486,6 +1486,21 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
         }
         return;
     }
+    // Pairing code status (app only, token required): lets the app
+    // show a "code used" transition when the extension claims the
+    // code, instead of the countdown just running out. `used` stays
+    // true until a new code is generated.
+    if method == "GET" && path == "/pair/status" {
+        let (active, used, seconds_left) = app.pairing.lock().unwrap().status();
+        let b = serde_json::json!({
+            "active": active,
+            "used": used,
+            "seconds_left": seconds_left
+        })
+        .to_string();
+        let _ = stream.write_all(http_response(200, &b).as_bytes());
+        return;
+    }
     if method == "GET" && path == "/downloads" {
         let list: Vec<DownloadRecord> = {
             let mut store = app.store.lock().unwrap();

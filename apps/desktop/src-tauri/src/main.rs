@@ -1044,6 +1044,16 @@ fn clear_finished_downloads(state: tauri::State<Arc<State>>) -> usize {
     removed
 }
 
+/// Pairing-code status for the app's pairing pill, mirrored from the
+/// bridge's GET /pair/status JSON. Local struct with serde derive in
+/// this file, like DetectedItem.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PairStatus {
+    active: bool,
+    used: bool,
+    seconds_left: u64,
+}
+
 /// Feat 1 (NOT VERIFIED on Windows): talk to the local bridge over
 /// loopback with plain TcpStream, so no new dependency is needed.
 /// The token is read from the app's own data dir, never shown in the
@@ -1064,6 +1074,46 @@ fn bridge_post(_data_dir: &PathBuf, token: &str, path: &str) -> Result<String, S
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:18443\r\nX-FetchForge-Token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("Bridge request failed ({e})"))?;
+    let mut raw = String::new();
+    stream
+        .read_to_string(&mut raw)
+        .map_err(|e| format!("Bridge response failed ({e})"))?;
+    let (head, body) = match raw.split_once("\r\n\r\n") {
+        Some((h, b)) => (h, b),
+        None => ("", raw.as_str()),
+    };
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if status != 200 {
+        return Err(format!(
+            "Bridge returned HTTP {status}: {}",
+            body.trim().chars().take(200).collect::<String>()
+        ));
+    }
+    Ok(body.to_string())
+}
+
+// GET twin of bridge_post: same loopback call, same token header,
+// same timeouts, for the read-only /pair/status endpoint.
+fn bridge_get(_data_dir: &PathBuf, token: &str, path: &str) -> Result<String, String> {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let mut stream = TcpStream::connect("127.0.0.1:18443")
+        .map_err(|e| format!("Bridge not reachable ({e}). Is FetchForge running?"))?;
+    // Never block forever: if the bridge accepts but never answers,
+    // fail visibly instead of hanging the UI.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:18443\r\nX-FetchForge-Token: {token}\r\nConnection: close\r\n\r\n"
     );
     stream
         .write_all(req.as_bytes())
@@ -1122,6 +1172,17 @@ async fn unpair_all_browsers(state: tauri::State<'_, Arc<State>>) -> Result<(), 
     Ok(())
 }
 
+// Async so the blocking loopback call runs off the IPC thread (see
+// pair_browser). Polled once a second while a pairing code is shown,
+// so the pill can transition to "code used" when the extension
+// claims the code instead of the countdown just running out.
+#[tauri::command]
+async fn pair_status(state: tauri::State<'_, Arc<State>>) -> Result<PairStatus, String> {
+    let token = read_bridge_token(&state.data_dir)?;
+    let body = bridge_get(&state.data_dir, &token, "/pair/status")?;
+    serde_json::from_str(&body).map_err(|e| format!("Bridge returned bad JSON ({e})"))
+}
+
 fn main() {
     let dir = data_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -1153,6 +1214,7 @@ fn main() {
             clear_finished_downloads,
             bridge_status,
             pair_browser,
+            pair_status,
             unpair_all_browsers
         ])
         .build(tauri::generate_context!())

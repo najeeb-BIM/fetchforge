@@ -144,6 +144,33 @@ impl PairingState {
         self.hash.is_some() && !self.used
     }
 
+    /// Status for the pairing pill: (has_active_code, code_was_used,
+    /// seconds_left). seconds_left is 0 when there is no active code
+    /// or it expired. `used` stays true after a successful verify
+    /// until a new code is generated, so the app can show a "code
+    /// used" transition instead of letting the countdown just run out.
+    pub fn status(&self) -> (bool, bool, u64) {
+        self.status_at(Instant::now())
+    }
+
+    /// Testable core: `now` is injected so expiry can be tested without
+    /// waiting 60 seconds.
+    pub fn status_at(&self, now: Instant) -> (bool, bool, u64) {
+        let expired = match self.expires_at {
+            Some(exp) => now > exp,
+            None => true,
+        };
+        let active = self.hash.is_some() && !self.used && !expired;
+        let seconds_left = if active {
+            self.expires_at
+                .map(|exp| exp.duration_since(now).as_secs())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        (active, self.used, seconds_left)
+    }
+
     pub fn wrong_attempts(&self) -> u32 {
         self.wrong_attempts
     }
@@ -252,6 +279,38 @@ mod tests {
         assert_eq!(s.verify_at(&code, future), Err(PairingError::Expired));
         // Expired code is gone, not reusable.
         assert_eq!(s.verify(&code), Err(PairingError::NoActiveCode));
+    }
+
+    #[test]
+    fn status_reports_fresh_used_and_expired_codes() {
+        let mut s = PairingState::new();
+        // No code at all: nothing active, nothing used, no time left.
+        assert_eq!(s.status(), (false, false, 0));
+        let code = s.generate().unwrap();
+        let now = Instant::now();
+        // Fresh code: active, not used, ~60s left (a tick may pass
+        // between generate and the status call, so allow 59).
+        let (active, used, left) = s.status_at(now);
+        assert!(active);
+        assert!(!used);
+        assert!((59..=60).contains(&left), "fresh code left = {left}");
+        // 10 seconds in, ~50s left.
+        let (_, _, left) = s.status_at(now + Duration::from_secs(10));
+        assert!((49..=50).contains(&left), "10s in, left = {left}");
+        // After a successful verify: used, not active, 0 left.
+        assert!(s.verify(&code).is_ok());
+        assert_eq!(s.status(), (false, true, 0));
+    }
+
+    #[test]
+    fn status_reports_expired_code_as_inactive() {
+        let mut s = PairingState::new();
+        let _code = s.generate().unwrap();
+        let future = Instant::now() + Duration::from_secs(61);
+        let (active, used, left) = s.status_at(future);
+        assert!(!active);
+        assert!(!used);
+        assert_eq!(left, 0);
     }
 
     #[test]

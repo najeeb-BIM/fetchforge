@@ -98,6 +98,28 @@ pub struct DownloadRecord {
     /// `#[serde(default)]` so older history files still load.
     #[serde(default, skip_serializing_if = "is_false")]
     pub duplicate: bool,
+    /// HLS/DASH downloads only: how many segments the manifest
+    /// lists in total. Recorded at plan time (the plan parses the
+    /// manifest), so the UI can show "0 / 3,321 pieces" before the
+    /// first segment lands. None for direct/yt-dlp downloads and
+    /// for records planned before this field existed.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub segments_total: Option<u64>,
+    /// HLS/DASH downloads only: how many segments have completed
+    /// so far (updated with every progress report). 0 until the
+    /// first segment completes.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub segments_done: u64,
+    /// HLS/DASH downloads only: the estimated total size in bytes,
+    /// from the measured average segment size so far times the
+    /// segment count (see [`crate::media::estimate_total_bytes`]).
+    /// An estimate, never exact — the UI shows it with "~". None
+    /// until at least one segment has completed.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub estimated_total_bytes: Option<u64>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -558,6 +580,9 @@ mod tests {
             referer: None,
             audio_url: None,
             duplicate: false,
+            segments_total: None,
+            segments_done: 0,
+            estimated_total_bytes: None,
         });
         s.save().unwrap();
         let mut s2 = Store::load(path);
@@ -590,6 +615,9 @@ mod tests {
             referer: None,
             audio_url: None,
             duplicate: false,
+            segments_total: None,
+            segments_done: 0,
+            estimated_total_bytes: None,
         }
     }
 

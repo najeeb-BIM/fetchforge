@@ -134,6 +134,17 @@ pub struct Progress {
     pub total: Option<u64>,
     /// Bytes per second, smoothed over the current run.
     pub bytes_per_sec: f64,
+    /// HLS/DASH segment progress (None for plain downloads):
+    /// how many segments have completed / how many the manifest
+    /// lists. The worker copies these into the record so the UI
+    /// can show "1,240 / 3,321 pieces".
+    pub segments_done: Option<u64>,
+    pub segments_total: Option<u64>,
+    /// HLS/DASH only: estimated total bytes (measured average
+    /// segment size × segment count). None until at least one
+    /// segment has completed. An estimate — the UI shows it
+    /// with "~", never as an exact total.
+    pub estimated_total: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,6 +558,9 @@ fn download_single_attempt(
                     downloaded,
                     total,
                     bytes_per_sec: downloaded as f64 / secs,
+                    segments_done: None,
+                    segments_total: None,
+                    estimated_total: None,
                 });
             }
             Err(e) => return Err(StopOrError::Error(format!("Read failed: {e}"))),
@@ -614,6 +628,9 @@ fn download_segmented(
                     downloaded: dl,
                     total: Some(total),
                     bytes_per_sec: dl as f64 / secs,
+                    segments_done: None,
+                    segments_total: None,
+                    estimated_total: None,
                 });
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -679,6 +696,9 @@ fn download_segmented(
         downloaded: total,
         total: Some(total),
         bytes_per_sec: total as f64 / secs,
+        segments_done: None,
+        segments_total: None,
+        estimated_total: None,
     });
     std::fs::rename(part_path, final_path)
         .map_err(|e| format!("Could not finish download: {e}"))?;

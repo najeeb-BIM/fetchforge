@@ -18,7 +18,8 @@ use crate::extract::DOWNLOAD_STALL_TIMEOUT;
 use crate::validate::validate_url;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Which streaming protocol a URL is.
@@ -119,14 +120,29 @@ pub struct StreamInfo {
     pub duration_secs: Option<u64>,
     pub manifest_url: String,
     pub formats: Vec<StreamFormat>,
+    /// How many segments the (default) media playlist lists.
+    /// Recorded at plan time so the UI can show "0 / N pieces"
+    /// before the first segment lands. None when the count could
+    /// not be determined (DASH template manifests without a
+    /// timeline, or a variant playlist that failed to fetch).
+    pub segment_count: Option<u64>,
 }
 
 /// List the qualities of an HLS or DASH manifest URL (routed by
 /// extension). The caller must have checked [`is_manifest_url`].
-pub fn list_stream_formats(url: &str) -> Result<StreamInfo, String> {
+/// `referer` is the page the stream came from (sent on the
+/// manifest request — signed CDNs refuse requests without it);
+/// `captured` is playlist text the extension captured from the
+/// player's own response, used instead of re-fetching a signed
+/// link that may only work once (see [`CapturedManifest`]).
+pub fn list_stream_formats(
+    url: &str,
+    referer: &Option<String>,
+    captured: Option<&CapturedManifest>,
+) -> Result<StreamInfo, String> {
     match stream_kind_of_url(url) {
-        Some(StreamKind::Hls) => list_hls_formats(url),
-        Some(StreamKind::Dash) => list_dash_formats(url),
+        Some(StreamKind::Hls) => list_hls_formats(url, referer, captured),
+        Some(StreamKind::Dash) => list_dash_formats(url, referer, captured),
         None => Err("Not an HLS (.m3u8) or DASH (.mpd) URL.".to_string()),
     }
 }
@@ -191,21 +207,159 @@ fn reqwest_error(e: &reqwest::Error) -> String {
     out
 }
 
-fn fetch_text(url: &str, referer: &Option<String>) -> Result<String, String> {
-    let c = reqwest::blocking::Client::builder()
-        .user_agent("FetchForge/0.2")
-        .timeout(std::time::Duration::from_secs(60))
+/// How many HLS/DASH segments download at once (bounded worker
+/// pool in [`download_segments`]). Four is the conservative end of
+/// the 4–8 range every mature downloader in the study uses (XDM/AB
+/// Download Manager default 8; the yt-dlp GUIs 4–8): enough to
+/// keep a movie flowing over one warm connection pool, few enough
+/// not to trip per-host connection limits on strict CDNs.
+pub const HLS_SEGMENT_WORKERS: usize = 4;
+
+/// Largest playlist text the extension may pass to the engine with
+/// a download (see [`CapturedManifest`]): a media playlist for a
+/// feature film is tens of KB; 256 KB leaves ample headroom while
+/// keeping the native message (1 MB cap) and the manifest sidecar
+/// small. Larger captures are ignored and the engine fetches the
+/// playlist normally.
+pub const MAX_CAPTURED_MANIFEST_BYTES: usize = 256 * 1024;
+
+/// The User-Agent sent on manifest and segment requests: a real
+/// current Chrome string, not `FetchForge/0.2`. Several CDNs
+/// (totallyacdn.cc among them, seen 2026-11-22) treat unknown
+/// user-agents as bots and stall or refuse their segment requests,
+/// while the same requests from a browser identity succeed — every
+/// working downloader in the study replays browser headers. This
+/// is only an identity string: no cookies, no auth, no session is
+/// ever sent with it.
+pub(crate) const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+
+/// Total timeout for one manifest or segment request (unchanged
+/// from the sequential engine): a request that has not finished in
+/// this long is dead, and the error surfaces as a timeout (see
+/// [`reqwest_error`]).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// One shared HTTP client for a whole stream download (study §A1):
+/// manifest + every segment reuse the same connection pool, so
+/// segments ride the warm connection that fetched the manifest
+/// instead of paying a fresh TCP+TLS handshake per segment — the
+/// old code built a new client per segment, the same anti-pattern
+/// res-downloader and ODM exhibit, and a prime suspect for the
+/// Atlantic segment-1 timeout on a CDN that rate-limits new
+/// connections. HTTP/1.1 only (study §A3: XDM and ABDM both force
+/// it; some CDNs reject Range with 400 over HTTP/2).
+fn hls_client() -> Result<reqwest::blocking::Client, String> {
+    hls_client_with_timeout(REQUEST_TIMEOUT)
+}
+
+/// [`hls_client`] with an overridden total timeout, for tests (a
+/// stalling stub server must fail in seconds, not after 120 s).
+fn hls_client_with_timeout(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .user_agent(BROWSER_USER_AGENT)
+        .http1_only()
+        .tcp_nodelay(true)
+        .tcp_keepalive(Duration::from_secs(60))
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
-        .map_err(|e| e.to_string())?;
-    let mut req = c.get(url);
+        .map_err(|e| e.to_string())
+}
+
+/// Benign browser headers for manifest + segment requests (study
+/// §A2): the headers the player's own fetch/XHR sent when it
+/// played the stream. Only the benign subset is ever replayed —
+/// never Cookie or Authorization (spec §10 forbids credential use
+/// outright; see the study §12). `Accept-Encoding: identity`
+/// stays: segments are already-compressed media and this build has
+/// no decoder features, so a compressed body only adds failure
+/// modes (see [`reqwest_error`]).
+fn browser_headers(
+    req: reqwest::blocking::RequestBuilder,
+    referer: &Option<String>,
+) -> reqwest::blocking::RequestBuilder {
+    let mut req = req
+        .header("Accept", "*/*")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Accept-Encoding", "identity");
     if let Some(r) = referer {
         req = req.header("Referer", r.clone());
+        // Origin: the player fetches cross-origin manifests via
+        // fetch/XHR, which send Origin; include the page's origin
+        // so the request looks like the player's own.
+        if let Ok(u) = url::Url::parse(r) {
+            if let (Some(host), Some(port)) = (
+                u.host_str(),
+                u.port_or_known_default(),
+            ) {
+                let default_port = match u.scheme() {
+                    "http" => 80,
+                    "https" => 443,
+                    _ => 0,
+                };
+                let origin = if port == default_port {
+                    format!("{}://{}", u.scheme(), host)
+                } else {
+                    format!("{}://{}:{}", u.scheme(), host, port)
+                };
+                req = req.header("Origin", origin);
+            }
+        }
     }
-    // Manifests are plain text; ask for identity encoding so no
-    // proxy or CDN in the middle can hand back a compressed body
-    // this client never asked for (see reqwest_error).
-    req = req.header("Accept-Encoding", "identity");
+    req
+}
+
+/// A playlist the browser extension captured from the player's own
+/// response (see the extension's MAIN-world fetch/XHR hook): the
+/// exact text the player received, so the engine never re-fetches
+/// a signed link that may only work once (study §A8 — some CDNs
+/// sign a playlist link for a single request, so a re-fetch gets
+/// 403). The text is used ONLY when its URL exactly matches the
+/// URL being fetched; anything else falls through to a normal
+/// fetch. Captured text is validated to look like a playlist
+/// before use (see [`manifest_text`]).
+#[derive(Debug, Clone)]
+pub struct CapturedManifest {
+    pub url: String,
+    pub text: String,
+}
+
+/// Fetch a manifest's text, preferring a captured copy when it
+/// matches the URL exactly. A captured text that does not look
+/// like a playlist (no `#EXTM3U` for .m3u8, no `<MPD` for .mpd)
+/// is ignored and the URL is fetched normally — a stale or
+/// mismatched capture must never poison a download.
+fn manifest_text(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    referer: &Option<String>,
+    captured: Option<&CapturedManifest>,
+) -> Result<String, String> {
+    if let Some(cap) = captured {
+        if cap.url == url {
+            let lower = url.to_ascii_lowercase();
+            let looks_like_playlist = if lower.contains(".m3u8") {
+                cap.text.contains("#EXTM3U")
+            } else if lower.contains(".mpd") {
+                cap.text.contains("<MPD")
+            } else {
+                false
+            };
+            if looks_like_playlist {
+                return Ok(cap.text.clone());
+            }
+        }
+    }
+    fetch_text(client, url, referer)
+}
+
+fn fetch_text(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    referer: &Option<String>,
+) -> Result<String, String> {
+    let req = browser_headers(client.get(url), referer);
     let resp = req.send().map_err(|e| reqwest_error(&e))?;
     if !resp.status().is_success() {
         return Err(format!("Manifest request failed: HTTP {}", resp.status()));
@@ -216,25 +370,17 @@ fn fetch_text(url: &str, referer: &Option<String>) -> Result<String, String> {
 /// Fetch bytes, optionally a single inclusive byte range
 /// (DASH SegmentList `@mediaRange`). A 206 response is used as-is;
 /// a 200 response (server ignored the Range header) is sliced to
-/// the requested range, so the assembly stays correct.
+/// the requested range, so the assembly stays correct. The caller
+/// passes the download's shared client (see [`hls_client`]); a
+/// fresh client per segment is exactly the anti-pattern that
+/// starved Atlantic's CDN of warm connections.
 fn fetch_bytes_range(
+    client: &reqwest::blocking::Client,
     url: &str,
     range: Option<(u64, u64)>,
     referer: &Option<String>,
 ) -> Result<Vec<u8>, String> {
-    let c = reqwest::blocking::Client::builder()
-        .user_agent("FetchForge/0.2")
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut req = c.get(url);
-    if let Some(r) = referer {
-        req = req.header("Referer", r.clone());
-    }
-    // Segments are already-compressed media: compression gains
-    // nothing and a compressed body only adds failure modes, so
-    // ask for identity encoding outright (see reqwest_error).
-    req = req.header("Accept-Encoding", "identity");
+    let mut req = browser_headers(client.get(url), referer);
     if let Some((start, end)) = range {
         req = req.header("Range", format!("bytes={start}-{end}"));
     }
@@ -526,9 +672,14 @@ fn pick_default_variant<'a>(variants: &'a [HlsVariant]) -> Option<&'a HlsVariant
 /// read from the default variant's playlist when it can be
 /// fetched; a failure there leaves the duration unknown rather
 /// than failing the whole listing.
-pub fn list_hls_formats(manifest_url: &str) -> Result<StreamInfo, String> {
+pub fn list_hls_formats(
+    manifest_url: &str,
+    referer: &Option<String>,
+    captured: Option<&CapturedManifest>,
+) -> Result<StreamInfo, String> {
     let manifest_url = validate_url(manifest_url)?;
-    let text = fetch_text(&manifest_url, &None)?;
+    let client = hls_client()?;
+    let text = manifest_text(&client, &manifest_url, referer, captured)?;
     if text.contains("#EXT-X-KEY") {
         return Err(
             "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
@@ -539,7 +690,7 @@ pub fn list_hls_formats(manifest_url: &str) -> Result<StreamInfo, String> {
     let title = title_from_manifest_url(&manifest_url);
     if master.variants.is_empty() {
         // Media playlist: validate it has segments, then one format.
-        parse_hls_segments(&text, &manifest_base_url(&manifest_url))?;
+        let segments = parse_hls_segments(&text, &manifest_base_url(&manifest_url))?;
         return Ok(StreamInfo {
             kind: StreamKind::Hls,
             title,
@@ -558,6 +709,7 @@ pub fn list_hls_formats(manifest_url: &str) -> Result<StreamInfo, String> {
                 filesize: None,
                 needs_merge: false,
             }],
+            segment_count: Some(segments.len() as u64),
         });
     }
     let formats = master
@@ -582,16 +734,27 @@ pub fn list_hls_formats(manifest_url: &str) -> Result<StreamInfo, String> {
             }
         })
         .collect();
-    // Duration from the default variant's playlist (best effort).
-    let duration_secs = pick_default_variant(&master.variants)
-        .and_then(|v| fetch_text(&v.uri, &None).ok())
-        .and_then(|t| hls_duration_secs(&t));
+    // Duration + segment count from the default variant's
+    // playlist (best effort): one fetch serves both, so the plan
+    // knows the piece count before the download starts.
+    let default_uri = pick_default_variant(&master.variants).map(|v| v.uri.clone());
+    let default_text = default_uri
+        .as_deref()
+        .and_then(|uri| manifest_text(&client, uri, referer, captured).ok());
+    let duration_secs = default_text.as_deref().and_then(hls_duration_secs);
+    let segment_count = match (&default_uri, &default_text) {
+        (Some(uri), Some(text)) => parse_hls_segments(text, &manifest_base_url(uri))
+            .ok()
+            .map(|s| s.len() as u64),
+        _ => None,
+    };
     Ok(StreamInfo {
         kind: StreamKind::Hls,
         title,
         duration_secs,
         manifest_url,
         formats,
+        segment_count,
     })
 }
 
@@ -663,12 +826,424 @@ fn check_stall(last_progress: Instant, timeout: Duration) -> Result<(), String> 
     Ok(())
 }
 
+/// Estimated total size of an HLS/DASH download, from the
+/// measured average segment size so far times the segment count:
+/// `downloaded_bytes × total_segments / completed_segments`.
+/// None until at least one segment has completed (no average to
+/// extrapolate from). An estimate, never exact — segment sizes
+/// vary (keyframes, silence), so the UI shows it with "~".
+/// Sanity check against the nime download (2026-11-22): 3,321
+/// pieces, ~1.5 GB total, ~450 KB per piece.
+pub fn estimate_total_bytes(
+    downloaded: u64,
+    done: u64,
+    total: u64,
+) -> Option<u64> {
+    if done == 0 || total == 0 {
+        return None;
+    }
+    // u128: downloaded (≤ ~10 GB) × total (≤ ~100k segments)
+    // fits u64 in practice, but saturate rather than overflow.
+    let est = (downloaded as u128 * total as u128) / done as u128;
+    Some(u64::try_from(est).unwrap_or(u64::MAX))
+}
+
+/// Directory holding one segment file per downloaded segment for
+/// the parallel path: `<part>.seg/` next to the `.part` file.
+/// Distinct from the legacy sidecar FILE (`<part>.segments`) so a
+/// download started by an older build keeps its own resume state.
+fn seg_dir_for(part_path: &Path) -> PathBuf {
+    part_path.with_file_name(format!(
+        "{}.seg",
+        part_path.file_name().unwrap().to_string_lossy()
+    ))
+}
+
+fn seg_file_name(index: usize) -> String {
+    format!("{index:06}.seg")
+}
+
+/// Meta file inside the segment dir, validating a resume: the
+/// manifest must still list the same number of segments with the
+/// same first segment, or the saved pieces belong to a different
+/// playlist and the download restarts cleanly instead of
+/// assembling a corrupt file.
+fn read_seg_meta(seg_dir: &Path, segments: &[Segment]) -> bool {
+    let Ok(saved) = std::fs::read_to_string(seg_dir.join("meta")) else {
+        return false;
+    };
+    let mut count: Option<usize> = None;
+    let mut first: Option<String> = None;
+    for line in saved.lines() {
+        if let Some(v) = line.strip_prefix("count=") {
+            count = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("first=") {
+            first = Some(v.to_string());
+        }
+    }
+    match (count, first) {
+        (Some(n), Some(f)) => {
+            n == segments.len() && segments.first().is_some_and(|s| s.url == f)
+        }
+        _ => false,
+    }
+}
+
+fn write_seg_meta(seg_dir: &Path, segments: &[Segment]) {
+    let first = segments.first().map(|s| s.url.as_str()).unwrap_or("");
+    let _ = std::fs::write(
+        seg_dir.join("meta"),
+        format!("count={}\nfirst={}\n", segments.len(), first),
+    );
+}
+
+/// Download `segments` into `part_path`, in parallel over the
+/// download's shared client (see [`hls_client`]).
+///
+/// Parallelism (study §A5): `HLS_SEGMENT_WORKERS` workers pull
+/// segment indices from a shared counter, each fetching its
+/// segment with the same 3-attempt retry rule as the old
+/// sequential engine, writing it to its own file in the segment
+/// dir (`<part>.seg/NNNNNN.seg`, via a `.tmp` + atomic rename, so
+/// a file's existence means the segment is complete). When every
+/// segment is on disk the files are concatenated in playlist
+/// order into the `.part` file — the output is byte-identical to
+/// the sequential engine's, verified by test. Progress reports
+/// carry the segment counts and the running size estimate (see
+/// [`estimate_total_bytes`]).
+///
+/// Resume: a segment dir whose meta still matches the manifest
+/// (same count, same first segment) keeps its completed pieces;
+/// only missing segments are fetched. A stale dir is wiped and
+/// the download restarts.
+///
+/// Legacy resume: a download started by an older build (a
+/// `<part>.segments` sidecar FILE next to an existing `.part`
+/// file — one concatenated prefix, not per-segment files) cannot
+/// be split back into pieces, so it finishes on the sequential
+/// path ([`download_segments_sequential`]) instead of restarting
+/// from zero. That path is also what a paused parallel download
+/// never needs: parallel downloads resume through the segment
+/// dir, never the sidecar.
+///
+/// Failure rules (kept from the sequential engine): a segment
+/// that exhausts its retries fails the run with its error — the
+/// file cannot be assembled without it. A timeout before ANY byte
+/// has downloaded fails fast (no retry — see
+/// [`should_retry_segment`]). The stall watchdog (no completed
+/// segment for `stall_timeout`) still bounds the whole run.
+/// Pause/cancel return the `__PAUSED__` / `__CANCELLED__`
+/// sentinels the workers understand; cancel deletes the part
+/// file, the segment dir and the sidecar, pause keeps everything
+/// for resume.
+#[allow(clippy::too_many_arguments)]
 fn download_segments(
+    client: &reqwest::blocking::Client,
     segments: &[Segment],
     part_path: &Path,
     referer: &Option<String>,
     progress_base: u64,
-    progress: &dyn Fn(Progress),
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+    stall_timeout: Duration,
+) -> Result<u64, String> {
+    if segments.is_empty() {
+        std::fs::File::create(part_path).map_err(|e| e.to_string())?;
+        return Ok(0);
+    }
+    // Legacy resume (see the doc comment above): a sidecar FILE
+    // plus an existing .part means an older build's concatenated
+    // prefix — finish it sequentially.
+    let sidecar = part_path.with_file_name(format!(
+        "{}.segments",
+        part_path.file_name().unwrap().to_string_lossy()
+    ));
+    if sidecar.is_file() && part_path.is_file() {
+        return download_segments_sequential(
+            client,
+            segments,
+            part_path,
+            referer,
+            progress_base,
+            progress,
+            paused,
+            cancelled,
+            stall_timeout,
+        );
+    }
+    download_segments_parallel(
+        client,
+        segments,
+        part_path,
+        referer,
+        progress_base,
+        progress,
+        paused,
+        cancelled,
+        stall_timeout,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_segments_parallel(
+    client: &reqwest::blocking::Client,
+    segments: &[Segment],
+    part_path: &Path,
+    referer: &Option<String>,
+    progress_base: u64,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+    stall_timeout: Duration,
+) -> Result<u64, String> {
+    let total = segments.len() as u64;
+    let seg_dir = seg_dir_for(part_path);
+    // Resume validation: a stale dir (different manifest) is
+    // wiped; a matching one keeps its completed pieces.
+    if seg_dir.exists() && !read_seg_meta(&seg_dir, segments) {
+        let _ = std::fs::remove_dir_all(&seg_dir);
+    }
+    if seg_dir.is_file() {
+        let _ = std::fs::remove_file(&seg_dir);
+    }
+    std::fs::create_dir_all(&seg_dir).map_err(|e| e.to_string())?;
+    write_seg_meta(&seg_dir, segments);
+    // Count resumed pieces (file presence = complete, by the
+    // atomic-rename rule) and their bytes.
+    let mut resumed_done: u64 = 0;
+    let mut resumed_bytes: u64 = 0;
+    for i in 0..segments.len() {
+        if let Ok(meta) = std::fs::metadata(seg_dir.join(seg_file_name(i))) {
+            resumed_done += 1;
+            resumed_bytes += meta.len();
+        }
+    }
+    let started = Instant::now();
+    let next = AtomicUsize::new(0);
+    let downloaded = AtomicU64::new(resumed_bytes);
+    let done = AtomicUsize::new(resumed_done as usize);
+    let stop = AtomicBool::new(false);
+    let first_error: Mutex<Option<String>> = Mutex::new(None);
+    let last_progress = Mutex::new(Instant::now());
+    let report = |progress: &(dyn Fn(Progress) + Send + Sync)| {
+        let dl = downloaded.load(Ordering::Relaxed);
+        let dn = done.load(Ordering::Relaxed) as u64;
+        let elapsed = started.elapsed().as_secs_f64().max(0.001);
+        progress(Progress {
+            downloaded: progress_base + dl,
+            total: None,
+            bytes_per_sec: dl as f64 / elapsed,
+            segments_done: Some(dn),
+            segments_total: Some(total),
+            estimated_total: estimate_total_bytes(dl, dn, total),
+        });
+    };
+    // Report the resumed state at once, so a resumed download
+    // does not sit at 0 pieces until the next segment lands.
+    report(progress);
+    // Workers run as `move` closures (each owns its clone of the
+    // shared client); the shared counters are borrowed through
+    // these references, so every worker sees the same state.
+    let next = &next;
+    let downloaded = &downloaded;
+    let done = &done;
+    let stop = &stop;
+    let first_error = &first_error;
+    let last_progress = &last_progress;
+    let seg_dir = &seg_dir;
+    let report = &report;
+    std::thread::scope(|scope| {
+        for _ in 0..HLS_SEGMENT_WORKERS {
+            let client = client.clone();
+            scope.spawn(move || loop {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if cancelled.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                    stop.store(true, Ordering::Relaxed);
+                    return;
+                }
+                // Stall watchdog (see check_stall): checked before
+                // every segment, so a dead run fails plainly
+                // instead of sitting at 0% forever.
+                {
+                    let last = *last_progress.lock().unwrap();
+                    if let Err(e) = check_stall(last, stall_timeout) {
+                        let mut slot = first_error.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        stop.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= segments.len() {
+                    return;
+                }
+                // Already on disk from an earlier run: counted in
+                // the resume scan, nothing to fetch.
+                if seg_dir.join(seg_file_name(i)).is_file() {
+                    continue;
+                }
+                let seg = &segments[i];
+                // Retry transient failures; a timeout at 0 bytes
+                // fails fast (see should_retry_segment) — the
+                // shared counter is what "0 bytes" means here.
+                let mut bytes = None;
+                let mut last_err = String::new();
+                let mut attempts = 0;
+                for attempt in 0..3 {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // Stall watchdog, inside the retry loop (same
+                    // placement as the sequential path): a server
+                    // that answers slowly but never delivers a
+                    // segment must be caught between attempts, not
+                    // after all three retries have burned the
+                    // timeout several times over. last_progress is
+                    // shared: any worker completing a segment
+                    // resets the clock for all of them.
+                    if let Err(e) = check_stall(
+                        *last_progress.lock().unwrap(),
+                        stall_timeout,
+                    ) {
+                        let mut slot = first_error.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        stop.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    attempts = attempt + 1;
+                    match fetch_bytes_range(&client, &seg.url, seg.range, referer) {
+                        Ok(b) => {
+                            bytes = Some(b);
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = e;
+                            if !should_retry_segment(
+                                attempt,
+                                downloaded.load(Ordering::Relaxed),
+                                &last_err,
+                            ) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(
+                                500 * (attempt + 1) as u64,
+                            ));
+                        }
+                    }
+                }
+                let Some(bytes) = bytes else {
+                    // This segment is persistently failing. The
+                    // file cannot be assembled without it, so any
+                    // persistent failure ends the run — the same
+                    // rule as the sequential path. At 0 bytes this
+                    // is the fail-fast: the download ends on the
+                    // first persistent failure instead of waiting
+                    // out the stall timeout. The saved pieces stay
+                    // in the segment dir for resume.
+                    let tries = if attempts == 1 { "try" } else { "tries" };
+                    let mut slot = first_error.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(format!(
+                            "Segment {} of {} could not be downloaded after {attempts} {tries}. ({last_err})",
+                            i + 1,
+                            segments.len()
+                        ));
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                    continue;
+                };
+                // Atomic completion marker: write temp, then
+                // rename, so a file's existence means the segment
+                // is whole (a crash mid-write leaves only a .tmp).
+                let tmp_path = seg_dir.join(format!("{}.tmp", seg_file_name(i)));
+                let final_path = seg_dir.join(seg_file_name(i));
+                if let Err(e) = (|| -> Result<(), String> {
+                    use std::io::Write;
+                    let mut f = std::fs::File::create(&tmp_path)
+                        .map_err(|e| e.to_string())?;
+                    f.write_all(&bytes).map_err(|e| e.to_string())?;
+                    drop(f);
+                    std::fs::rename(&tmp_path, &final_path).map_err(|e| e.to_string())?;
+                    Ok(())
+                })() {
+                    let mut slot = first_error.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(e);
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                    return;
+                }
+                downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                done.fetch_add(1, Ordering::Relaxed);
+                *last_progress.lock().unwrap() = Instant::now();
+                report(progress);
+            });
+        }
+    });
+    // A fetch error beats pause/cancel here (the run genuinely
+    // failed); cancel beats pause (the user asked for the files to
+    // go). The segment dir is kept on failure and pause, so a
+    // later resume continues from the completed pieces.
+    if let Some(err) = first_error.lock().unwrap().take() {
+        return Err(err);
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        let _ = std::fs::remove_file(part_path);
+        let _ = std::fs::remove_dir_all(&seg_dir);
+        return Err("__CANCELLED__".to_string());
+    }
+    if paused.load(Ordering::Relaxed) {
+        return Err("__PAUSED__".to_string());
+    }
+    // Assembly: stream-concatenate the segment files in playlist
+    // order (io::copy per file — no whole-file reads into memory).
+    // Every index must be present: a missing file here means a
+    // worker exited without recording its failure, which must
+    // never silently produce a short file.
+    {
+        use std::io::Write;
+        let mut out = std::fs::File::create(part_path).map_err(|e| e.to_string())?;
+        for i in 0..segments.len() {
+            let path = seg_dir.join(seg_file_name(i));
+            let mut f = std::fs::File::open(&path).map_err(|_| {
+                format!(
+                    "Segment {} of {} is missing after download; the download will retry from the saved pieces.",
+                    i + 1,
+                    segments.len()
+                )
+            })?;
+            std::io::copy(&mut f, &mut out).map_err(|e| e.to_string())?;
+        }
+        out.flush().map_err(|e| e.to_string())?;
+    }
+    let total_bytes = downloaded.load(Ordering::Relaxed);
+    let _ = std::fs::remove_dir_all(&seg_dir);
+    Ok(total_bytes)
+}
+
+/// The pre-round-6 sequential engine, kept for one purpose:
+/// finishing downloads an older build started (a `<part>.segments`
+/// sidecar FILE next to an existing `.part` file — one
+/// concatenated prefix, not per-segment files). New downloads
+/// always take the parallel path. Same retry, stall, pause/cancel
+/// and progress rules as before, now over the shared client and
+/// reporting segment counts + the size estimate like the parallel
+/// path, so a resumed legacy download shows its pieces too.
+#[allow(clippy::too_many_arguments)]
+fn download_segments_sequential(
+    client: &reqwest::blocking::Client,
+    segments: &[Segment],
+    part_path: &Path,
+    referer: &Option<String>,
+    progress_base: u64,
+    progress: &(dyn Fn(Progress) + Send + Sync),
     paused: &AtomicBool,
     cancelled: &AtomicBool,
     stall_timeout: Duration,
@@ -719,14 +1294,15 @@ fn download_segments(
     };
     let started = Instant::now();
     let mut last_progress = Instant::now();
+    let total = segments.len() as u64;
     for (i, seg) in segments.iter().enumerate().skip(start) {
-        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        if cancelled.load(Ordering::Relaxed) {
             drop(out);
             let _ = std::fs::remove_file(part_path);
             let _ = std::fs::remove_file(&sidecar);
             return Err("__CANCELLED__".to_string());
         }
-        if paused.load(std::sync::atomic::Ordering::Relaxed) {
+        if paused.load(Ordering::Relaxed) {
             return Err("__PAUSED__".to_string());
         }
         // Stall watchdog: no completed segment for the whole
@@ -743,7 +1319,7 @@ fn download_segments(
         for attempt in 0..3 {
             check_stall(last_progress, stall_timeout)?;
             attempts = attempt + 1;
-            match fetch_bytes_range(&seg.url, seg.range, referer) {
+            match fetch_bytes_range(client, &seg.url, seg.range, referer) {
                 Ok(b) => {
                     bytes = Some(b);
                     break;
@@ -783,10 +1359,14 @@ fn download_segments(
         }
         let _ = std::fs::write(&sidecar, sidecar_text);
         let elapsed = started.elapsed().as_secs_f64().max(0.001);
+        let done_now = (i + 1) as u64;
         progress(Progress {
             downloaded: progress_base + downloaded,
             total: None,
             bytes_per_sec: downloaded as f64 / elapsed,
+            segments_done: Some(done_now),
+            segments_total: Some(total),
+            estimated_total: estimate_total_bytes(downloaded, done_now, total),
         });
     }
     drop(out);
@@ -818,12 +1398,14 @@ pub fn download_hls(
     destination_dir: &Path,
     filename: &str,
     referer: &Option<String>,
-    progress: &dyn Fn(Progress),
+    progress: &(dyn Fn(Progress) + Send + Sync),
     paused: &AtomicBool,
     cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
 ) -> Result<PathBuf, String> {
     let manifest_url = validate_url(manifest_url)?;
-    let text = fetch_text(&manifest_url, referer)?;
+    let client = hls_client()?;
+    let text = manifest_text(&client, &manifest_url, referer, captured)?;
     if text.contains("#EXT-X-KEY") {
         return Err(
             "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
@@ -845,6 +1427,7 @@ pub fn download_hls(
         progress,
         paused,
         cancelled,
+        captured,
     )
 }
 
@@ -854,7 +1437,10 @@ pub fn download_hls(
 /// tracks and merges them with `ffmpeg` (`.mp4` output); without
 /// ffmpeg that variant is refused with a clear error instead of
 /// producing a silent video. Muxed variants concatenate straight
-/// to `.ts`.
+/// to `.ts`. `captured` is playlist text the extension captured
+/// from the player's own response (see [`CapturedManifest`]):
+/// used for the master and the variant playlist when its URL
+/// matches, so a signed link is never re-fetched.
 #[allow(clippy::too_many_arguments)]
 pub fn download_hls_variant(
     manifest_url: &str,
@@ -863,17 +1449,19 @@ pub fn download_hls_variant(
     filename: &str,
     referer: &Option<String>,
     ffmpeg: Option<&Path>,
-    progress: &dyn Fn(Progress),
+    progress: &(dyn Fn(Progress) + Send + Sync),
     paused: &AtomicBool,
     cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
 ) -> Result<PathBuf, String> {
     let manifest_url = validate_url(manifest_url)?;
     let variant_uri = validate_url(variant_uri)?;
+    let client = hls_client()?;
     // The master text tells us whether this variant's audio is a
     // separate track (skip the fetch when the "variant" is the
     // manifest itself — a plain media playlist).
     let audio_uri = if variant_uri != manifest_url {
-        let master_text = fetch_text(&manifest_url, referer)?;
+        let master_text = manifest_text(&client, &manifest_url, referer, captured)?;
         if master_text.contains("#EXT-X-KEY") {
             return Err(
                 "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
@@ -903,7 +1491,7 @@ pub fn download_hls_variant(
                 .to_string(),
         );
     }
-    let variant_text = fetch_text(&variant_uri, referer)?;
+    let variant_text = manifest_text(&client, &variant_uri, referer, captured)?;
     // Segments resolve against the variant playlist's own URL —
     // unwrapped when the variant came through a proxy worker, so
     // they are fetched from the real CDN, not the proxy origin.
@@ -913,7 +1501,7 @@ pub fn download_hls_variant(
         .collect::<Vec<_>>();
     let audio_segments = match &audio_uri {
         Some(uri) => {
-            let audio_text = fetch_text(uri, referer)?;
+            let audio_text = fetch_text(&client, uri, referer)?;
             Some(
                 parse_hls_segments(&audio_text, uri)?
                     .into_iter()
@@ -928,6 +1516,7 @@ pub fn download_hls_variant(
     let final_path = crate::filename::unique_path(destination_dir, &clean);
     let video_part = part_path_for(&final_path);
     let video_bytes = download_segments(
+        &client,
         &video_segments,
         &video_part,
         referer,
@@ -957,6 +1546,7 @@ pub fn download_hls_variant(
         final_path.file_name().unwrap().to_string_lossy()
     ));
     download_segments(
+        &client,
         &audio_segments,
         &audio_part,
         referer,
@@ -981,7 +1571,10 @@ pub fn download_hls_variant(
 /// with ffmpeg into one `.mp4`; a video-only variant must never
 /// again be delivered as a silent `.ts` when its audio sibling was
 /// right there. ffmpeg is required (the caller resolves it when
-/// the plan says the download needs a merge).
+/// the plan says the download needs a merge). `captured` is
+/// playlist text the extension captured for the VIDEO playlist
+/// (see [`CapturedManifest`]); the audio playlist is always
+/// fetched normally.
 #[allow(clippy::too_many_arguments)]
 pub fn download_hls_pair(
     video_uri: &str,
@@ -990,20 +1583,22 @@ pub fn download_hls_pair(
     filename: &str,
     referer: &Option<String>,
     ffmpeg: &Path,
-    progress: &dyn Fn(Progress),
+    progress: &(dyn Fn(Progress) + Send + Sync),
     paused: &AtomicBool,
     cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
 ) -> Result<PathBuf, String> {
     let video_uri = validate_url(video_uri)?;
     let audio_uri = validate_url(audio_uri)?;
-    let video_text = fetch_text(&video_uri, referer)?;
+    let client = hls_client()?;
+    let video_text = manifest_text(&client, &video_uri, referer, captured)?;
     if video_text.contains("#EXT-X-KEY") {
         return Err(
             "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
                 .to_string(),
         );
     }
-    let audio_text = fetch_text(&audio_uri, referer)?;
+    let audio_text = fetch_text(&client, &audio_uri, referer)?;
     if audio_text.contains("#EXT-X-KEY") {
         return Err(
             "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
@@ -1023,6 +1618,7 @@ pub fn download_hls_pair(
     let final_path = crate::filename::unique_path(destination_dir, &clean);
     let video_part = part_path_for(&final_path);
     let video_bytes = download_segments(
+        &client,
         &video_segments,
         &video_part,
         referer,
@@ -1044,6 +1640,7 @@ pub fn download_hls_pair(
         final_path.file_name().unwrap().to_string_lossy()
     ));
     download_segments(
+        &client,
         &audio_segments,
         &audio_part,
         referer,
@@ -1879,9 +2476,14 @@ fn choose_dash_representation<'a>(
 /// representation. Video representations in a manifest with a
 /// separate audio track are video-only (merged with the best audio
 /// on download); audio representations are audio-only.
-pub fn list_dash_formats(manifest_url: &str) -> Result<StreamInfo, String> {
+pub fn list_dash_formats(
+    manifest_url: &str,
+    referer: &Option<String>,
+    captured: Option<&CapturedManifest>,
+) -> Result<StreamInfo, String> {
     let manifest_url = validate_url(manifest_url)?;
-    let text = fetch_text(&manifest_url, &None)?;
+    let client = hls_client()?;
+    let text = manifest_text(&client, &manifest_url, referer, captured)?;
     if text.contains("ContentProtection") || text.contains("cenc:") {
         return Err(
             "This DASH stream is DRM-protected (ContentProtection). FetchForge does not bypass DRM."
@@ -1927,12 +2529,24 @@ pub fn list_dash_formats(manifest_url: &str) -> Result<StreamInfo, String> {
             }
         })
         .collect();
+    // Segment count from the default representation (best
+    // effort): the template/timeline expands to a concrete list,
+    // so the plan can show the piece count up front like HLS.
+    // The init segment counts too — it is a piece the worker
+    // downloads.
+    let segment_count = choose_dash_representation(&manifest, None)
+        .ok()
+        .and_then(|(chosen, _)| {
+            dash_segments(chosen, &manifest_url, manifest.duration_secs).ok()
+        })
+        .map(|(init, segments)| segments.len() as u64 + init.map_or(0, |_| 1));
     Ok(StreamInfo {
         kind: StreamKind::Dash,
         title: title_from_manifest_url(&manifest_url),
         duration_secs: manifest.duration_secs.map(|d| d as u64),
         manifest_url,
         formats,
+        segment_count,
     })
 }
 
@@ -1952,17 +2566,21 @@ pub struct DashDownloadOptions {
 
 /// Download a DASH manifest: resolve ffmpeg when the manifest
 /// needs a merge, then assemble via [`download_dash_with`].
+/// `captured` is manifest text the extension captured from the
+/// player's own response (see [`CapturedManifest`]).
 pub fn download_dash(
     data_dir: &Path,
     opts: &DashDownloadOptions,
-    progress: &dyn Fn(Progress),
+    progress: &(dyn Fn(Progress) + Send + Sync),
     paused: &AtomicBool,
     cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
 ) -> Result<PathBuf, String> {
     // One manifest fetch to decide whether a merge is needed; the
     // assembly fetch is a second cheap GET of the same small file.
     let manifest_url = validate_url(&opts.manifest_url)?;
-    let text = fetch_text(&manifest_url, &opts.referer)?;
+    let client = hls_client()?;
+    let text = manifest_text(&client, &manifest_url, &opts.referer, captured)?;
     if text.contains("ContentProtection") || text.contains("cenc:") {
         return Err(
             "This DASH stream is DRM-protected (ContentProtection). FetchForge does not bypass DRM."
@@ -1977,7 +2595,7 @@ pub fn download_dash(
     } else {
         None
     };
-    download_dash_with(ffmpeg.as_deref(), opts, progress, paused, cancelled)
+    download_dash_with(ffmpeg.as_deref(), opts, progress, paused, cancelled, captured)
 }
 
 /// The testable core of [`download_dash`]: ffmpeg is explicit, so
@@ -1991,12 +2609,14 @@ pub fn download_dash(
 pub fn download_dash_with(
     ffmpeg: Option<&Path>,
     opts: &DashDownloadOptions,
-    progress: &dyn Fn(Progress),
+    progress: &(dyn Fn(Progress) + Send + Sync),
     paused: &AtomicBool,
     cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
 ) -> Result<PathBuf, String> {
     let manifest_url = validate_url(&opts.manifest_url)?;
-    let text = fetch_text(&manifest_url, &opts.referer)?;
+    let client = hls_client()?;
+    let text = manifest_text(&client, &manifest_url, &opts.referer, captured)?;
     if text.contains("ContentProtection") || text.contains("cenc:") {
         return Err(
             "This DASH stream is DRM-protected (ContentProtection). FetchForge does not bypass DRM."
@@ -2023,6 +2643,7 @@ pub fn download_dash_with(
         segments.insert(0, init);
     }
     let video_bytes = download_segments(
+        &client,
         &segments,
         &video_part,
         &opts.referer,
@@ -2053,6 +2674,7 @@ pub fn download_dash_with(
         audio_segments.insert(0, init);
     }
     download_segments(
+        &client,
         &audio_segments,
         &audio_part,
         &opts.referer,
@@ -2307,7 +2929,7 @@ mod tests {
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (port, server) = serve_map(files, hits, stop.clone());
         let info =
-            list_hls_formats(&format!("http://127.0.0.1:{port}/master.m3u8")).unwrap();
+            list_hls_formats(&format!("http://127.0.0.1:{port}/master.m3u8"), &None, None).unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
         assert_eq!(info.kind, StreamKind::Hls);
@@ -2335,7 +2957,8 @@ mod tests {
         let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (port, server) = serve_map(files, hits, stop.clone());
-        let info = list_hls_formats(&format!("http://127.0.0.1:{port}/play.m3u8")).unwrap();
+        let info =
+            list_hls_formats(&format!("http://127.0.0.1:{port}/play.m3u8"), &None, None).unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
         assert_eq!(info.formats.len(), 1);
@@ -2373,6 +2996,7 @@ mod tests {
             &|p| seen.lock().unwrap().push(p.downloaded),
             &paused,
             &cancelled,
+            None,
         )
         .unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2417,6 +3041,7 @@ mod tests {
             &|_| {},
             &paused,
             &cancelled,
+            None,
         )
         .unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2457,6 +3082,7 @@ mod tests {
             &|_| {},
             &paused,
             &cancelled,
+            None,
         )
         .unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2482,8 +3108,17 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/enc.m3u8");
         let paused = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
-        let err = download_hls(&url, &dir, "x.ts", &None, &|_| {}, &paused, &cancelled)
-            .unwrap_err();
+        let err = download_hls(
+            &url,
+            &dir,
+            "x.ts",
+            &None,
+            &|_| {},
+            &paused,
+            &cancelled,
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("encrypted"), "error: {err}");
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
@@ -2559,6 +3194,7 @@ mod tests {
             &|_| {},
             &paused,
             &cancelled,
+            None,
         )
         .unwrap();
         assert!(out.is_file());
@@ -2577,6 +3213,7 @@ mod tests {
             &|_| {},
             &paused,
             &cancelled,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("ffmpeg"), "error: {err}");
@@ -2652,6 +3289,7 @@ mod tests {
             &|_| {},
             &paused,
             &cancelled,
+            None,
         )
         .unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2731,7 +3369,7 @@ mod tests {
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (_port, server) = serve_map_bound(listener, files, hits.clone(), stop.clone());
         // Listing works through the wrapper (title from the inner URL).
-        let info = list_hls_formats(&proxy).unwrap();
+        let info = list_hls_formats(&proxy, &None, None).unwrap();
         assert_eq!(info.formats.len(), 1);
         assert_eq!(info.title, "media");
         let dir = unique_temp_dir("hls-proxy");
@@ -2748,6 +3386,7 @@ mod tests {
             &|_| {},
             &paused,
             &cancelled,
+            None,
         )
         .unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2827,6 +3466,7 @@ mod tests {
             &|_| {},
             &paused,
             &cancelled,
+            None,
         )
         .unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2910,7 +3550,9 @@ mod tests {
         let paused = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
         let start = Instant::now();
+        let client = hls_client().unwrap();
         let err = download_segments(
+            &client,
             &segments,
             &part,
             &None,
@@ -2950,7 +3592,9 @@ mod tests {
         }];
         let paused = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
+        let client = hls_client().unwrap();
         let err = download_segments(
+            &client,
             &segments,
             &part,
             &None,
@@ -3089,7 +3733,9 @@ mod tests {
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let (port, server) =
             serve_truncated_body(100, b"0123456789", seen.clone());
+        let client = hls_client().unwrap();
         let err = fetch_bytes_range(
+            &client,
             &format!("http://127.0.0.1:{port}/seg0.ts"),
             None,
             &None,
@@ -3308,7 +3954,7 @@ mod tests {
         let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (port, server) = serve_map(files, hits, stop.clone());
-        let info = list_dash_formats(&format!("http://127.0.0.1:{port}/bbb.mpd")).unwrap();
+        let info = list_dash_formats(&format!("http://127.0.0.1:{port}/bbb.mpd"), &None, None).unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
         assert_eq!(info.kind, StreamKind::Dash);
@@ -3352,7 +3998,7 @@ mod tests {
             filename: "clip.mp4".to_string(),
             referer: None,
         };
-        let out = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled).unwrap();
+        let out = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled, None).unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"INIT-SEG-ONE-SEG-TWO");
@@ -3383,7 +4029,7 @@ mod tests {
             filename: "clip.mp4".to_string(),
             referer: None,
         };
-        let out = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled).unwrap();
+        let out = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled, None).unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
         // init + seg1 + bytes 100..199 of file.mp4 (100 B's). The
@@ -3460,12 +4106,12 @@ mod tests {
             referer: None,
         };
         let out =
-            download_dash_with(Some(&ffmpeg), &opts, &|_| {}, &paused, &cancelled).unwrap();
+            download_dash_with(Some(&ffmpeg), &opts, &|_| {}, &paused, &cancelled, None).unwrap();
         assert!(out.is_file());
         assert!(std::fs::metadata(&out).unwrap().len() > 0);
         // No ffmpeg -> the same manifest is refused, not silently
         // downloaded as a silent video.
-        let err = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled).unwrap_err();
+        let err = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled, None).unwrap_err();
         assert!(err.contains("ffmpeg"), "error: {err}");
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
@@ -3491,10 +4137,460 @@ mod tests {
             filename: "x.mp4".to_string(),
             referer: None,
         };
-        let err = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled).unwrap_err();
+        let err = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled, None).unwrap_err();
         assert!(err.contains("DRM"), "error: {err}");
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Loopback server for the trickle test: serves one body to
+    /// every connection, in `chunk`-byte writes `delay` apart —
+    /// a slow-but-alive server, the shape a throttled CDN takes.
+    fn serve_trickle(
+        body: Vec<u8>,
+        chunk: usize,
+        delay: Duration,
+        stop: std::sync::Arc<AtomicBool>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut buf = [0u8; 8192];
+                    let _ = stream.read(&mut buf);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    for part in body.chunks(chunk) {
+                        let _ = stream.write_all(part);
+                        let _ = stream.flush();
+                        std::thread::sleep(delay);
+                    }
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        });
+        (port, handle)
+    }
+
+    /// `serve_map`, but records the full raw request text of every
+    /// request (for the browser-headers assertions).
+    fn serve_map_recording(
+        files: HashMap<String, Vec<u8>>,
+        seen: std::sync::Arc<Mutex<Vec<String>>>,
+        stop: std::sync::Arc<AtomicBool>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    seen.lock().unwrap().push(req);
+                    match files.get(&path) {
+                        Some(body) => {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(body);
+                        }
+                        None => {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn parallel_segments_match_sequential_byte_for_byte() {
+        // The parallel engine must produce exactly the output the
+        // sequential engine produced for the same playlist —
+        // segment order in the file is playlist order, never
+        // arrival order — and its progress reports must carry the
+        // segment counts and the running size estimate.
+        let bodies: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("SEGMENT-{i}-").repeat(i + 1).into_bytes())
+            .collect();
+        let mut files = HashMap::new();
+        for (i, b) in bodies.iter().enumerate() {
+            files.insert(format!("/seg{i}.ts"), b.clone());
+        }
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let segments: Vec<Segment> = (0..8)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
+                range: None,
+            })
+            .collect();
+        let expected: Vec<u8> = bodies.concat();
+        let client = hls_client().unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+
+        let dir_p = unique_temp_dir("seg-parallel");
+        std::fs::create_dir_all(&dir_p).unwrap();
+        let part_p = dir_p.join("movie.ts.part");
+        let reports: std::sync::Arc<Mutex<Vec<Progress>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let reports_c = reports.clone();
+        let n_p = download_segments(
+            &client,
+            &segments,
+            &part_p,
+            &None,
+            0,
+            &move |p| reports_c.lock().unwrap().push(p),
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(n_p as usize, expected.len());
+        assert_eq!(std::fs::read(&part_p).unwrap(), expected);
+
+        let dir_s = unique_temp_dir("seg-sequential");
+        std::fs::create_dir_all(&dir_s).unwrap();
+        let part_s = dir_s.join("movie.ts.part");
+        let n_s = download_segments_sequential(
+            &client,
+            &segments,
+            &part_s,
+            &None,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(n_s as usize, expected.len());
+        assert_eq!(std::fs::read(&part_s).unwrap(), expected);
+
+        // Progress: the last report shows all 8 pieces done and
+        // the estimate converged on the real total.
+        let reports = reports.lock().unwrap();
+        let last = reports.last().expect("at least one progress report");
+        assert_eq!(last.segments_done, Some(8));
+        assert_eq!(last.segments_total, Some(8));
+        assert_eq!(last.estimated_total, Some(expected.len() as u64));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir_p);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[test]
+    fn slow_trickle_segment_succeeds() {
+        // A slow-but-alive server (10 bytes every 100 ms) must
+        // still deliver the whole segment: the client timeout is
+        // a total budget, not a per-read deadline, and the stall
+        // watchdog only fires when NO segment completes.
+        let body = b"TRICKLE-SEGMENT-BODY-0123456789".to_vec();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) =
+            serve_trickle(body.clone(), 10, Duration::from_millis(100), stop.clone());
+        let dir = unique_temp_dir("seg-trickle");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let segments = vec![Segment {
+            url: format!("http://127.0.0.1:{port}/seg0.ts"),
+            range: None,
+        }];
+        let client = hls_client().unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let n = download_segments(
+            &client,
+            &segments,
+            &part,
+            &None,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(n as usize, body.len());
+        assert_eq!(std::fs::read(&part).unwrap(), body);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stalling_segment_fails_fast_with_timeout_reason() {
+        // Atlantic 2026-11-22, round 6: the first segment's body
+        // never arrives. With a short client timeout the run must
+        // fail after ONE try, quickly, saying "timed out" — not
+        // burn three long attempts behind a bare "error decoding
+        // response body".
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (port, server) = serve_stalled_body(1_000_000, Duration::from_secs(3), seen);
+        let dir = unique_temp_dir("seg-stall-fast");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let segments = vec![Segment {
+            url: format!("http://127.0.0.1:{port}/seg0.ts"),
+            range: None,
+        }];
+        let client = hls_client_with_timeout(Duration::from_secs(1)).unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let start = Instant::now();
+        let err = download_segments(
+            &client,
+            &segments,
+            &part,
+            &None,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(err.contains("timed out"), "error: {err}");
+        assert!(err.contains("after 1 try"), "error: {err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "fail-fast took {:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parallel_resume_skips_completed_segments() {
+        // A segment dir with a matching meta and two of four
+        // pieces already on disk: only the two missing pieces are
+        // fetched, and the assembled file is still the whole
+        // playlist in order.
+        let bodies: Vec<Vec<u8>> = (0..4)
+            .map(|i| format!("PIECE-{i}-").repeat(3).into_bytes())
+            .collect();
+        let mut files = HashMap::new();
+        for (i, b) in bodies.iter().enumerate() {
+            files.insert(format!("/seg{i}.ts"), b.clone());
+        }
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits.clone(), stop.clone());
+        let segments: Vec<Segment> = (0..4)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
+                range: None,
+            })
+            .collect();
+        let dir = unique_temp_dir("seg-resume");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        // Pre-seed pieces 0 and 2 as a crashed run left them.
+        let seg_dir = seg_dir_for(&part);
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        write_seg_meta(&seg_dir, &segments);
+        std::fs::write(seg_dir.join(seg_file_name(0)), &bodies[0]).unwrap();
+        std::fs::write(seg_dir.join(seg_file_name(2)), &bodies[2]).unwrap();
+        let client = hls_client().unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let n = download_segments(
+            &client,
+            &segments,
+            &part,
+            &None,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .unwrap();
+        let expected: Vec<u8> = bodies.concat();
+        assert_eq!(n as usize, expected.len());
+        assert_eq!(std::fs::read(&part).unwrap(), expected);
+        let mut got = hits.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(got, vec!["/seg1.ts".to_string(), "/seg3.ts".to_string()]);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hls_requests_send_browser_headers() {
+        // Round 6: the engine must announce itself as a current
+        // Chrome, not as FetchForge, and carry the page as
+        // Referer/Origin on manifest and segment fetches alike —
+        // CDNs that gate on browser-like requests (Atlantic's
+        // totallyacdn.cc) reject anything else.
+        let variant = "#EXTM3U\n#EXTINF:10,\nseg0.ts\n#EXTINF:10,\nseg1.ts\n#EXT-X-ENDLIST\n";
+        let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=640x360\nvar.m3u8\n";
+        let mut files = HashMap::new();
+        files.insert("/master.m3u8".to_string(), master.as_bytes().to_vec());
+        files.insert("/var.m3u8".to_string(), variant.as_bytes().to_vec());
+        files.insert("/seg0.ts".to_string(), b"SEGMENT-ZERO-".to_vec());
+        files.insert("/seg1.ts".to_string(), b"SEGMENT-ONE".to_vec());
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map_recording(files, seen.clone(), stop.clone());
+        let dir = unique_temp_dir("hls-headers");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let referer = Some("https://novahd.cc/watch/m/1368337".to_string());
+        let master_url = format!("http://127.0.0.1:{port}/master.m3u8");
+        let variant_url = format!("http://127.0.0.1:{port}/var.m3u8");
+        let out = download_hls_variant(
+            &master_url,
+            &variant_url,
+            &dir,
+            "movie.ts",
+            &referer,
+            None,
+            &|_| {},
+            &paused,
+            &cancelled,
+            None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"SEGMENT-ZERO-SEGMENT-ONE");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let seen = seen.lock().unwrap();
+        // Master, variant, and both segments: four requests, all
+        // browser-like.
+        assert_eq!(seen.len(), 4, "requests: {seen:?}");
+        for req in seen.iter() {
+            let lower = req.to_lowercase();
+            assert!(
+                req.contains("Chrome/142.0.0.0"),
+                "no Chrome UA in request: {req}"
+            );
+            assert!(
+                !lower.contains("fetchforge"),
+                "FetchForge UA leaked into request: {req}"
+            );
+            assert!(
+                lower.contains("accept-encoding: identity"),
+                "no identity encoding in request: {req}"
+            );
+            assert!(
+                lower.contains("referer: https://novahd.cc/watch/m/1368337"),
+                "no Referer in request: {req}"
+            );
+            assert!(
+                lower.contains("origin: https://novahd.cc"),
+                "no Origin in request: {req}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn estimate_total_bytes_matches_nime_sanity_check() {
+        // The nime download (2026-11-22): 3,321 pieces, ~1.5 GB.
+        // At 690 MB with 1,240 pieces done the estimate must land
+        // in the right neighbourhood, and it must stay silent
+        // until at least one piece has landed.
+        assert_eq!(estimate_total_bytes(0, 0, 3321), None);
+        assert_eq!(estimate_total_bytes(100, 5, 0), None);
+        assert_eq!(estimate_total_bytes(100, 2, 4), Some(200));
+        let est = estimate_total_bytes(690_000_000, 1240, 3321)
+            .expect("estimate once pieces have landed");
+        assert!(
+            (1_800_000_000..2_000_000_000).contains(&est),
+            "estimate {est} is not ~1.8 GB"
+        );
+    }
+
+    #[test]
+    fn captured_manifest_used_instead_of_fetch() {
+        // A signed playlist link may only work once: the extension
+        // captures the text from the player's own response, and the
+        // engine must use it instead of re-fetching the URL. Here
+        // the master URL 404s — the download still succeeds, and
+        // the server never sees a request for it.
+        let variant = "#EXTM3U\n#EXTINF:10,\nseg0.ts\n#EXTINF:10,\nseg1.ts\n#EXT-X-ENDLIST\n";
+        let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=640x360\nvar.m3u8\n";
+        let mut files = HashMap::new();
+        // NOTE: no /master.m3u8 — fetching it would 404.
+        files.insert("/var.m3u8".to_string(), variant.as_bytes().to_vec());
+        files.insert("/seg0.ts".to_string(), b"SEGMENT-ZERO-".to_vec());
+        files.insert("/seg1.ts".to_string(), b"SEGMENT-ONE".to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits.clone(), stop.clone());
+        let dir = unique_temp_dir("hls-captured");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let master_url = format!("http://127.0.0.1:{port}/master.m3u8");
+        let variant_url = format!("http://127.0.0.1:{port}/var.m3u8");
+        let captured = CapturedManifest {
+            url: master_url.clone(),
+            text: master.to_string(),
+        };
+        let out = download_hls_variant(
+            &master_url,
+            &variant_url,
+            &dir,
+            "movie.ts",
+            &None,
+            None,
+            &|_| {},
+            &paused,
+            &cancelled,
+            Some(&captured),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"SEGMENT-ZERO-SEGMENT-ONE");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let hits = hits.lock().unwrap();
+        assert!(
+            !hits.iter().any(|h| h == "/master.m3u8"),
+            "master was re-fetched: {hits:?}"
+        );
+        assert!(hits.iter().any(|h| h == "/var.m3u8"), "hits: {hits:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

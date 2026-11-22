@@ -10,9 +10,9 @@
 
 use fetchforge_engine::{
     category_for_filename, download, download_dash, download_gltf_bundle, download_hls_pair,
-    download_hls_variant, download_media, ensure_ffmpeg, ensure_image_extension,
-    fetch_gltf_plan, find_ytdlp, generate_download_id, is_gltf_url, is_image_content_type,
-    list_formats, plan_media_download_or_drive_fallback, probe, sanitize_filename, stop_reason,
+    download_hls_variant, download_media, ensure_ffmpeg, ensure_image_extension, fetch_gltf_plan,
+    find_ytdlp, generate_download_id, is_gltf_url, is_image_content_type, list_formats,
+    plan_media_download_or_drive_fallback, probe, sanitize_filename, stop_reason, CapturedManifest,
     DashDownloadOptions, DownloadOptions, DownloadRecord, GltfDownloadOptions,
     MediaDownloadOptions, MediaInfo, PlanOutcome, Status, Store,
 };
@@ -113,6 +113,16 @@ struct DetectedItem {
     audio_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     title: Option<String>,
+    /// The file's own name as the extension saw it (video file
+    /// name, PDF file name): the detector panel shows this when
+    /// there is no page title. Mirrors the bridge's field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filename: Option<String>,
+    /// A poster/thumbnail URL for a video: the detector panel
+    /// shows it like an image thumbnail. Mirrors the bridge's
+    /// field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    poster: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,6 +177,35 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Captured-manifest sidecars (round 6): the bridge saves playlist
+/// text the extension captured from the player's own response to
+/// `data_dir/manifests/<id>.m3u8` at add time, so a signed manifest
+/// link is never fetched twice. The desktop worker reads the same
+/// sidecar when it plans or runs a record the bridge added (a
+/// resume runs here, not in the bridge), and deletes it when the
+/// download reaches a terminal state. Saving lives in the bridge
+/// only — the desktop never receives manifest text. Mirrors the
+/// bridge's helpers; the file layout is shared.
+fn manifest_sidecar_path(data_dir: &std::path::Path, id: &str) -> PathBuf {
+    data_dir.join("manifests").join(format!("{id}.m3u8"))
+}
+
+fn read_manifest_sidecar(
+    data_dir: &std::path::Path,
+    id: &str,
+    url: &str,
+) -> Option<CapturedManifest> {
+    let text = std::fs::read_to_string(manifest_sidecar_path(data_dir, id)).ok()?;
+    Some(CapturedManifest {
+        url: url.to_string(),
+        text,
+    })
+}
+
+fn delete_manifest_sidecar(data_dir: &std::path::Path, id: &str) {
+    let _ = std::fs::remove_file(manifest_sidecar_path(data_dir, id));
 }
 
 fn data_dir() -> PathBuf {
@@ -338,6 +377,9 @@ fn failed_record(
         referer: None,
         audio_url: None,
         duplicate: false,
+        segments_total: None,
+        segments_done: 0,
+        estimated_total_bytes: None,
     };
     state.store.lock().unwrap().upsert(rec.clone());
     let _ = state.store.lock().unwrap().save();
@@ -407,7 +449,13 @@ fn try_gltf_download(
     // download for the same URL + filename is returned, never
     // queued twice.
     {
-        let store = state.store.lock().unwrap();
+        let mut store = state.store.lock().unwrap();
+        // Fresh disk state before the duplicate check: the bridge
+        // may have cleared this record since this process last
+        // loaded — a stale in-memory match would return a download
+        // the user already removed instead of queueing the new one
+        // (2026-11-22 incident).
+        store.reload_from_disk();
         if let Some(mut existing) =
             store.find_duplicate(clean_url, &record_filename, &state.download_dir.to_string_lossy())
         {
@@ -442,6 +490,9 @@ fn try_gltf_download(
         referer: None,
         audio_url: None,
         duplicate: false,
+        segments_total: None,
+        segments_done: 0,
+        estimated_total_bytes: None,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -481,7 +532,11 @@ fn try_media_download(
     // planning, when the resolved URL and planned filename are
     // known.
     {
-        let store = state.store.lock().unwrap();
+        let mut store = state.store.lock().unwrap();
+        // Fresh disk state before the duplicate check (see the
+        // glTF add above): a record the bridge cleared must not
+        // match from stale memory.
+        store.reload_from_disk();
         if let Some(mut existing) =
             store.find_duplicate(clean_url, &provisional, &state.download_dir.to_string_lossy())
         {
@@ -515,6 +570,9 @@ fn try_media_download(
         referer,
         audio_url,
         duplicate: false,
+        segments_total: None,
+        segments_done: 0,
+        estimated_total_bytes: None,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -550,12 +608,18 @@ fn plan_pending_download(
     } else {
         Some(rec.filename.as_str())
     };
+    // Captured playlist text (extension sends only, saved by the
+    // bridge at add time): the plan fetch is the FIRST fetch of
+    // the manifest, so it must use the capture — a single-use
+    // signed link consumed here would fail again at run time.
+    let captured = read_manifest_sidecar(&state.data_dir, &id, &rec.url);
     let outcome = plan_media_download_or_drive_fallback(
         &state.data_dir,
         &rec.url,
         rec.format_id.as_deref(),
         filename_arg,
         &rec.referer,
+        captured.as_ref(),
     );
     if job.cancelled.load(Ordering::Relaxed) {
         set_status(state, &id, Status::Cancelled, None);
@@ -590,6 +654,13 @@ fn plan_pending_download(
                 .clone()
                 .unwrap_or_else(|| rec.url.clone());
             let mut store = state.store.lock().unwrap();
+            // Fresh disk state before the plan-time duplicate
+            // check: the removal below must only fire when the
+            // matched record is CONFIRMED still on disk (same
+            // 2026-11-22 incident as the bridge: a new download
+            // vanished when the plan matched a cleared clip in
+            // stale memory).
+            store.reload_from_disk();
             if store
                 .find_duplicate_except(
                     &record_url,
@@ -601,6 +672,11 @@ fn plan_pending_download(
             {
                 store.remove(&id);
                 let _ = store.save();
+                drop(store);
+                // The record is gone, so its sidecar is orphaned
+                // — delete it (set_status never runs for a removed
+                // record).
+                delete_manifest_sidecar(&state.data_dir, &id);
                 return Ok(None);
             }
             let mut updated = match store.get(&id) {
@@ -616,6 +692,10 @@ fn plan_pending_download(
             updated.format_selector = Some(plan.selector);
             updated.stream_kind = plan.stream_kind.map(|k| k.as_str().to_string());
             updated.audio_url = paired_audio;
+            // HLS/DASH only: the manifest's segment count, so the
+            // UI can show "0 / N pieces" before the first segment
+            // lands. yt-dlp plans carry None.
+            updated.segments_total = plan.segments_total;
             updated.updated_unix = now_unix();
             store.upsert(updated.clone());
             let _ = store.save();
@@ -676,7 +756,11 @@ fn queue_direct_download(
     // `clean` is moved into the new record below, so the same value
     // is never used after a move (E0382 fix).
     {
-        let store = state.store.lock().unwrap();
+        let mut store = state.store.lock().unwrap();
+        // Fresh disk state before the duplicate check (see the
+        // glTF add above): a record the bridge cleared must not
+        // match from stale memory.
+        store.reload_from_disk();
         if let Some(mut existing) =
             store.find_duplicate(&clean, &filename, &state.download_dir.to_string_lossy())
         {
@@ -709,6 +793,9 @@ fn queue_direct_download(
         referer,
         audio_url: None,
         duplicate: false,
+        segments_total: None,
+        segments_done: 0,
+        estimated_total_bytes: None,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -746,6 +833,18 @@ async fn media_formats(
 }
 
 fn set_status(state: &Arc<State>, id: &str, status: Status, error: Option<String>) {
+    // Terminal state (Completed/Failed/Cancelled): the captured
+    // manifest sidecar is no longer needed — a resume re-plans
+    // from the stored format, and a finished download never
+    // fetches its manifest again. Paused keeps the sidecar: a
+    // resume re-fetches the manifest, and a single-use signed
+    // link still needs the capture. Mirrors the bridge's
+    // set_status. (Status is not Copy, so the check runs before
+    // the move into the record.)
+    let terminal = matches!(
+        status,
+        Status::Completed | Status::Failed | Status::Cancelled
+    );
     let mut store = state.store.lock().unwrap();
     if let Some(mut r) = store.get(id).cloned() {
         r.status = status;
@@ -755,6 +854,10 @@ fn set_status(state: &Arc<State>, id: &str, status: Status, error: Option<String
         r.updated_unix = now_unix();
         store.upsert(r);
         let _ = store.save();
+    }
+    drop(store);
+    if terminal {
+        delete_manifest_sidecar(&state.data_dir, id);
     }
 }
 
@@ -834,6 +937,19 @@ fn run_download(state: &Arc<State>, id: &str, job: &Job) {
         if let Some(mut r) = store.get(&id2).cloned() {
             r.downloaded_bytes = p.downloaded;
             r.total_bytes = p.total.or(r.total_bytes);
+            // Segment progress (HLS/DASH only): only overwrite when
+            // the report carries a value — yt-dlp and direct
+            // downloads report None here, and must never wipe
+            // the plan-time segment count.
+            if let Some(d) = p.segments_done {
+                r.segments_done = d;
+            }
+            if let Some(t) = p.segments_total {
+                r.segments_total = Some(t);
+            }
+            if let Some(e) = p.estimated_total {
+                r.estimated_total_bytes = Some(e);
+            }
             r.updated_unix = now_unix();
             store.upsert(r);
             let _ = store.save();
@@ -913,6 +1029,19 @@ fn run_media_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
         if let Some(mut r) = store.get(&id2).cloned() {
             r.downloaded_bytes = p.downloaded;
             r.total_bytes = p.total.or(r.total_bytes);
+            // Segment progress (HLS/DASH only): only overwrite when
+            // the report carries a value — yt-dlp and direct
+            // downloads report None here, and must never wipe
+            // the plan-time segment count.
+            if let Some(d) = p.segments_done {
+                r.segments_done = d;
+            }
+            if let Some(t) = p.segments_total {
+                r.segments_total = Some(t);
+            }
+            if let Some(e) = p.estimated_total {
+                r.estimated_total_bytes = Some(e);
+            }
             r.updated_unix = now_unix();
             store.upsert(r);
             let _ = store.save();
@@ -986,6 +1115,19 @@ fn run_stream_hls_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) 
         if let Some(mut r) = store.get(&id2).cloned() {
             r.downloaded_bytes = p.downloaded;
             r.total_bytes = p.total.or(r.total_bytes);
+            // Segment progress (HLS/DASH only): only overwrite when
+            // the report carries a value — yt-dlp and direct
+            // downloads report None here, and must never wipe
+            // the plan-time segment count.
+            if let Some(d) = p.segments_done {
+                r.segments_done = d;
+            }
+            if let Some(t) = p.segments_total {
+                r.segments_total = Some(t);
+            }
+            if let Some(e) = p.estimated_total {
+                r.estimated_total_bytes = Some(e);
+            }
             r.updated_unix = now_unix();
             store.upsert(r);
             let _ = store.save();
@@ -995,7 +1137,10 @@ fn run_stream_hls_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) 
     // audio sibling, no master): download both tracks and merge
     // them. Otherwise the normal variant path, with the page
     // Referer on every manifest/segment request. Mirrors the
-    // bridge's run_stream_hls.
+    // bridge's run_stream_hls. The captured manifest (extension
+    // sends only) is used for whichever fetch its URL matches, so
+    // a single-use signed link is never re-fetched here.
+    let captured = read_manifest_sidecar(&state.data_dir, &id, &rec.url);
     let result = match &rec.audio_url {
         Some(audio_uri) => {
             let ffmpeg = match &ffmpeg {
@@ -1020,6 +1165,7 @@ fn run_stream_hls_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) 
                 &progress,
                 &job.paused,
                 &job.cancelled,
+                captured.as_ref(),
             )
         }
         None => download_hls_variant(
@@ -1032,6 +1178,7 @@ fn run_stream_hls_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) 
             &progress,
             &job.paused,
             &job.cancelled,
+            captured.as_ref(),
         ),
     };
     match result {
@@ -1091,6 +1238,19 @@ fn run_stream_dash_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job)
         if let Some(mut r) = store.get(&id2).cloned() {
             r.downloaded_bytes = p.downloaded;
             r.total_bytes = p.total.or(r.total_bytes);
+            // Segment progress (HLS/DASH only): only overwrite when
+            // the report carries a value — yt-dlp and direct
+            // downloads report None here, and must never wipe
+            // the plan-time segment count.
+            if let Some(d) = p.segments_done {
+                r.segments_done = d;
+            }
+            if let Some(t) = p.segments_total {
+                r.segments_total = Some(t);
+            }
+            if let Some(e) = p.estimated_total {
+                r.estimated_total_bytes = Some(e);
+            }
             r.updated_unix = now_unix();
             store.upsert(r);
             let _ = store.save();
@@ -1102,6 +1262,7 @@ fn run_stream_dash_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job)
         &progress,
         &job.paused,
         &job.cancelled,
+        read_manifest_sidecar(&state.data_dir, &id, &rec.url).as_ref(),
     ) {
         Ok(final_path) => {
             let mut store = state.store.lock().unwrap();
@@ -1160,6 +1321,19 @@ fn run_gltf_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
         if let Some(mut r) = store.get(&id2).cloned() {
             r.downloaded_bytes = p.downloaded;
             r.total_bytes = p.total.or(r.total_bytes);
+            // Segment progress (HLS/DASH only): only overwrite when
+            // the report carries a value — yt-dlp and direct
+            // downloads report None here, and must never wipe
+            // the plan-time segment count.
+            if let Some(d) = p.segments_done {
+                r.segments_done = d;
+            }
+            if let Some(t) = p.segments_total {
+                r.segments_total = Some(t);
+            }
+            if let Some(e) = p.estimated_total {
+                r.estimated_total_bytes = Some(e);
+            }
             r.updated_unix = now_unix();
             store.upsert(r);
             let _ = store.save();
@@ -1391,6 +1565,44 @@ async fn pair_status(state: tauri::State<'_, Arc<State>>) -> Result<PairStatus, 
     serde_json::from_str(&body).map_err(|e| format!("Bridge returned bad JSON ({e})"))
 }
 
+/// What the bridge's POST /cache/clear returns: how many cached
+/// files were removed and how many bytes that freed. Serialized
+/// back to the frontend as {"removed_files": N, "freed_bytes": N}.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ClearCacheResult {
+    removed_files: usize,
+    freed_bytes: u64,
+}
+
+// Async so the blocking loopback call runs off the IPC thread (see
+// pair_browser). Forwards to the bridge, which owns the detector
+// list (memory + detected.json). Detector items only — downloads
+// and history are never touched. Returns how many items were
+// removed.
+#[tauri::command]
+async fn clear_detected_media(state: tauri::State<'_, Arc<State>>) -> Result<usize, String> {
+    let token = read_bridge_token(&state.data_dir)?;
+    let body = bridge_post(&state.data_dir, &token, "/media/detected/clear")?;
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Bridge returned bad JSON ({e})"))?;
+    v.get("removed")
+        .and_then(|n| n.as_u64())
+        .map(|n| n as usize)
+        .ok_or_else(|| "Bridge did not return a removed count.".to_string())
+}
+
+// Async so the blocking loopback call runs off the IPC thread (see
+// pair_browser). Forwards to the bridge, which clears temp/segment
+// cache files and the detector store. Downloaded files, the
+// download list and history are never touched (see the bridge's
+// clear_cache).
+#[tauri::command]
+async fn clear_cache(state: tauri::State<'_, Arc<State>>) -> Result<ClearCacheResult, String> {
+    let token = read_bridge_token(&state.data_dir)?;
+    let body = bridge_post(&state.data_dir, &token, "/cache/clear")?;
+    serde_json::from_str(&body).map_err(|e| format!("Bridge returned bad JSON ({e})"))
+}
+
 fn main() {
     let dir = data_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -1416,6 +1628,8 @@ fn main() {
             add_download,
             media_formats,
             list_detected_media,
+            clear_detected_media,
+            clear_cache,
             pause_download,
             resume_download,
             cancel_download,

@@ -787,7 +787,7 @@ fn list_formats_with_fallback(
 /// stream lists its qualities even with no yt-dlp installed.
 pub fn list_formats(data_dir: &Path, url: &str) -> Result<MediaInfo, String> {
     if crate::media::is_manifest_url(url) {
-        let info = crate::media::list_stream_formats(url)?;
+        let info = crate::media::list_stream_formats(url, &None, None)?;
         return Ok(stream_info_to_media_info(&info));
     }
     let ytdlp = ensure_ytdlp(data_dir)?;
@@ -997,6 +997,233 @@ pub fn find_embedded_media_urls(html: &str, page_url: &str) -> Vec<String> {
     manifests
 }
 
+/// A direct-file candidate's probe result: its duration in seconds
+/// (known only for faststart .mp4, where the moov box sits in the
+/// fetched prefix) and its total size in bytes (known when the
+/// server reports it). Either may be unknown — unknown means "cannot
+/// prove it is short", never "short".
+struct DirectProbe {
+    duration_secs: Option<u64>,
+    total_bytes: Option<u64>,
+}
+
+/// A direct-file candidate is an ad/pre-roll clip, not the film,
+/// when its duration is known and under this: a 15–30 s pre-roll
+/// (novahd's "NOVA Members" ad, 2026-11-22) must never be the
+/// fallback's answer while a longer candidate exists, and a page
+/// with only such clips fails loudly instead of queueing an ad.
+const HTML_FALLBACK_MIN_DURATION_SECS: u64 = 60;
+/// How much of a candidate file the duration probe reads: enough
+/// for a faststart moov box (usually a few KB), never the whole
+/// file — a 1.5 GB film must not be downloaded to measure it.
+const HTML_FALLBACK_PROBE_PREFIX_BYTES: u64 = 65536;
+/// At most this many direct-file candidates are probed per page:
+/// each probe is a network round trip, and the fallback is already
+/// the slow path (yt-dlp failed first). Unprobed candidates keep
+/// document order after the probed ones.
+const HTML_FALLBACK_MAX_PROBES: usize = 6;
+/// Per-probe timeout: a hanging CDN must not stall planning for
+/// minutes. Six probes at worst 5 s each bounds the probe phase
+/// at ~30 s.
+const HTML_FALLBACK_PROBE_TIMEOUT_SECS: u64 = 5;
+
+/// Duration of an .mp4 file from its first bytes: walk the top-level
+/// boxes to `moov`, then to `mvhd`, and read timescale + duration.
+/// Returns None when the moov box is not in the prefix (not a
+/// faststart file — the duration lives at the END of the file, which
+/// this probe deliberately never fetches), when the data is not an
+/// .mp4 at all, or when any box is truncated. None is "unknown",
+/// never "short".
+fn mp4_duration_secs(prefix: &[u8]) -> Option<u64> {
+    fn u32be(b: &[u8]) -> u32 {
+        u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+    }
+    fn u64be(b: &[u8]) -> u64 {
+        u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+    }
+    // Walk top-level boxes; each is size(4) + type(4) + payload.
+    let mut off = 0usize;
+    while off + 8 <= prefix.len() {
+        let size = u32be(&prefix[off..off + 4]) as usize;
+        let typ = &prefix[off + 4..off + 8];
+        // size 0 = "to end of file"; size 1 = 64-bit largesize,
+        // which this minimal parser does not follow (rare in
+        // practice; the file is then simply "unknown duration").
+        let (box_end, header) = match size {
+            0 => (prefix.len(), 8),
+            1 => return None,
+            s => (off.saturating_add(s).min(prefix.len()), 8),
+        };
+        if typ == b"moov" {
+            // Walk moov's children for mvhd.
+            let mut inner = off + header;
+            while inner + 8 <= box_end {
+                let isize = u32be(&prefix[inner..inner + 4]) as usize;
+                let ityp = &prefix[inner + 4..inner + 8];
+                let iend = inner.saturating_add(isize).min(box_end);
+                if ityp == b"mvhd" {
+                    let mvhd = &prefix[inner + 8..iend];
+                    if mvhd.is_empty() {
+                        return None;
+                    }
+                    return match mvhd[0] {
+                        // v0: version/flags(4) creation(4)
+                        // modification(4) timescale(4) duration(4).
+                        0 => {
+                            if mvhd.len() < 20 {
+                                return None;
+                            }
+                            let timescale = u32be(&mvhd[12..16]) as u64;
+                            let duration = u32be(&mvhd[16..20]) as u64;
+                            if timescale == 0 {
+                                None
+                            } else {
+                                Some(duration / timescale)
+                            }
+                        }
+                        // v1: version/flags(4) creation(8)
+                        // modification(8) timescale(4) duration(8).
+                        1 => {
+                            if mvhd.len() < 32 {
+                                return None;
+                            }
+                            let timescale = u32be(&mvhd[20..24]) as u64;
+                            let duration = u64be(&mvhd[24..32]);
+                            if timescale == 0 {
+                                None
+                            } else {
+                                Some(duration / timescale)
+                            }
+                        }
+                        _ => None,
+                    };
+                }
+                if isize < 8 {
+                    return None;
+                }
+                inner = iend;
+            }
+            return None;
+        }
+        if size < 8 {
+            return None;
+        }
+        off = box_end;
+    }
+    None
+}
+
+/// Total size from a `Content-Range: bytes 0-65535/<total>` header.
+fn parse_content_range_total(header: &str) -> Option<u64> {
+    header
+        .rsplit('/')
+        .next()
+        .and_then(|total| total.trim().parse::<u64>().ok())
+}
+
+/// Probe one direct-file candidate: fetch at most the first 64 KB
+/// (a Range request; servers that ignore Range still only cost us
+/// the capped read) and measure its duration (faststart .mp4 only)
+/// and total size. Any failure — network, timeout, unparseable —
+/// yields an unknown probe, never an error: the fallback must not
+/// die because one candidate could not be measured.
+fn probe_direct_file(client: &reqwest::blocking::Client, url: &str) -> DirectProbe {
+    let unknown = DirectProbe {
+        duration_secs: None,
+        total_bytes: None,
+    };
+    let Ok(mut resp) = client
+        .get(url)
+        .header(
+            "Range",
+            format!("bytes=0-{}", HTML_FALLBACK_PROBE_PREFIX_BYTES - 1),
+        )
+        .header("Accept-Encoding", "identity")
+        .send()
+    else {
+        return unknown;
+    };
+    if !resp.status().is_success() {
+        return unknown;
+    }
+    // Total size: a 206 answers with Content-Range; a 200 (server
+    // ignored the Range) answers with the full Content-Length.
+    let total_bytes = if resp.status().as_u16() == 206 {
+        resp.headers()
+            .get("Content-Range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_content_range_total)
+    } else {
+        resp.headers()
+            .get("Content-Length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    let mut prefix = Vec::new();
+    if resp
+        .take(HTML_FALLBACK_PROBE_PREFIX_BYTES)
+        .read_to_end(&mut prefix)
+        .is_err()
+    {
+        return DirectProbe {
+            duration_secs: None,
+            total_bytes,
+        };
+    }
+    let duration_secs = if url.to_ascii_lowercase().contains(".mp4") {
+        mp4_duration_secs(&prefix)
+    } else {
+        None
+    };
+    DirectProbe {
+        duration_secs,
+        total_bytes,
+    }
+}
+
+/// Rank direct-file candidates longest-first: known duration
+/// descending, then unknown duration by size descending (size is
+/// the duration proxy when the moov box cannot be read), then
+/// document order. Probes at most the first few candidates; the
+/// rest keep document order after them, unprobed (unknown duration
+/// and size). Returns (url, probe) pairs in try order.
+fn rank_direct_candidates(
+    client: &reqwest::blocking::Client,
+    urls: &[String],
+) -> Vec<(String, DirectProbe)> {
+    let mut ranked: Vec<(String, DirectProbe, usize)> = Vec::with_capacity(urls.len());
+    for (i, url) in urls.iter().enumerate() {
+        let probe = if i < HTML_FALLBACK_MAX_PROBES {
+            probe_direct_file(client, url)
+        } else {
+            DirectProbe {
+                duration_secs: None,
+                total_bytes: None,
+            }
+        };
+        ranked.push((url.clone(), probe, i));
+    }
+    // Known-long first (duration desc), then unknown (size desc),
+    // then known-short (duration desc — tried only when nothing
+    // longer exists, and the caller refuses those outright).
+    ranked.sort_by(|a, b| {
+        let rank = |p: &DirectProbe| match p.duration_secs {
+            Some(d) if d >= HTML_FALLBACK_MIN_DURATION_SECS => 0,
+            None => 1,
+            Some(_) => 2,
+        };
+        rank(&a.1)
+            .cmp(&rank(&b.1))
+            .then(b.1.duration_secs.unwrap_or(0).cmp(&a.1.duration_secs.unwrap_or(0)))
+            .then(b.1.total_bytes.unwrap_or(0).cmp(&a.1.total_bytes.unwrap_or(0)))
+            .then(a.2.cmp(&b.2))
+    });
+    ranked
+        .into_iter()
+        .map(|(url, probe, _)| (url, probe))
+        .collect()
+}
+
 /// HTML fallback for a page yt-dlp cannot read: fetch the page, scan
 /// for embedded stream/file URLs, and extract the first one that
 /// lists formats. Returns None when the page has no embedded media
@@ -1009,21 +1236,90 @@ pub fn find_embedded_media_urls(html: &str, page_url: &str) -> Vec<String> {
 /// doesn't, and re-fetching it as HTML would only download media
 /// bytes). The returned MediaInfo carries `resolved_url` so the
 /// planner routes the worker to the found URL.
+///
+/// Ranking: manifests first (the real stream), then direct files
+/// longest-first by probed duration/size. A known-short clip
+/// (under 60 s) is NEVER the answer while a longer or unknown
+/// candidate exists; when the page holds only short clips the plan
+/// FAILS with a clear reason instead of silently queueing an ad.
 fn try_html_embedded_fallback(ytdlp: &Path, page_url: &str) -> Option<Result<MediaInfo, String>> {
     let html = fetch_page_html(page_url).ok()?;
     let candidates = find_embedded_media_urls(&html, page_url);
     if candidates.is_empty() {
         return None;
     }
+    // Manifests first (already ordered by find_embedded_media_urls):
+    // the first that lists wins.
     let mut last_err: Option<String> = None;
-    for candidate in &candidates {
-        let attempt: Result<MediaInfo, String> = if crate::media::is_manifest_url(candidate) {
-            crate::media::list_stream_formats(candidate)
-                .map(|info| stream_info_to_media_info(&info))
-        } else {
-            list_formats_with_fallback(ytdlp, candidate, false)
-        };
-        match attempt {
+    for candidate in candidates.iter().filter(|u| crate::media::is_manifest_url(u)) {
+        match crate::media::list_stream_formats(candidate, &None, None)
+            .map(|info| stream_info_to_media_info(&info))
+        {
+            Ok(mut info) => {
+                info.resolved_url = Some(candidate.clone());
+                return Some(Ok(info));
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let files: Vec<String> = candidates
+        .iter()
+        .filter(|u| !crate::media::is_manifest_url(u))
+        .cloned()
+        .collect();
+    if files.is_empty() {
+        return Some(Err(last_err.unwrap_or_else(|| {
+            "No downloadable video was found on this page.".to_string()
+        })));
+    }
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(crate::media::BROWSER_USER_AGENT)
+        .timeout(Duration::from_secs(HTML_FALLBACK_PROBE_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .ok();
+    let ranked = match &client {
+        Some(c) => rank_direct_candidates(c, &files),
+        // No probe client (should not happen): try in document
+        // order with unknown probes — the old behaviour, kept as
+        // a safe fallback rather than failing the whole plan.
+        None => files
+            .iter()
+            .map(|u| {
+                (
+                    u.clone(),
+                    DirectProbe {
+                        duration_secs: None,
+                        total_bytes: None,
+                    },
+                )
+            })
+            .collect(),
+    };
+    // Long candidates (known >= 60 s, or duration unknown) are the
+    // only ones ever tried. Known-short clips are skipped outright
+    // while any long candidate exists; when NOTHING long exists the
+    // page holds only ad clips, and the plan fails loudly.
+    let has_long = ranked.iter().any(|(_, p)| {
+        p.duration_secs
+            .map_or(true, |d| d >= HTML_FALLBACK_MIN_DURATION_SECS)
+    });
+    if !has_long {
+        return Some(Err(
+            "Only short clips were found on this page (each under a minute long) — \
+            the full video could not be found, so nothing was downloaded."
+                .to_string(),
+        ));
+    }
+    for (candidate, probe) in &ranked {
+        if probe
+            .duration_secs
+            .map_or(false, |d| d < HTML_FALLBACK_MIN_DURATION_SECS)
+        {
+            continue;
+        }
+        match list_formats_with_fallback(ytdlp, candidate, false) {
             Ok(mut info) => {
                 info.resolved_url = Some(candidate.clone());
                 return Some(Ok(info));
@@ -1148,6 +1444,12 @@ pub struct MediaPlan {
     /// fallback resolved the page to an embedded stream/file URL:
     /// the record URL and the worker input both use this value.
     pub effective_url: Option<String>,
+    /// HLS/DASH downloads only: how many segments the manifest
+    /// lists (from [`crate::media::StreamInfo::segment_count`]).
+    /// The worker stores it in the record so the UI can show
+    /// "0 / N pieces" before the first segment lands. None for
+    /// yt-dlp downloads and when the count could not be determined.
+    pub segments_total: Option<u64>,
 }
 
 fn stem_for_title(title: &str) -> String {
@@ -1179,9 +1481,11 @@ pub fn plan_media_download(
     url: &str,
     format_id: Option<&str>,
     filename: Option<&str>,
+    referer: &Option<String>,
+    captured: Option<&crate::media::CapturedManifest>,
 ) -> Result<MediaPlan, String> {
     if crate::media::is_manifest_url(url) {
-        return plan_stream_download(url, format_id, filename);
+        return plan_stream_download(url, format_id, filename, referer, captured);
     }
     let info = list_formats(data_dir, url)?;
     plan_from_info(&info, format_id, filename)
@@ -1194,12 +1498,15 @@ fn plan_stream_download(
     url: &str,
     format_id: Option<&str>,
     filename: Option<&str>,
+    referer: &Option<String>,
+    captured: Option<&crate::media::CapturedManifest>,
 ) -> Result<MediaPlan, String> {
-    let info = crate::media::list_stream_formats(url)?;
+    let info = crate::media::list_stream_formats(url, referer, captured)?;
     let media = stream_info_to_media_info(&info);
     let mut plan = plan_from_info(&media, format_id, filename)?;
     plan.stream_kind = Some(info.kind);
     plan.selector = String::new();
+    plan.segments_total = info.segment_count;
     Ok(plan)
 }
 
@@ -1226,15 +1533,20 @@ pub enum PlanOutcome {
 /// saved as a download). Any other failure returns the extraction
 /// error unchanged. The worker calls this (planning runs in the
 /// worker, not in the add request, so a slow extraction never
-/// blocks the button's confirmation).
+/// blocks the button's confirmation). `captured` is playlist text
+/// the extension captured from the player's own response (see
+/// [`crate::media::CapturedManifest`]): for a manifest URL it is
+/// used instead of re-fetching a signed link that may only work
+/// once.
 pub fn plan_media_download_or_drive_fallback(
     data_dir: &Path,
     url: &str,
     format_id: Option<&str>,
     filename: Option<&str>,
     referer: &Option<String>,
+    captured: Option<&crate::media::CapturedManifest>,
 ) -> Result<PlanOutcome, String> {
-    match plan_media_download(data_dir, url, format_id, filename) {
+    match plan_media_download(data_dir, url, format_id, filename, referer, captured) {
         Ok(plan) => Ok(PlanOutcome::Media(plan)),
         Err(e) => {
             if let Some(file_id) = drive_file_id(url) {
@@ -1334,6 +1646,9 @@ fn plan_from_info(
         // resolved URL, not the page. Normal extraction leaves
         // this None.
         effective_url: info.resolved_url.clone(),
+        // yt-dlp downloads have no segment list; stream plans set
+        // this from the manifest (see plan_stream_download).
+        segments_total: None,
     };
     // A resolved manifest is routed to the stream engine (empty
     // yt-dlp selector, stream_kind set) exactly as if the user had
@@ -1535,6 +1850,9 @@ impl ProgressTracker {
             downloaded,
             total,
             bytes_per_sec: speed,
+            segments_done: None,
+            segments_total: None,
+            estimated_total: None,
         }
     }
 }
@@ -2050,6 +2368,20 @@ mod tests {
     }
 
     #[test]
+    fn plan_from_info_sanitises_caller_filename_for_windows() {
+        let info = parse_media_info(&youtube_json(), "https://example.com").unwrap();
+        // Round 6: the extension passes the page title as the caller
+        // filename ("The Odyssey (2026)" instead of the manifest
+        // stem "index_287.ts"). Windows-forbidden characters are
+        // replaced, trailing dots are trimmed, and the extension
+        // still comes from the chosen format.
+        let plan = plan_from_info(&info, Some("22"), Some("The Odyssey (2026): A Film?")).unwrap();
+        assert_eq!(plan.filename, "The Odyssey (2026)_ A Film_.mp4");
+        let plan = plan_from_info(&info, Some("22"), Some("The Odyssey (2026)...")).unwrap();
+        assert_eq!(plan.filename, "The Odyssey (2026).mp4");
+    }
+
+    #[test]
     fn parses_progress_lines_and_sizes() {
         let (pct, total, speed) =
             parse_progress_line("[download]  54.4% of  939.19KiB at    1.34MiB/s ETA 00:00").unwrap();
@@ -2303,6 +2635,185 @@ mod tests {
         assert_eq!(urls, vec!["https://example.com/v/ok.mp4".to_string()]);
     }
 
+    /// Minimal faststart .mp4: ftyp + moov(mvhd) with the given
+    /// timescale/duration, then `pad` zero bytes. The bodies are
+    /// headers, not real media — enough for the duration probe and
+    /// for size ranking via Content-Length.
+    fn mp4_bytes(timescale: u32, duration: u32, version: u8, pad: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        // ftyp box: size 24.
+        out.extend_from_slice(&24u32.to_be_bytes());
+        out.extend_from_slice(b"ftyp");
+        out.extend_from_slice(b"isom");
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(b"isomiso2");
+        // mvhd box (offsets below are box-relative: the 8-byte
+        // header precedes the version field the parser reads).
+        let mvhd_len = if version == 1 { 120 } else { 108 };
+        let mut mvhd = vec![0u8; mvhd_len];
+        mvhd[0..4].copy_from_slice(&(mvhd_len as u32).to_be_bytes());
+        mvhd[4..8].copy_from_slice(b"mvhd");
+        mvhd[8] = version;
+        if version == 0 {
+            mvhd[20..24].copy_from_slice(&timescale.to_be_bytes());
+            mvhd[24..28].copy_from_slice(&duration.to_be_bytes());
+        } else {
+            mvhd[28..32].copy_from_slice(&timescale.to_be_bytes());
+            mvhd[32..40].copy_from_slice(&(duration as u64).to_be_bytes());
+        }
+        // moov box: size 8 + mvhd.
+        let moov_len = 8 + mvhd_len;
+        out.extend_from_slice(&(moov_len as u32).to_be_bytes());
+        out.extend_from_slice(b"moov");
+        out.extend_from_slice(&mvhd);
+        out.resize(out.len() + pad, 0);
+        out
+    }
+
+    #[test]
+    fn mp4_duration_secs_reads_mvhd_v0_and_v1() {
+        assert_eq!(mp4_duration_secs(&mp4_bytes(1000, 15000, 0, 0)), Some(15));
+        assert_eq!(
+            mp4_duration_secs(&mp4_bytes(90000, 6480000, 1, 0)),
+            Some(72)
+        );
+        // Not an mp4 at all.
+        assert_eq!(mp4_duration_secs(b"this is not a video file"), None);
+        // Empty / truncated.
+        assert_eq!(mp4_duration_secs(&[]), None);
+        let full = mp4_bytes(1000, 15000, 0, 0);
+        assert_eq!(mp4_duration_secs(&full[..20]), None);
+        // Timescale zero: division would be meaningless.
+        assert_eq!(mp4_duration_secs(&mp4_bytes(0, 15000, 0, 0)), None);
+        // moov present but no mvhd inside: unknown, not short.
+        let mut no_mvhd = Vec::new();
+        no_mvhd.extend_from_slice(&24u32.to_be_bytes());
+        no_mvhd.extend_from_slice(b"ftyp");
+        no_mvhd.extend_from_slice(b"isom");
+        no_mvhd.extend_from_slice(&0u32.to_be_bytes());
+        no_mvhd.extend_from_slice(b"isomiso2");
+        no_mvhd.extend_from_slice(&24u32.to_be_bytes());
+        no_mvhd.extend_from_slice(b"moov");
+        no_mvhd.extend_from_slice(&16u32.to_be_bytes());
+        no_mvhd.extend_from_slice(b"free");
+        no_mvhd.extend_from_slice(&[0u8; 8]);
+        assert_eq!(mp4_duration_secs(&no_mvhd), None);
+    }
+
+    #[test]
+    fn content_range_total_parses() {
+        assert_eq!(
+            parse_content_range_total("bytes 0-65535/1234567"),
+            Some(1234567)
+        );
+        assert_eq!(parse_content_range_total("bytes 0-99/*"), None);
+        assert_eq!(parse_content_range_total("garbage"), None);
+    }
+
+    /// Stub yt-dlp that "lists" any URL (prints the canned YouTube
+    /// info JSON), so the fallback tests measure CANDIDATE CHOICE,
+    /// not extraction: whichever candidate is tried first wins.
+    fn permissive_stub_ytdlp(dir: &Path) -> PathBuf {
+        let json_path = dir.join("info.json");
+        std::fs::write(&json_path, serde_json::to_string(&youtube_json()).unwrap()).unwrap();
+        write_stub_ytdlp(
+            dir,
+            "fake-yt-dlp",
+            &format!(
+                "#!/bin/sh\ncat \"{}\"\n",
+                json_path.to_string_lossy().replace('\\', "\\\\")
+            ),
+            &format!(
+                "[Console]::Out.Write([IO.File]::ReadAllText('{}'))\n",
+                json_path.to_string_lossy().replace('\'', "''")
+            ),
+        )
+    }
+
+    #[test]
+    fn html_fallback_prefers_longest_file_over_ad_clips() {
+        // 2026-11-22 novahd: the page HTML holds /assets/p/*.mp4 ad
+        // clips (15–30 s) and the film file. The old code took the
+        // FIRST .mp4 (an ad); the fallback must now take the
+        // longest. The clips come FIRST in the document and the
+        // film LAST, so document order cannot win by accident; all
+        // files are the same size, so duration alone decides.
+        let dir = unique_temp_dir("fallback-longest");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = permissive_stub_ytdlp(&dir);
+        let mut media = std::collections::HashMap::new();
+        media.insert("/ad1.mp4".to_string(), mp4_bytes(1000, 15000, 0, 100));
+        media.insert("/ad2.mp4".to_string(), mp4_bytes(1000, 30000, 0, 100));
+        media.insert("/ad3.mp4".to_string(), mp4_bytes(1000, 30000, 0, 100));
+        media.insert("/film.mp4".to_string(), mp4_bytes(1000, 7200000, 0, 100));
+        let stop_media = std::sync::Arc::new(AtomicBool::new(false));
+        let (media_port, media_server) = serve_files(media, stop_media.clone());
+        let page = format!(
+            "<html><body>\
+            <video src=\"http://127.0.0.1:{media_port}/ad1.mp4\"></video>\
+            <video src=\"http://127.0.0.1:{media_port}/ad2.mp4\"></video>\
+            <video src=\"http://127.0.0.1:{media_port}/ad3.mp4\"></video>\
+            <video src=\"http://127.0.0.1:{media_port}/film.mp4\"></video>\
+            </body></html>"
+        );
+        let mut pages = std::collections::HashMap::new();
+        pages.insert("/page".to_string(), page.into_bytes());
+        let stop_page = std::sync::Arc::new(AtomicBool::new(false));
+        let (page_port, page_server) = serve_files(pages, stop_page.clone());
+        let result =
+            try_html_embedded_fallback(&stub, &format!("http://127.0.0.1:{page_port}/page"));
+        stop_media.store(true, Ordering::Relaxed);
+        stop_page.store(true, Ordering::Relaxed);
+        let _ = media_server.join();
+        let _ = page_server.join();
+        let info = result.expect("fallback must find media").unwrap();
+        assert_eq!(
+            info.resolved_url.as_deref(),
+            Some(format!("http://127.0.0.1:{media_port}/film.mp4").as_str()),
+            "the fallback must resolve to the 2-hour film, not the first ad clip"
+        );
+    }
+
+    #[test]
+    fn html_fallback_fails_when_only_short_clips() {
+        // Same page with NO film file: every candidate is a known
+        // short clip. The plan must FAIL with a clear reason
+        // instead of silently queueing an ad.
+        let dir = unique_temp_dir("fallback-only-shorts");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = permissive_stub_ytdlp(&dir);
+        let mut media = std::collections::HashMap::new();
+        media.insert("/ad1.mp4".to_string(), mp4_bytes(1000, 15000, 0, 100));
+        media.insert("/ad2.mp4".to_string(), mp4_bytes(1000, 30000, 0, 100));
+        let stop_media = std::sync::Arc::new(AtomicBool::new(false));
+        let (media_port, media_server) = serve_files(media, stop_media.clone());
+        let page = format!(
+            "<html><body>\
+            <video src=\"http://127.0.0.1:{media_port}/ad1.mp4\"></video>\
+            <video src=\"http://127.0.0.1:{media_port}/ad2.mp4\"></video>\
+            </body></html>"
+        );
+        let mut pages = std::collections::HashMap::new();
+        pages.insert("/page".to_string(), page.into_bytes());
+        let stop_page = std::sync::Arc::new(AtomicBool::new(false));
+        let (page_port, page_server) = serve_files(pages, stop_page.clone());
+        let result =
+            try_html_embedded_fallback(&stub, &format!("http://127.0.0.1:{page_port}/page"));
+        stop_media.store(true, Ordering::Relaxed);
+        stop_page.store(true, Ordering::Relaxed);
+        let _ = media_server.join();
+        let _ = page_server.join();
+        let err = result
+            .expect("fallback must find media")
+            .expect_err("only short clips must fail, not queue an ad");
+        assert!(
+            err.contains("Only short clips"),
+            "error must say only short clips were found: {err}"
+        );
+    }
+
     #[test]
     fn list_formats_with_falls_back_to_embedded_manifest() {
         // yt-dlp has no extractor for the page ("Unsupported URL"),
@@ -2390,6 +2901,7 @@ mod tests {
             title: "clip".to_string(),
             duration_secs: Some(120),
             manifest_url: "https://cdn.example.com/clip/master.m3u8".to_string(),
+            segment_count: None,
             formats: vec![StreamFormat {
                 id: "https://cdn.example.com/clip/mid.m3u8".to_string(),
                 ext: "ts".to_string(),
@@ -2631,6 +3143,7 @@ exit 0
             title: "clip".to_string(),
             duration_secs: Some(120),
             manifest_url: "https://example.com/clip/master.m3u8".to_string(),
+            segment_count: None,
             formats: vec![
                 StreamFormat {
                     id: "https://example.com/clip/low.m3u8".to_string(),
@@ -2785,7 +3298,7 @@ exit 0
         std::fs::create_dir_all(&dir).unwrap();
         // Default: best combined <= 1080p (720p mid), .ts, no merge,
         // tagged as an HLS plan with an empty yt-dlp selector.
-        let plan = plan_media_download(&dir, &url, None, None).unwrap();
+        let plan = plan_media_download(&dir, &url, None, None, &None, None).unwrap();
         assert_eq!(plan.format_id, format!("http://127.0.0.1:{port}/mid.m3u8"));
         assert!(plan.filename.ends_with(".ts"), "filename: {}", plan.filename);
         assert!(!plan.needs_merge);
@@ -2797,11 +3310,13 @@ exit 0
             &url,
             Some(&format!("http://127.0.0.1:{port}/low.m3u8")),
             None,
+            &None,
+            None,
         )
         .unwrap();
         assert_eq!(plan.format_id, format!("http://127.0.0.1:{port}/low.m3u8"));
         // Unknown format id is a clear error.
-        assert!(plan_media_download(&dir, &url, Some("nope"), None).is_err());
+        assert!(plan_media_download(&dir, &url, Some("nope"), None, &None, None).is_err());
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
     }
@@ -2821,7 +3336,7 @@ exit 0
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let url = format!("http://127.0.0.1:{port}/master.m3u8");
-        match plan_media_download_or_drive_fallback(&dir, &url, None, None, &None).unwrap() {
+        match plan_media_download_or_drive_fallback(&dir, &url, None, None, &None, None).unwrap() {
             PlanOutcome::Media(plan) => {
                 assert_eq!(plan.stream_kind, Some(crate::media::StreamKind::Hls));
                 assert_eq!(plan.format_id, format!("http://127.0.0.1:{port}/mid.m3u8"));
@@ -2831,7 +3346,7 @@ exit 0
         // Missing manifest on a non-Drive host: the error passes
         // through (the Drive fallback only applies to Drive links).
         let missing = format!("http://127.0.0.1:{port}/missing.m3u8");
-        let err = plan_media_download_or_drive_fallback(&dir, &missing, None, None, &None)
+        let err = plan_media_download_or_drive_fallback(&dir, &missing, None, None, &None, None)
             .unwrap_err();
         assert!(
             err.contains("404") || err.contains("Manifest"),
@@ -2868,14 +3383,14 @@ exit 0
         let info = list_formats(&dir, &url).unwrap();
         assert_eq!(info.extractor, "DASH");
         assert_eq!(info.formats.len(), 3);
-        let plan = plan_media_download(&dir, &url, None, None).unwrap();
+        let plan = plan_media_download(&dir, &url, None, None, &None, None).unwrap();
         assert_eq!(plan.format_id, "v720");
         assert!(plan.filename.ends_with(".mp4"), "filename: {}", plan.filename);
         assert!(plan.needs_merge);
         assert_eq!(plan.stream_kind, Some(crate::media::StreamKind::Dash));
         assert_eq!(plan.selector, "");
         // Audio-only choice: .m4a, no merge.
-        let plan = plan_media_download(&dir, &url, Some("a64k"), None).unwrap();
+        let plan = plan_media_download(&dir, &url, Some("a64k"), None, &None, None).unwrap();
         assert_eq!(plan.format_id, "a64k");
         assert!(plan.filename.ends_with(".m4a"), "filename: {}", plan.filename);
         assert!(!plan.needs_merge);

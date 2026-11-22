@@ -16,11 +16,11 @@
 
 use fetchforge_engine::{
     category_for_filename, download, download_dash, download_gltf_bundle, download_hls_pair,
-    download_hls_variant, download_media, ensure_ffmpeg, ensure_image_extension,
-    fetch_gltf_plan, find_ytdlp, generate_download_id, generate_secure_token, is_gltf_url,
-    is_image_content_type, list_formats, plan_media_download_or_drive_fallback, probe,
-    sanitize_filename, stop_reason, DashDownloadOptions, DownloadOptions, DownloadRecord,
-    GltfDownloadOptions, MediaDownloadOptions, PlanOutcome, Status, Store,
+    download_hls_variant, download_media, ensure_ffmpeg, ensure_image_extension, fetch_gltf_plan,
+    find_ytdlp, generate_download_id, generate_secure_token, is_gltf_url, is_image_content_type,
+    list_formats, plan_media_download_or_drive_fallback, probe, sanitize_filename, stop_reason,
+    CapturedManifest, DashDownloadOptions, DownloadOptions, DownloadRecord, GltfDownloadOptions,
+    MediaDownloadOptions, PlanOutcome, Status, Store, MAX_CAPTURED_MANIFEST_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -281,7 +281,16 @@ impl App {
             accepted += 1;
         }
         while list.len() > MAX_DETECTED_ITEMS {
-            list.remove(0);
+            // Per-kind fairness: the detector floods with images,
+            // which used to crowd every video/PDF out of the list
+            // (the panel showed images only). Trim the oldest
+            // IMAGE first; only drop a non-image when the list
+            // holds no images at all.
+            let pos = list
+                .iter()
+                .position(|d| d.kind.as_deref() == Some("image"))
+                .unwrap_or(0);
+            list.remove(pos);
         }
         drop(list);
         self.save_detected();
@@ -336,6 +345,7 @@ impl App {
         format_id: Option<String>,
         referer: Option<String>,
         audio_url: Option<String>,
+        manifest_text: Option<String>,
     ) -> Result<DownloadRecord, String> {
         let clean_url = fetchforge_engine::validate_url(url)?;
         // HLS (.m3u8) / DASH (.mpd) manifests go straight to the
@@ -343,7 +353,14 @@ impl App {
         // media.rs): a manifest must never reach the direct path,
         // which would save the manifest text itself as a file.
         if fetchforge_engine::is_manifest_url(&clean_url) {
-            return self.add_media_download(&clean_url, filename, format_id, referer, audio_url);
+            return self.add_media_download(
+                &clean_url,
+                filename,
+                format_id,
+                referer,
+                audio_url,
+                manifest_text,
+            );
         }
         // glTF models (.gltf) carry dependencies (buffers, textures)
         // that must be downloaded with the model and kept in the same
@@ -379,7 +396,7 @@ impl App {
                     .is_some_and(|ct| ct.starts_with("text/html"))
             });
         if is_page {
-            return self.add_media_download(&clean_url, filename, format_id, referer, audio_url);
+            return self.add_media_download(&clean_url, filename, format_id, referer, audio_url, manifest_text);
         }
         match probe_result {
             Ok(p) => {
@@ -388,7 +405,7 @@ impl App {
                 if p.content_type.as_deref().is_some_and(|ct| {
                     fetchforge_engine::stream_kind_of_content_type(ct).is_some()
                 }) {
-                    return self.add_media_download(&clean_url, filename, format_id, referer, audio_url);
+                    return self.add_media_download(&clean_url, filename, format_id, referer, audio_url, manifest_text);
                 }
                 let (mut filename, total, resumable) = (
                     filename
@@ -434,6 +451,7 @@ impl App {
                         format_id.clone(),
                         referer.clone(),
                         audio_url.clone(),
+                        manifest_text,
                     ) {
                         Ok(rec) => return Ok(rec),
                         Err(extract_err) => e = extract_err,
@@ -461,6 +479,9 @@ impl App {
                     referer: None,
                     audio_url: None,
                     duplicate: false,
+                    segments_total: None,
+                    segments_done: 0,
+                    estimated_total_bytes: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -481,8 +502,16 @@ impl App {
         format_id: Option<String>,
         referer: Option<String>,
         audio_url: Option<String>,
+        manifest_text: Option<String>,
     ) -> Result<DownloadRecord, String> {
-        match self.try_media_download(clean_url, filename.clone(), format_id, referer.clone(), audio_url) {
+        match self.try_media_download(
+            clean_url,
+            filename.clone(),
+            format_id,
+            referer.clone(),
+            audio_url,
+            manifest_text,
+        ) {
             Ok(rec) => Ok(rec),
             Err(e) => {
                 // Extraction now runs in the worker (see
@@ -511,6 +540,9 @@ impl App {
                     referer: None,
                     audio_url: None,
                     duplicate: false,
+                    segments_total: None,
+                    segments_done: 0,
+                    estimated_total_bytes: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -539,6 +571,13 @@ impl App {
                 // Same idempotent-add rule as the other paths.
                 {
                     let mut store = self.store.lock().unwrap();
+                    // Fresh disk state before the duplicate check:
+                    // the other process may have cleared this record
+                    // (Clear finished) since this process last
+                    // loaded — a stale in-memory match would return
+                    // a download the user already removed instead of
+                    // queueing the new one (2026-11-22 incident).
+                    store.reload_from_disk();
                     if let Some(mut existing) = store.find_duplicate(
                         clean_url,
                         &record_filename,
@@ -576,6 +615,9 @@ impl App {
                         referer: None,
                         audio_url: None,
                         duplicate: false,
+                        segments_total: None,
+                        segments_done: 0,
+                        estimated_total_bytes: None,
                     };
                     store.upsert(rec.clone());
                     let _ = store.save();
@@ -606,6 +648,9 @@ impl App {
                     referer: None,
                     audio_url: None,
                     duplicate: false,
+                    segments_total: None,
+                    segments_done: 0,
+                    estimated_total_bytes: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -635,6 +680,7 @@ impl App {
         format_id: Option<String>,
         referer: Option<String>,
         audio_url: Option<String>,
+        manifest_text: Option<String>,
     ) -> Result<DownloadRecord, String> {
         let provisional = filename
             .as_deref()
@@ -647,6 +693,10 @@ impl App {
         // and planned filename are known.
         {
             let mut store = self.store.lock().unwrap();
+            // Fresh disk state before the duplicate check (see
+            // add_gltf_download): a record the other process
+            // cleared must not match from stale memory.
+            store.reload_from_disk();
             if let Some(mut existing) = store.find_duplicate(
                 clean_url,
                 &provisional,
@@ -683,10 +733,22 @@ impl App {
                 referer,
                 audio_url,
                 duplicate: false,
+                segments_total: None,
+                segments_done: 0,
+                estimated_total_bytes: None,
             };
             store.upsert(rec.clone());
             let _ = store.save();
             drop(store);
+            // Captured playlist text (extension sends only): save
+            // it to the record's sidecar before the worker plans,
+            // so a signed manifest link is never fetched twice.
+            // A duplicate add above never reaches here, so no
+            // sidecar is written for a download that was not
+            // queued.
+            if let Some(text) = &manifest_text {
+                save_manifest_sidecar(&self.data_dir, &id, text);
+            }
             self.spawn_worker(id);
             Ok(rec)
         }
@@ -717,12 +779,18 @@ impl App {
         } else {
             Some(rec.filename.as_str())
         };
+        // Captured playlist text (extension sends only): the plan
+        // fetch is the FIRST fetch of the manifest, so it must use
+        // the capture — a single-use signed link consumed here
+        // would fail again at run time.
+        let captured = read_manifest_sidecar(&self.data_dir, &id, &rec.url);
         let outcome = plan_media_download_or_drive_fallback(
             &self.data_dir,
             &rec.url,
             rec.format_id.as_deref(),
             filename_arg,
             &rec.referer,
+            captured.as_ref(),
         );
         if job.cancelled.load(Ordering::Relaxed) {
             self.set_status(&id, Status::Cancelled, None);
@@ -759,6 +827,15 @@ impl App {
                     .clone()
                     .unwrap_or_else(|| rec.url.clone());
                 let mut store = self.store.lock().unwrap();
+                // Fresh disk state before the plan-time duplicate
+                // check: the removal below must only fire when the
+                // matched record is CONFIRMED still on disk. The
+                // bridge's memory can hold a record the app's Clear
+                // finished already removed (2026-11-22: a new
+                // novahd download vanished this way — the plan
+                // matched the cleared clip in stale memory and
+                // removed the new record).
+                store.reload_from_disk();
                 if store
                     .find_duplicate_except(
                         &record_url,
@@ -770,6 +847,11 @@ impl App {
                 {
                     store.remove(&id);
                     let _ = store.save();
+                    drop(store);
+                    // The record is gone, so its sidecar is
+                    // orphaned — delete it (set_status never runs
+                    // for a removed record).
+                    delete_manifest_sidecar(&self.data_dir, &id);
                     return Ok(None);
                 }
                 let mut updated = match store.get(&id) {
@@ -785,6 +867,10 @@ impl App {
                 updated.format_selector = Some(plan.selector);
                 updated.stream_kind = plan.stream_kind.map(|k| k.as_str().to_string());
                 updated.audio_url = paired_audio;
+                // HLS/DASH only: the manifest's segment count, so
+                // the UI can show "0 / N pieces" before the first
+                // segment lands. yt-dlp plans carry None.
+                updated.segments_total = plan.segments_total;
                 updated.updated_unix = now_unix();
                 store.upsert(updated.clone());
                 let _ = store.save();
@@ -849,6 +935,10 @@ impl App {
         // simultaneous POSTs cannot both slip through.
         {
             let mut store = self.store.lock().unwrap();
+            // Fresh disk state before the duplicate check (see
+            // add_gltf_download): a record the other process
+            // cleared must not match from stale memory.
+            store.reload_from_disk();
             if let Some(mut existing) =
                 store.find_duplicate(clean_url, &filename, &self.settings.download_dir)
             {
@@ -881,6 +971,9 @@ impl App {
                 referer,
                 audio_url: None,
                 duplicate: false,
+                segments_total: None,
+                segments_done: 0,
+                estimated_total_bytes: None,
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -992,6 +1085,19 @@ impl App {
                 let mut r = r;
                 r.downloaded_bytes = p.downloaded;
                 r.total_bytes = p.total.or(r.total_bytes);
+                // Segment progress (HLS/DASH only): only overwrite when
+                // the report carries a value — yt-dlp and direct
+                // downloads report None here, and must never wipe
+                // the plan-time segment count.
+                if let Some(d) = p.segments_done {
+                    r.segments_done = d;
+                }
+                if let Some(t) = p.segments_total {
+                    r.segments_total = Some(t);
+                }
+                if let Some(e) = p.estimated_total {
+                    r.estimated_total_bytes = Some(e);
+                }
                 r.updated_unix = now_unix();
                 store.upsert(r);
                 let _ = store.save();
@@ -1076,6 +1182,19 @@ impl App {
                 let mut r = r;
                 r.downloaded_bytes = p.downloaded;
                 r.total_bytes = p.total.or(r.total_bytes);
+                // Segment progress (HLS/DASH only): only overwrite when
+                // the report carries a value — yt-dlp and direct
+                // downloads report None here, and must never wipe
+                // the plan-time segment count.
+                if let Some(d) = p.segments_done {
+                    r.segments_done = d;
+                }
+                if let Some(t) = p.segments_total {
+                    r.segments_total = Some(t);
+                }
+                if let Some(e) = p.estimated_total {
+                    r.estimated_total_bytes = Some(e);
+                }
                 r.updated_unix = now_unix();
                 store.upsert(r);
                 let _ = store.save();
@@ -1156,6 +1275,19 @@ impl App {
                 let mut r = r;
                 r.downloaded_bytes = p.downloaded;
                 r.total_bytes = p.total.or(r.total_bytes);
+                // Segment progress (HLS/DASH only): only overwrite when
+                // the report carries a value — yt-dlp and direct
+                // downloads report None here, and must never wipe
+                // the plan-time segment count.
+                if let Some(d) = p.segments_done {
+                    r.segments_done = d;
+                }
+                if let Some(t) = p.segments_total {
+                    r.segments_total = Some(t);
+                }
+                if let Some(e) = p.estimated_total {
+                    r.estimated_total_bytes = Some(e);
+                }
                 r.updated_unix = now_unix();
                 store.upsert(r);
                 let _ = store.save();
@@ -1164,7 +1296,12 @@ impl App {
         // Paired variants (the extension saw a video variant and
         // its audio sibling, no master): download both tracks and
         // merge them. Otherwise the normal variant path, with the
-        // page Referer on every manifest/segment request.
+        // page Referer on every manifest/segment request. The
+        // captured manifest (extension sends only) is used for
+        // whichever fetch its URL matches — the plan fetch already
+        // consumed nothing, but a single-use signed link must
+        // still not be re-fetched here.
+        let captured = read_manifest_sidecar(&self.data_dir, &id, &rec.url);
         let result = match &rec.audio_url {
             Some(audio_uri) => {
                 let ffmpeg = match &ffmpeg {
@@ -1188,6 +1325,7 @@ impl App {
                     &progress,
                     &job.paused,
                     &job.cancelled,
+                    captured.as_ref(),
                 )
             }
             None => download_hls_variant(
@@ -1200,6 +1338,7 @@ impl App {
                 &progress,
                 &job.paused,
                 &job.cancelled,
+                captured.as_ref(),
             ),
         };
         match result {
@@ -1264,6 +1403,19 @@ impl App {
                 let mut r = r;
                 r.downloaded_bytes = p.downloaded;
                 r.total_bytes = p.total.or(r.total_bytes);
+                // Segment progress (HLS/DASH only): only overwrite when
+                // the report carries a value — yt-dlp and direct
+                // downloads report None here, and must never wipe
+                // the plan-time segment count.
+                if let Some(d) = p.segments_done {
+                    r.segments_done = d;
+                }
+                if let Some(t) = p.segments_total {
+                    r.segments_total = Some(t);
+                }
+                if let Some(e) = p.estimated_total {
+                    r.estimated_total_bytes = Some(e);
+                }
                 r.updated_unix = now_unix();
                 store.upsert(r);
                 let _ = store.save();
@@ -1275,6 +1427,7 @@ impl App {
             &progress,
             &job.paused,
             &job.cancelled,
+            read_manifest_sidecar(&self.data_dir, &id, &rec.url).as_ref(),
         ) {
             Ok(final_path) => {
                 let mut store = self.store.lock().unwrap();
@@ -1339,6 +1492,19 @@ impl App {
                 let mut r = r;
                 r.downloaded_bytes = p.downloaded;
                 r.total_bytes = p.total.or(r.total_bytes);
+                // Segment progress (HLS/DASH only): only overwrite when
+                // the report carries a value — yt-dlp and direct
+                // downloads report None here, and must never wipe
+                // the plan-time segment count.
+                if let Some(d) = p.segments_done {
+                    r.segments_done = d;
+                }
+                if let Some(t) = p.segments_total {
+                    r.segments_total = Some(t);
+                }
+                if let Some(e) = p.estimated_total {
+                    r.estimated_total_bytes = Some(e);
+                }
                 r.updated_unix = now_unix();
                 store.upsert(r);
                 let _ = store.save();
@@ -1388,6 +1554,17 @@ impl App {
     }
 
     fn set_status(&self, id: &str, status: Status, error: Option<String>) {
+        // Terminal state (Completed/Failed/Cancelled): the captured
+        // manifest sidecar is no longer needed — a resume re-plans
+        // from the stored format, and a finished download never
+        // fetches its manifest again. Paused keeps the sidecar: a
+        // resume re-fetches the manifest, and a single-use signed
+        // link still needs the capture. (Status is not Copy, so
+        // the check runs before the move into the record.)
+        let terminal = matches!(
+            status,
+            Status::Completed | Status::Failed | Status::Cancelled
+        );
         let mut store = self.store.lock().unwrap();
         if let Some(mut r) = store.get(id).cloned() {
             r.status = status;
@@ -1398,6 +1575,167 @@ impl App {
             store.upsert(r);
             let _ = store.save();
         }
+        drop(store);
+        if terminal {
+            delete_manifest_sidecar(&self.data_dir, id);
+        }
+    }
+
+    /// Empty the detector list (memory + detected.json). Detector
+    /// items only — downloads and history are never touched.
+    /// Returns how many items were removed.
+    fn clear_detected(&self) -> usize {
+        let mut list = self.detected.lock().unwrap();
+        let n = list.len();
+        list.clear();
+        drop(list);
+        let _ = std::fs::remove_file(self.data_dir.join("detected.json"));
+        n
+    }
+
+    /// Clear cached files (the app's "Clear cache" action). Removes:
+    /// (a) the detector store (see clear_detected); (b) per-download
+    /// segment temp dirs (`<name>.part.seg/`) and legacy sidecars
+    /// (`<name>.part.segments`) for downloads that are terminal or
+    /// have no record — NEVER for active or paused downloads, whose
+    /// segments are their resume state; (c) manifest sidecars for
+    /// terminal or missing records; (d) stale `*.tmp` files in the
+    /// data dir. NEVER deletes downloaded files, the download list,
+    /// or history. Returns (files removed, bytes freed).
+    fn clear_cache(&self) -> (usize, u64) {
+        let mut removed_files = 0usize;
+        let mut freed_bytes = 0u64;
+        // (a) Detector store: count the file itself as one removed
+        // file (sized before clearing, since clearing deletes it).
+        let detected_path = self.data_dir.join("detected.json");
+        let detected_size = std::fs::metadata(&detected_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let detected_existed = detected_path.is_file();
+        self.clear_detected();
+        if detected_existed {
+            removed_files += 1;
+            freed_bytes += detected_size;
+        }
+        // Live records protect their temp files: active (queued /
+        // downloading) and paused downloads keep every segment.
+        let (live_ids, live_filenames): (Vec<String>, Vec<String>) = {
+            let mut store = self.store.lock().unwrap();
+            store.reload_from_disk();
+            let mut ids = Vec::new();
+            let mut names = Vec::new();
+            for rec in store.all() {
+                if matches!(
+                    rec.status,
+                    Status::Queued | Status::Downloading | Status::Paused
+                ) {
+                    ids.push(rec.id.clone());
+                    names.push(rec.filename.clone());
+                }
+            }
+            (ids, names)
+        };
+        // (b) Segment temp dirs + legacy sidecars in the download
+        // tree (top level and one level of category subdirs — the
+        // only depths the worker writes to).
+        let mut dirs_to_scan = vec![PathBuf::from(&self.settings.download_dir)];
+        if let Ok(entries) = std::fs::read_dir(&self.settings.download_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    dirs_to_scan.push(p);
+                }
+            }
+        }
+        for dir in &dirs_to_scan {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                let stem = if name.ends_with(".part.seg") {
+                    Some(name.trim_end_matches(".part.seg"))
+                } else if name.ends_with(".part.segments") {
+                    Some(name.trim_end_matches(".part.segments"))
+                } else {
+                    None
+                };
+                let Some(stem) = stem else { continue };
+                // A live download with a matching filename keeps
+                // its temp files (fail-safe: keep on any doubt).
+                if live_filenames
+                    .iter()
+                    .any(|f| filename_matches_unique(stem, f))
+                {
+                    continue;
+                }
+                if path.is_dir() {
+                    // Sum the segment files, then remove the dir.
+                    let mut dir_bytes = 0u64;
+                    let mut dir_files = 0usize;
+                    if let Ok(files) = std::fs::read_dir(&path) {
+                        for f in files.flatten() {
+                            if let Ok(m) = f.metadata() {
+                                if m.is_file() {
+                                    dir_files += 1;
+                                    dir_bytes += m.len();
+                                }
+                            }
+                        }
+                    }
+                    if std::fs::remove_dir_all(&path).is_ok() {
+                        removed_files += dir_files;
+                        freed_bytes += dir_bytes;
+                    }
+                } else if path.is_file() {
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    if std::fs::remove_file(&path).is_ok() {
+                        removed_files += 1;
+                        freed_bytes += size;
+                    }
+                }
+            }
+        }
+        // (c) Manifest sidecars for terminal or missing records.
+        let manifests_dir = self.data_dir.join("manifests");
+        if let Ok(entries) = std::fs::read_dir(&manifests_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                let Some(id) = name.strip_suffix(".m3u8") else {
+                    continue;
+                };
+                if live_ids.iter().any(|live| live == id) {
+                    continue;
+                }
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if std::fs::remove_file(&path).is_ok() {
+                    removed_files += 1;
+                    freed_bytes += size;
+                }
+            }
+        }
+        // (d) Stale *.tmp files in the data dir (detected.json.tmp,
+        // downloads.json.tmp — both writers are best-effort tmp +
+        // rename, so a tmp removed mid-write only loses one save,
+        // which the next save rewrites).
+        if let Ok(entries) = std::fs::read_dir(&self.data_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                if path.extension().is_some_and(|e| e == "tmp") {
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    if std::fs::remove_file(&path).is_ok() {
+                        removed_files += 1;
+                        freed_bytes += size;
+                    }
+                }
+            }
+        }
+        (removed_files, freed_bytes)
     }
 }
 
@@ -1418,6 +1756,14 @@ struct AddRequest {
     /// and merges them.
     #[serde(default)]
     audio_url: Option<String>,
+    /// Playlist text the extension captured from the player's own
+    /// response (extension sends only): the worker uses it instead
+    /// of re-fetching a signed manifest link that may only work
+    /// once. Saved to a sidecar file at add time, never stored in
+    /// the record (see save_manifest_sidecar). Over the native
+    /// limit it is ignored with a warning.
+    #[serde(default)]
+    manifest_text: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1446,6 +1792,17 @@ struct DetectedItem {
     audio_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     title: Option<String>,
+    /// The file's own name as the extension saw it (video file
+    /// name, PDF file name): the detector panel shows this when
+    /// there is no page title, so a video is listed BY NAME
+    /// instead of by its URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filename: Option<String>,
+    /// A poster/thumbnail URL for a video (its poster attribute):
+    /// the detector panel shows it like an image thumbnail, so
+    /// the user can tell what the video is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    poster: Option<String>,
     /// The extension's word for the kind ("video", "audio", ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
@@ -1480,6 +1837,82 @@ fn generate_token() -> String {
             std::process::exit(1);
         }
     }
+}
+
+/// Captured-manifest sidecars (round 6): the extension captures a
+/// playlist's text from the player's own response — where the page
+/// origin and cookies apply — and sends it with the download, so a
+/// signed link is never fetched twice (the second fetch fails).
+/// The text is too large to live in downloads.json, so it is kept
+/// in a sidecar file per record, `data_dir/manifests/<id>.m3u8`,
+/// written at add time, read by the worker at plan and run time,
+/// and deleted when the download reaches a terminal state (see
+/// set_status) or is removed as a post-plan duplicate. A missing
+/// or unreadable sidecar simply means "fetch normally".
+fn manifest_sidecar_path(data_dir: &std::path::Path, id: &str) -> PathBuf {
+    data_dir.join("manifests").join(format!("{id}.m3u8"))
+}
+
+fn save_manifest_sidecar(data_dir: &std::path::Path, id: &str, text: &str) {
+    if text.len() > MAX_CAPTURED_MANIFEST_BYTES {
+        eprintln!(
+            "FetchForge WARNING: captured manifest for download {id} is {} bytes (limit {}); ignoring it, the manifest will be fetched normally",
+            text.len(),
+            MAX_CAPTURED_MANIFEST_BYTES
+        );
+        return;
+    }
+    let dir = data_dir.join("manifests");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if std::fs::write(manifest_sidecar_path(data_dir, id), text).is_err() {
+        eprintln!("FetchForge WARNING: could not save the captured manifest for download {id}");
+    }
+}
+
+fn read_manifest_sidecar(
+    data_dir: &std::path::Path,
+    id: &str,
+    url: &str,
+) -> Option<CapturedManifest> {
+    let text = std::fs::read_to_string(manifest_sidecar_path(data_dir, id)).ok()?;
+    Some(CapturedManifest {
+        url: url.to_string(),
+        text,
+    })
+}
+
+fn delete_manifest_sidecar(data_dir: &std::path::Path, id: &str) {
+    let _ = std::fs::remove_file(manifest_sidecar_path(data_dir, id));
+}
+
+/// Does a segment-temp stem belong to a record's filename? The
+/// worker writes `<unique-filename>.part.seg` / `.segments`, where
+/// the unique filename is the record filename, or the record
+/// filename with a " (N)" collision suffix before the extension
+/// (see unique_path). Cache clearing must never delete a live
+/// download's pieces, so the match is deliberately generous: any
+/// plausible suffix keeps the files.
+fn filename_matches_unique(stem: &str, filename: &str) -> bool {
+    if stem == filename {
+        return true;
+    }
+    let Some((stem_base, stem_ext)) = stem.rsplit_once('.') else {
+        return false;
+    };
+    let Some((file_base, file_ext)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    if stem_ext != file_ext {
+        return false;
+    }
+    let Some(rest) = stem_base.strip_prefix(file_base) else {
+        return false;
+    };
+    // Rest must be exactly " (N)" with N a positive integer.
+    let rest = rest.strip_prefix(" (").and_then(|r| r.strip_suffix(')'));
+    matches!(rest, Some(n) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Host check (DNS-rebinding defence): the bridge only answers when the
@@ -1750,7 +2183,14 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
     if method == "POST" && path == "/downloads" {
         let req: Result<AddRequest, _> = serde_json::from_str(&body);
         match req {
-            Ok(r) => match app.add_download(&r.url, r.filename, r.format_id, r.referer, r.audio_url) {
+            Ok(r) => match app.add_download(
+                &r.url,
+                r.filename,
+                r.format_id,
+                r.referer,
+                r.audio_url,
+                r.manifest_text,
+            ) {
                 Ok(rec) => {
                     // 202: the download is queued; extraction and
                     // the download itself run asynchronously in the
@@ -1814,6 +2254,24 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
     if method == "GET" && path == "/media/detected" {
         let items: Vec<DetectedItem> = app.detected.lock().unwrap().clone();
         let b = serde_json::json!({"items": items}).to_string();
+        let _ = stream.write_all(http_response(200, &b).as_bytes());
+        return;
+    }
+    // Clear the detector list (token required): empties detected
+    // media only — downloads and history are never touched.
+    if method == "POST" && path == "/media/detected/clear" {
+        let removed = app.clear_detected();
+        let b = serde_json::json!({"removed": removed}).to_string();
+        let _ = stream.write_all(http_response(200, &b).as_bytes());
+        return;
+    }
+    // Clear cache (token required): temp/segment files and the
+    // detector store only — downloaded files, the download list
+    // and history are never touched (see clear_cache).
+    if method == "POST" && path == "/cache/clear" {
+        let (removed_files, freed_bytes) = app.clear_cache();
+        let b = serde_json::json!({"removed_files": removed_files, "freed_bytes": freed_bytes})
+            .to_string();
         let _ = stream.write_all(http_response(200, &b).as_bytes());
         return;
     }
@@ -1953,6 +2411,8 @@ fn forward_add_to_bridge(
     filename: Option<&str>,
     referer: Option<&str>,
     audio_url: Option<&str>,
+    format_id: Option<&str>,
+    manifest_text: Option<&str>,
 ) -> Result<DownloadRecord, String> {
     let token = std::fs::read_to_string(data_dir.join("bridge-token.txt"))
         .map_err(|_| "Bridge token file not found.".to_string())?;
@@ -1960,7 +2420,7 @@ fn forward_add_to_bridge(
     if token.is_empty() {
         return Err("Bridge token file is empty.".to_string());
     }
-    let body = serde_json::json!({"url": url, "filename": filename, "referer": referer, "audio_url": audio_url}).to_string();
+    let body = serde_json::json!({"url": url, "filename": filename, "referer": referer, "audio_url": audio_url, "format_id": format_id, "manifest_text": manifest_text}).to_string();
     let (status, resp) = loopback_http(port, "POST", "/downloads", Some(token), Some(&body))?;
     // POST /downloads answers 202 (queued; extraction runs in the
     // worker). 201 is still accepted so a newer CLI keeps working
@@ -2057,6 +2517,17 @@ fn native_host(app: &Arc<App>) {
                     .get("audio_url")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                // The picker popup's choice (extension sends only):
+                // a format id, and playlist text captured from the
+                // player's own response (see save_manifest_sidecar).
+                let format_id = value
+                    .get("format_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let manifest_text = value
+                    .get("manifest_text")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 // A download started from the extension must survive
                 // this host process exiting: Chrome/Firefox terminate
                 // the native host after its sendNativeMessage reply,
@@ -2084,17 +2555,46 @@ fn native_host(app: &Arc<App>) {
                 //      would be worse: the extension would then hand
                 //      the URL to the browser's own downloader, which
                 //      saves a YouTube page as a useless .html file.
-                match forward_add_to_bridge(&app.data_dir, DEFAULT_PORT, url, filename.as_deref(), referer.as_deref(), audio_url.as_deref()) {
+                match forward_add_to_bridge(
+                    &app.data_dir,
+                    DEFAULT_PORT,
+                    url,
+                    filename.as_deref(),
+                    referer.as_deref(),
+                    audio_url.as_deref(),
+                    format_id.as_deref(),
+                    manifest_text.as_deref(),
+                ) {
                     Ok(rec) => {
                         serde_json::json!({"type": "added", "download": rec, "via": "bridge"})
                     }
                     Err(_first_err) => {
                         match spawn_detached_bridge(&app.data_dir, DEFAULT_PORT).and_then(|()| {
-                            forward_add_to_bridge(&app.data_dir, DEFAULT_PORT, url, filename.as_deref(), referer.as_deref(), audio_url.as_deref())
+                            forward_add_to_bridge(
+                                &app.data_dir,
+                                DEFAULT_PORT,
+                                url,
+                                filename.as_deref(),
+                                referer.as_deref(),
+                                audio_url.as_deref(),
+                                format_id.as_deref(),
+                                manifest_text.as_deref(),
+                            )
                         }) {
-                            Ok(rec) => serde_json::json!({"type": "added", "download": rec, "via": "bridge", "bridge_started": true}),
-                            Err(_second_err) => match app.add_download(url, filename, None, referer, audio_url) {
-                                Ok(rec) => serde_json::json!({"type": "added", "download": rec, "via": "in-process", "warning": "The FetchForge bridge is not running, so this download started inside the browser connection and may stop if the browser closes it. Open the FetchForge app to keep downloads running."}),
+                            Ok(rec) => {
+                                serde_json::json!({"type": "added", "download": rec, "via": "bridge", "bridge_started": true})
+                            }
+                            Err(_second_err) => match app.add_download(
+                                url,
+                                filename,
+                                format_id,
+                                referer,
+                                audio_url,
+                                manifest_text,
+                            ) {
+                                Ok(rec) => {
+                                    serde_json::json!({"type": "added", "download": rec, "via": "in-process", "warning": "The FetchForge bridge is not running, so this download started inside the browser connection and may stop if the browser closes it. Open the FetchForge app to keep downloads running."})
+                                }
                                 Err(e) => serde_json::json!({"type": "error", "error": e}),
                             },
                         }
@@ -2240,8 +2740,17 @@ mod tests {
             record_json()
         );
         let (port, handle) = stub_server(response);
-        let rec = forward_add_to_bridge(&dir, port, "https://example.com/x.zip", Some("x.zip"), None, None)
-            .unwrap();
+        let rec = forward_add_to_bridge(
+            &dir,
+            port,
+            "https://example.com/x.zip",
+            Some("x.zip"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(rec.id, "dl-1");
         assert_eq!(rec.filename, "x.zip");
         assert_eq!(rec.format_id, None, "old record JSON must load with defaults");
@@ -2270,7 +2779,17 @@ mod tests {
             .unwrap()
             .port();
         let start = std::time::Instant::now();
-        let err = forward_add_to_bridge(&dir, port, "https://example.com/x.zip", None, None, None).unwrap_err();
+        let err = forward_add_to_bridge(
+            &dir,
+            port,
+            "https://example.com/x.zip",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("not reachable"), "error: {err}");
         assert!(start.elapsed() < Duration::from_secs(5));
     }
@@ -2285,7 +2804,17 @@ mod tests {
             body
         );
         let (port, _handle) = stub_server(response);
-        let err = forward_add_to_bridge(&dir, port, "https://example.com/x.zip", None, None, None).unwrap_err();
+        let err = forward_add_to_bridge(
+            &dir,
+            port,
+            "https://example.com/x.zip",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("401"), "error: {err}");
     }
 
@@ -2329,6 +2858,8 @@ mod tests {
             page_url: None,
             audio_url: None,
             title: None,
+            filename: None,
+            poster: None,
             kind: None,
             mime_type: None,
             size_bytes: None,
@@ -2434,11 +2965,11 @@ mod tests {
         let app = App::new(dir);
         let url = format!("http://127.0.0.1:{port}/v.m3u8");
         let first = app
-            .try_media_download(&url, Some("clip.mp4".to_string()), None, None, None)
+            .try_media_download(&url, Some("clip.mp4".to_string()), None, None, None, None)
             .unwrap();
         assert!(!first.duplicate, "first add queues a new download");
         let second = app
-            .try_media_download(&url, Some("clip.mp4".to_string()), None, None, None)
+            .try_media_download(&url, Some("clip.mp4".to_string()), None, None, None, None)
             .unwrap();
         assert!(second.duplicate, "second add must be flagged duplicate");
         assert_eq!(second.id, first.id, "same record returned");
@@ -2457,5 +2988,365 @@ mod tests {
         );
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn cleared_record_does_not_block_readd() {
+        // 2026-11-22 incident: the user cleared a finished clip
+        // (Clear finished in the app), then re-added the same URL;
+        // the bridge's stale in-memory store still held the cleared
+        // record, so the add-time duplicate check returned it as
+        // "Already downloaded" and nothing was queued. The add must
+        // reload from disk first, so a cleared record never blocks
+        // a re-add in the same process.
+        let dir = test_data_dir("fetchforge-test-cleared-readd");
+        let app = App::new(dir.clone());
+        let download_dir = app.settings.download_dir.clone();
+        let mut old = test_record("clip-old", "clip.mp4", Status::Completed);
+        old.url = "https://example.com/clip.mp4".to_string();
+        old.destination = download_dir.clone();
+        {
+            let mut store = app.store.lock().unwrap();
+            store.upsert(old.clone());
+            let _ = store.save();
+            // Age the in-memory copy: a real cleared record was
+            // finished hours ago, so the reload's grace period
+            // (which protects just-created records) must not
+            // protect it. No save here — the disk copy is deleted
+            // by the other process below either way.
+            old.created_unix -= 3600;
+            old.updated_unix -= 3600;
+            store.upsert(old);
+        }
+        // The other process (the app) clears it from disk.
+        let mut other = Store::load(dir.join("downloads.json"));
+        assert!(other.remove("clip-old"));
+        let _ = other.save();
+        // Re-add the same URL + filename without restarting: the
+        // bridge's memory still holds the cleared record, but the
+        // add-time check must reload and queue a NEW download.
+        // (The spawned worker fails in the background — no yt-dlp
+        // or network for example.com here — which is harmless: the
+        // assertion is on the returned record.)
+        let second = app
+            .try_media_download(
+                "https://example.com/clip.mp4",
+                Some("clip.mp4".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            !second.duplicate,
+            "a cleared record must not flag the re-add as a duplicate"
+        );
+        assert_ne!(second.id, "clip-old", "the re-add must queue a new record");
+        assert_eq!(second.status, Status::Queued);
+    }
+
+    #[test]
+    fn plan_time_duplicate_check_uses_fresh_disk_state() {
+        // The 2026-11-22 incident itself: the add queued a pending
+        // record, the worker planned it, the HTML fallback resolved
+        // the page to a clip URL, and the PLAN-time duplicate check
+        // matched the cleared clip in stale memory and removed the
+        // new record — downloads.json was written with no record
+        // at all. The plan-time check must reload from disk first,
+        // so only a record CONFIRMED still on disk can kill a new
+        // download.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicBool;
+        // Stub server: one media playlist. The plan fetches it
+        // twice (once to learn the planned filename, once inside
+        // plan_pending_download), so the server loops until told
+        // to stop.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let playlist =
+                "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\nseg0.ts\n#EXT-X-ENDLIST\n";
+            loop {
+                if stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf);
+                        let _ = stream.write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                playlist.len(),
+                                playlist
+                            )
+                            .as_bytes(),
+                        );
+                        let _ = stream.flush();
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+        let dir = test_data_dir("fetchforge-test-plan-duplicate-fresh");
+        let app = App::new(dir.clone());
+        let download_dir = app.settings.download_dir.clone();
+        let url = format!("http://127.0.0.1:{port}/v.m3u8");
+        // Learn the planned filename first: the cleared record must
+        // match it exactly, or the test would pass trivially.
+        let planned_filename = match plan_media_download_or_drive_fallback(
+            &dir, &url, None, Some("clip"), &None, None,
+        )
+        .unwrap()
+        {
+            PlanOutcome::Media(plan) => plan.filename,
+            PlanOutcome::Direct { .. } => panic!("manifest URL must plan as media"),
+        };
+        // The cleared clip: same URL + planned filename, Completed,
+        // aged so the reload's grace period does not protect it.
+        let mut cleared = test_record("clip-cleared", &planned_filename, Status::Completed);
+        cleared.url = url.clone();
+        cleared.destination = download_dir.clone();
+        {
+            let mut store = app.store.lock().unwrap();
+            store.upsert(cleared.clone());
+            let _ = store.save();
+            cleared.created_unix -= 3600;
+            cleared.updated_unix -= 3600;
+            store.upsert(cleared);
+        }
+        // The pending record the worker is about to plan.
+        let mut pending = test_record("clip-pending", "clip", Status::Queued);
+        pending.url = url.clone();
+        pending.destination = download_dir.clone();
+        pending.stream_kind = Some("pending".to_string());
+        {
+            let mut store = app.store.lock().unwrap();
+            store.upsert(pending.clone());
+            let _ = store.save();
+        }
+        // The other process clears the clip from disk.
+        let mut other = Store::load(dir.join("downloads.json"));
+        assert!(other.remove("clip-cleared"));
+        let _ = other.save();
+        // Plan the pending record directly (no worker thread): the
+        // plan-time check must reload, find the clip gone, and
+        // keep the new record.
+        let job = Job {
+            paused: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let outcome = app.plan_pending_download(&pending, &job).unwrap();
+        assert!(
+            outcome.is_some(),
+            "the new record must survive planning once its duplicate is cleared from disk"
+        );
+        let updated = outcome.unwrap();
+        assert_eq!(updated.id, "clip-pending");
+        assert_eq!(updated.filename, planned_filename);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    fn detected_item(url: &str, kind: &str) -> DetectedItem {
+        DetectedItem {
+            url: url.to_string(),
+            page_url: None,
+            audio_url: None,
+            title: None,
+            filename: None,
+            poster: None,
+            kind: Some(kind.to_string()),
+            mime_type: None,
+            size_bytes: None,
+            duration_secs: None,
+            detected_unix: None,
+        }
+    }
+
+    #[test]
+    fn store_detected_keeps_videos_when_images_flood() {
+        // The detector used to show images only: 200 image
+        // detections crowded every video out of the capped list.
+        // Trimming must drop the oldest IMAGE first, so a video
+        // (or PDF) survives the flood.
+        let dir = test_data_dir("fetchforge-test-detected-fairness");
+        let app = App::new(dir);
+        let mut items: Vec<DetectedItem> = (0..200)
+            .map(|i| detected_item(&format!("https://example.com/img{i}.jpg"), "image"))
+            .collect();
+        items.push(detected_item("https://example.com/movie.m3u8", "video"));
+        items.push(detected_item("https://example.com/manual.pdf", "document"));
+        let stored = app.store_detected(items);
+        assert_eq!(stored, 202);
+        let list = app.detected.lock().unwrap();
+        assert_eq!(list.len(), MAX_DETECTED_ITEMS);
+        assert!(
+            list.iter()
+                .any(|d| d.url == "https://example.com/movie.m3u8"),
+            "video crowded out by images"
+        );
+        assert!(
+            list.iter()
+                .any(|d| d.url == "https://example.com/manual.pdf"),
+            "PDF crowded out by images"
+        );
+        // Two oldest images gave way, not the newcomers.
+        assert!(!list.iter().any(|d| d.url == "https://example.com/img0.jpg"));
+        assert!(!list.iter().any(|d| d.url == "https://example.com/img1.jpg"));
+    }
+
+    #[test]
+    fn clear_detected_empties_list_and_file() {
+        let dir = test_data_dir("fetchforge-test-detected-clear");
+        let app = App::new(dir.clone());
+        app.store_detected(vec![
+            detected_item("https://example.com/a.jpg", "image"),
+            detected_item("https://example.com/b.mp4", "video"),
+        ]);
+        assert!(dir.join("detected.json").is_file());
+        let removed = app.clear_detected();
+        assert_eq!(removed, 2);
+        assert!(app.detected.lock().unwrap().is_empty());
+        assert!(!dir.join("detected.json").is_file());
+        // Clearing an empty list is a no-op, not an error.
+        assert_eq!(app.clear_detected(), 0);
+    }
+
+    fn test_record(id: &str, filename: &str, status: Status) -> DownloadRecord {
+        // Current timestamps: the store's anti-resurrection rule
+        // drops records absent from disk whose updated_unix is
+        // older than the removal grace period, so an ancient
+        // timestamp would make save()/reload() discard the record.
+        let now = now_unix();
+        DownloadRecord {
+            id: id.to_string(),
+            url: format!("https://example.com/{filename}"),
+            filename: filename.to_string(),
+            destination: String::new(),
+            category: "Video".to_string(),
+            status,
+            total_bytes: None,
+            downloaded_bytes: 0,
+            resumable: true,
+            error: None,
+            created_unix: now,
+            updated_unix: now,
+            format_id: None,
+            needs_merge: false,
+            format_selector: None,
+            stream_kind: None,
+            referer: None,
+            audio_url: None,
+            duplicate: false,
+            segments_total: None,
+            segments_done: 0,
+            estimated_total_bytes: None,
+        }
+    }
+
+    #[test]
+    fn clear_cache_keeps_live_download_pieces() {
+        // Cache clear must remove temp files for terminal/orphaned
+        // downloads only. A queued download's segment dir, a paused
+        // download's segment dir, and a live download's manifest
+        // sidecar must all survive; a completed download's pieces,
+        // an orphan's pieces, a stale tmp file, and the detector
+        // store must go. Downloaded files are never touched.
+        let dir = test_data_dir("fetchforge-test-cache-clear");
+        let downloads = std::env::temp_dir().join("fetchforge-test-cache-clear-dl");
+        let _ = std::fs::remove_dir_all(&downloads);
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::json!({"download_dir": downloads.to_string_lossy()}).to_string(),
+        )
+        .unwrap();
+        let app = App::new(dir.clone());
+        {
+            let mut store = app.store.lock().unwrap();
+            store.upsert(test_record("live-id", "live-movie.mp4", Status::Queued));
+            store.upsert(test_record("paused-id", "paused-movie.mp4", Status::Paused));
+            store.upsert(test_record("done-id", "done-movie.mp4", Status::Completed));
+            let _ = store.save();
+        }
+        // Segment dirs: live, paused, done, orphan.
+        for name in [
+            "live-movie.mp4.part.seg",
+            "paused-movie.mp4.part.seg",
+            "done-movie.mp4.part.seg",
+            "orphan.mp4.part.seg",
+        ] {
+            let d = downloads.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("000000.seg"), b"SEGMENT").unwrap();
+        }
+        // Legacy sidecar for the done download.
+        std::fs::write(downloads.join("done-movie.mp4.part.segments"), b"done=1\n").unwrap();
+        // A real downloaded file: never touched.
+        std::fs::write(downloads.join("done-movie.mp4"), b"MOVIE").unwrap();
+        // Manifest sidecars: live (keep), done + missing (remove).
+        save_manifest_sidecar(&dir, "live-id", "#EXTM3U\n");
+        save_manifest_sidecar(&dir, "done-id", "#EXTM3U\n");
+        save_manifest_sidecar(&dir, "missing-id", "#EXTM3U\n");
+        // Stale tmp + a detector item.
+        std::fs::write(dir.join("stale.tmp"), b"tmp").unwrap();
+        app.store_detected(vec![detected_item("https://example.com/a.jpg", "image")]);
+
+        let (removed_files, freed_bytes) = app.clear_cache();
+        assert!(removed_files > 0, "nothing was cleared");
+        assert!(freed_bytes > 0, "nothing was freed");
+        // Live + paused pieces survive.
+        assert!(downloads.join("live-movie.mp4.part.seg").is_dir());
+        assert!(downloads.join("paused-movie.mp4.part.seg").is_dir());
+        assert!(manifest_sidecar_path(&dir, "live-id").is_file());
+        // Terminal + orphan temp files are gone.
+        assert!(!downloads.join("done-movie.mp4.part.seg").exists());
+        assert!(!downloads.join("orphan.mp4.part.seg").exists());
+        assert!(!downloads.join("done-movie.mp4.part.segments").exists());
+        assert!(!manifest_sidecar_path(&dir, "done-id").exists());
+        assert!(!manifest_sidecar_path(&dir, "missing-id").exists());
+        assert!(!dir.join("stale.tmp").exists());
+        assert!(app.detected.lock().unwrap().is_empty());
+        // The downloaded file itself is untouched.
+        assert_eq!(
+            std::fs::read(downloads.join("done-movie.mp4")).unwrap(),
+            b"MOVIE"
+        );
+        let _ = std::fs::remove_dir_all(&downloads);
+    }
+
+    #[test]
+    fn manifest_sidecar_round_trip_and_oversize_ignored() {
+        let dir = test_data_dir("fetchforge-test-manifest-sidecar");
+        save_manifest_sidecar(&dir, "rec-1", "#EXTM3U\n#EXTINF:10,\nseg0.ts\n");
+        let got = read_manifest_sidecar(&dir, "rec-1", "https://cdn.example.com/v.m3u8")
+            .expect("sidecar readable");
+        assert_eq!(got.url, "https://cdn.example.com/v.m3u8");
+        assert!(got.text.contains("#EXTM3U"));
+        delete_manifest_sidecar(&dir, "rec-1");
+        assert!(read_manifest_sidecar(&dir, "rec-1", "https://cdn.example.com/v.m3u8").is_none());
+        // Oversize captures are ignored (with a warning), never
+        // written — the worker fetches the manifest normally.
+        let big = "x".repeat(MAX_CAPTURED_MANIFEST_BYTES + 1);
+        save_manifest_sidecar(&dir, "rec-2", &big);
+        assert!(!manifest_sidecar_path(&dir, "rec-2").is_file());
+    }
+
+    #[test]
+    fn filename_matches_unique_handles_collision_suffixes() {
+        assert!(filename_matches_unique("movie.mp4", "movie.mp4"));
+        assert!(filename_matches_unique("movie (1).mp4", "movie.mp4"));
+        assert!(filename_matches_unique("movie (12).mp4", "movie.mp4"));
+        assert!(!filename_matches_unique("movie (x).mp4", "movie.mp4"));
+        assert!(!filename_matches_unique("movie (1).mkv", "movie.mp4"));
+        assert!(!filename_matches_unique("other.mp4", "movie.mp4"));
+        assert!(!filename_matches_unique("movie.mp4", "movie (1).mp4"));
     }
 }

@@ -400,6 +400,9 @@ pub fn download_gltf_bundle(
                         downloaded: base,
                         total: plan.total_bytes,
                         bytes_per_sec: 0.0,
+                        segments_done: None,
+                        segments_total: None,
+                        estimated_total: None,
                     });
                     continue;
                 }
@@ -432,6 +435,9 @@ pub fn download_gltf_bundle(
                 downloaded: base_before + p.downloaded,
                 total,
                 bytes_per_sec: p.bytes_per_sec,
+                segments_done: None,
+                segments_total: None,
+                estimated_total: None,
             });
         };
         let got = download(&file_opts, &file_progress, paused, cancelled).map_err(|e| {
@@ -451,6 +457,9 @@ pub fn download_gltf_bundle(
         downloaded: base,
         total: plan.total_bytes,
         bytes_per_sec: 0.0,
+        segments_done: None,
+        segments_total: None,
+        estimated_total: None,
     });
     Ok(main_target)
 }

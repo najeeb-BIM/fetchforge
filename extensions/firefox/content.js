@@ -11,6 +11,13 @@
 // URLs are only sent to the app when the user clicks Download, or as a
 // detected-media report (URL + confirmed metadata only, no credentials).
 //
+// Round 6 adds a MAIN-world fetch/XHR hook (see the manifest-hook
+// section below) that captures playlist TEXT the player itself
+// received — the playlist body, never cookies, credentials, or page
+// content — so a single-use signed playlist still downloads. The hook
+// is best-effort: a strict page CSP may block its inline script, in
+// which case the resource-timing fallback below still applies.
+//
 // It never runs on chrome://, about:, or extension pages: the manifest
 // matches http(s) only, and the protocol check below is a second line
 // of defence.
@@ -51,6 +58,188 @@
   // document_start, before the player loads — so the playlist is
   // still in the log when the stream picker looks for it.
   try { performance.setResourceTimingBufferSize(5000); } catch (_) {}
+
+  // ---- MAIN-world manifest hook (round 6, study B2/A8) ----
+  //
+  // TECHNIQUE ONLY, reimplemented from scratch: the idea of hooking
+  // fetch/XHR in the page's MAIN world to clone playlist responses
+  // comes from the published description of XDM's hls-hook.js
+  // (GPL-3.0). No code, identifiers, comments, or structure were
+  // copied from it; everything below is original FetchForge code.
+  //
+  // Why: on novahd the playlist the player loads never appears in
+  // any frame's resource-timing log (fetched before this script
+  // runs, or via a path the timing API does not surface), so the
+  // picker fell back to a 15-second preview clip. The hook sees
+  // what the player sees: it clones 2xx playlist responses and
+  // forwards the TEXT to this content script, which keeps it per
+  // URL and attaches it to the download. Some CDNs sign a playlist
+  // link for a single request, so re-fetching it from the app gets
+  // 403 — the captured text is the only copy that works.
+  //
+  // Privacy: only playlist text + its URL are captured — never
+  // cookies, credentials, headers, or page content. A worker-loaded
+  // playlist is NOT seen by this hook (workers have their own
+  // fetch); the timing-log fallback below still covers those.
+  //
+  // CSP caveat: a strict page CSP (script-src without
+  // 'unsafe-inline') blocks the injected inline script, so the hook
+  // never runs on such pages. That is fine: the hook is best-effort
+  // and its failure must NEVER break the button or the timing-log
+  // fallback — injection and every hook step are wrapped so a
+  // failure is silent and the rest of this script runs unchanged.
+  //
+  // Anti-spoof token: the injected code gets a random per-page-load
+  // token and echoes it in every message; the listener below only
+  // accepts messages carrying it, so a page script cannot forge a
+  // fake manifest into the download path. (Not a security boundary
+  // — a page observing DOM mutations could read the token from the
+  // script element before it is removed — but it stops casual
+  // postMessage spoofing.)
+  const HOOK_TOKEN = (function () {
+    try {
+      const b = new Uint8Array(16);
+      crypto.getRandomValues(b);
+      return Array.from(b, function (x) { return ("0" + x.toString(16)).slice(-2); }).join("");
+    } catch (_) { return "ff-" + Math.random().toString(36).slice(2) + Date.now().toString(36); }
+  })();
+  // 256 KB cap per captured playlist, enforced in BOTH worlds: a VOD
+  // master/variant is a few KB, but a live playlist can grow without
+  // bound and must never bloat the download message. Text over the
+  // cap is dropped here and in the hook; the URL is still sent and
+  // the engine fetches the playlist normally.
+  const MANIFEST_TEXT_MAX = 262144;
+  // Captured playlist text by URL: url -> { text, at } (at is
+  // performance.now() at capture time, for ranking). First capture
+  // wins per URL: the player's first fetch carries the signed link;
+  // later re-fetches of the same URL add nothing for a VOD stream.
+  const capturedManifests = new Map();
+  window.addEventListener("message", function (e) {
+    if (e.source !== window) return;
+    const d = e.data;
+    if (!d || d.type !== "ff-manifest" || d.token !== HOOK_TOKEN) return;
+    if (typeof d.text !== "string" || d.text.length > MANIFEST_TEXT_MAX) return;
+    const url = resolveUrl(d.url);
+    if (!url || !/^https?:\/\//i.test(url)) return;
+    if (capturedManifests.has(url)) return;
+    capturedManifests.set(url, { text: d.text, at: performance.now() });
+    // A newly captured playlist may change this frame's stream
+    // (the clip becomes ineligible — see scanResourceStreams), so
+    // re-scan and re-report to the election promptly.
+    scheduleScan();
+  });
+  // The hook itself. NEVER called in this (isolated) world: it is
+  // stringified and injected as an inline <script> into the page's
+  // MAIN world, where it runs with the page's own fetch/XHR. It
+  // must therefore be fully self-contained (no outer references
+  // except its `token` argument) and must never throw into page
+  // code: every step is guarded, the original fetch promise and
+  // the original XHR behaviour are always preserved.
+  function manifestHookMain(token) {
+    var MAX_TEXT = 262144; // 256 KB cap, mirrored in the content script
+    function isPlaylistUrl(u) { return /\.m3u8([?#]|$)/i.test(u) || /\.mpd([?#]|$)/i.test(u); }
+    function isPlaylistType(ct) {
+      ct = String(ct || "").toLowerCase();
+      return ct.indexOf("mpegurl") !== -1 || ct.indexOf("dash+xml") !== -1;
+    }
+    function looksLikePlaylist(text, url) {
+      if (/\.m3u8([?#]|$)/i.test(url)) return text.indexOf("#EXTM3U") !== -1;
+      if (/\.mpd([?#]|$)/i.test(url)) return text.indexOf("<MPD") !== -1;
+      // URL gave no hint (matched by content-type only): accept
+      // either playlist shape.
+      return text.indexOf("#EXTM3U") !== -1 || text.indexOf("<MPD") !== -1;
+    }
+    function absUrl(u) {
+      try { return new URL(String(u), window.location.href).href; } catch (_) { return String(u || ""); }
+    }
+    function forward(url, text) {
+      if (typeof text !== "string" || text.length > MAX_TEXT) return;
+      try { window.postMessage({ type: "ff-manifest", token: token, url: url, text: text }, "*"); } catch (_) {}
+    }
+    function maybeForward(url, text, contentType) {
+      var u = absUrl(url);
+      if (!u) return;
+      if (!isPlaylistUrl(u) && !isPlaylistType(contentType)) return;
+      if (!looksLikePlaylist(text, u)) return;
+      forward(u, text);
+    }
+    try {
+      var origFetch = window.fetch;
+      if (typeof origFetch === "function") {
+        window.fetch = function (input) {
+          var url = "";
+          try {
+            if (typeof input === "string") url = input;
+            else if (input && typeof input.url === "string") url = input.url;
+          } catch (_) {}
+          var p = origFetch.apply(this, arguments);
+          if (!url) return p;
+          return p.then(function (resp) {
+            try {
+              if (resp && resp.ok) {
+                var clone = resp.clone();
+                var ct = "";
+                try { ct = clone.headers.get("content-type") || ""; } catch (_) {}
+                if (isPlaylistUrl(absUrl(url)) || isPlaylistType(ct)) {
+                  clone.text().then(function (t) { maybeForward(url, t, ct); }).catch(function () {});
+                }
+              }
+            } catch (_) {}
+            return resp;
+          });
+        };
+      }
+    } catch (_) {}
+    try {
+      var origOpen = XMLHttpRequest.prototype.open;
+      var origSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function (method, url) {
+        try { this.__ffManifestUrl = url; } catch (_) {}
+        return origOpen.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function () {
+        var xhr = this;
+        try {
+          xhr.addEventListener("load", function () {
+            try {
+              if (xhr.status >= 200 && xhr.status < 300 && typeof xhr.responseText === "string") {
+                var ct = "";
+                try { ct = xhr.getResponseHeader("Content-Type") || ""; } catch (_) {}
+                maybeForward(xhr.__ffManifestUrl || "", xhr.responseText, ct);
+              }
+            } catch (_) {}
+          });
+        } catch (_) {}
+        return origSend.apply(this, arguments);
+      };
+    } catch (_) {}
+  }
+  let manifestHookInjected = false;
+  function injectManifestHook() {
+    if (manifestHookInjected) return true;
+    const root = document.documentElement;
+    if (!root) return false;
+    try {
+      const s = document.createElement("script");
+      s.textContent = "(" + manifestHookMain.toString() + ")(" + JSON.stringify(HOOK_TOKEN) + ");";
+      root.appendChild(s);
+      s.remove();
+      manifestHookInjected = true;
+      return true;
+    } catch (_) { return false; } // CSP or DOM failure: best-effort only
+  }
+  if (!injectManifestHook()) {
+    // documentElement does not exist yet at document_start: retry
+    // as soon as it appears, with DOMContentLoaded as a backstop.
+    const hookObserver = new MutationObserver(function () {
+      if (injectManifestHook()) hookObserver.disconnect();
+    });
+    try { hookObserver.observe(document, { childList: true }); } catch (_) {}
+    document.addEventListener("DOMContentLoaded", function () {
+      hookObserver.disconnect();
+      injectManifestHook();
+    }, { once: true });
+  }
 
   const api = typeof browser !== "undefined" ? browser : chrome;
   const isFirefox = typeof browser !== "undefined";
@@ -95,7 +284,7 @@
   //
   // A detector is { kind, selector, overlay, extract }:
   //   kind     - item kind reported to the app ("video" | "audio" |
-  //              "image" | "model")
+  //              "image" | "model" | "document")
   //   selector - CSS selector for candidate elements
   //   overlay  - true when detected elements get the download button
   //   extract  - (el) => item | null; item is { kind, url, viaPage,
@@ -108,11 +297,15 @@
   function registerDetector(detector) { detectors.push(detector); }
 
   // Best downloadable source for a <video>/<audio> element, or null.
-  // Returns { url, viaPage, viaStream? }: url is a direct http(s)
-  // media URL, or null with viaPage=true when the only source is a
-  // blob: URL (the page URL must be sent instead so the desktop app
-  // can extract the media). viaStream is set when the URL came from
-  // the resource-timing log rather than the DOM (see below).
+  // Returns { url, viaPage, viaStream?, manifestText?, masterText? }:
+  // url is a direct http(s) media URL, or null with viaPage=true when
+  // the only source is a blob: URL (the page URL must be sent instead
+  // so the desktop app can extract the media). viaStream is set when
+  // the URL came from the resource-timing log (or a captured manifest)
+  // rather than the DOM (see below). manifestText is the captured
+  // playlist text for url (if the MAIN-world hook saw it); masterText
+  // is the captured text of this frame's master playlist (if any) —
+  // the quality popup parses it into variant rows.
   //
   // Playlist-first: a playlist observed in the resource-timing log
   // beats ANY direct file in the DOM. The direct file is often a
@@ -139,14 +332,31 @@
       if (/^https?:\/\//i.test(u)) {
         // A playlist URL in the DOM is the stream itself, not a
         // file: it wins immediately.
-        if (STREAM_EXT_RE.test(u)) return { url: u, viaPage: false };
+        if (STREAM_EXT_RE.test(u)) {
+          const cap = capturedManifests.get(u);
+          const out = { url: u, viaPage: false };
+          if (cap) {
+            out.manifestText = cap.text;
+            // The DOM URL may itself be the master (its text
+            // contains #EXT-X-STREAM-INF); otherwise the frame's
+            // master text, if any, comes from the scan.
+            if (cap.text.indexOf("#EXT-X-STREAM-INF") !== -1 || cap.text.indexOf("<MPD") !== -1) {
+              out.masterText = cap.text;
+            } else {
+              const pl = findPlaylistFromResources();
+              if (pl && pl.masterText) out.masterText = pl.masterText;
+            }
+          }
+          return out;
+        }
         if (!directFile) directFile = u;
       }
     }
-    // A playlist in the resource-timing log beats the direct file:
-    // see the playlist-first note above.
+    // A playlist in the resource-timing log (or captured by the
+    // MAIN-world hook) beats the direct file: see the playlist-first
+    // note above.
     const playlist = findPlaylistFromResources();
-    if (playlist) return { url: playlist.url, viaPage: false, viaStream: true, audioUrl: playlist.audioUrl };
+    if (playlist) return { url: playlist.url, viaPage: false, viaStream: true, audioUrl: playlist.audioUrl, manifestText: playlist.manifestText, masterText: playlist.masterText };
     if (directFile) return { url: directFile, viaPage: false };
     if (sawBlob) {
       // The player loads its stream through Media Source Extensions:
@@ -157,7 +367,7 @@
       // already have been returned above; this only ever yields a
       // direct file the player fetched.)
       const stream = findStreamUrlFromResources();
-      if (stream) return { url: stream.url, viaPage: false, viaStream: true, audioUrl: stream.audioUrl };
+      if (stream) return { url: stream.url, viaPage: false, viaStream: true, audioUrl: stream.audioUrl, manifestText: stream.manifestText, masterText: stream.masterText };
       return { url: null, viaPage: true };
     }
     return null;
@@ -200,13 +410,23 @@
   // and stream pickers below. Returns { master, video, audio,
   // file }: the best observed URL of each kind (or null). Best =
   // player-initiated fetch first, then most recent (see the
-  // ranking comment on findStreamUrlFromResources).
+  // ranking comment on findStreamUrlFromResources). Captured
+  // manifests (MAIN-world hook) are merged into the same buckets
+  // with the highest rank: they are the playlist the player itself
+  // requested, even when the timing log never shows them.
+  //
+  // Per-frame playlist suppression (study B1, XDM m3u8MpdTabs
+  // TECHNIQUE reimplemented): once ANY playlist is seen among a
+  // frame's candidates, direct-file candidates from that frame are
+  // suppressed (file is nulled below). A direct file alongside a
+  // playlist is a preview/ad clip, never the stream that is
+  // playing — it must become ineligible the moment a playlist
+  // exists, in this frame's log OR in its captured manifests.
   function scanResourceStreams() {
-    const empty = { master: null, video: null, audio: null, file: null };
     let entries = [];
     try {
       entries = performance.getEntriesByType("resource") || [];
-    } catch (_) { return empty; }
+    } catch (_) { entries = []; } // fall through: captured manifests may still exist
     const rankOf = function (e) {
       const it = e.initiatorType || "";
       return (it === "video" || it === "audio" || it === "fetch" || it === "xmlhttprequest") ? 1 : 0;
@@ -232,20 +452,56 @@
         if (better(cand, out.file)) out.file = cand;
       }
     }
+    // Merge captured manifests: kind by playlist STRUCTURE (B3) —
+    // a master contains #EXT-X-STREAM-INF, a DASH manifest is the
+    // whole stream — with the stem heuristic only to spot an audio
+    // media playlist. Rank 2 beats any timing entry; the captured
+    // text rides along so the download can carry it (see
+    // pickPlaylist). A captured URL with no playlist extension
+    // (matched by content-type in the hook) still counts: its text
+    // proves it is a playlist.
+    capturedManifests.forEach(function (cap, url) {
+      const isMaster = cap.text.indexOf("#EXT-X-STREAM-INF") !== -1 || cap.text.indexOf("<MPD") !== -1;
+      const kind = isMaster ? "master" : (AUDIO_STEM_RE.test(url.split(/[?#]/)[0].split("/").pop() || "") ? "audio" : "video");
+      const cand = { url: url, rank: 2, startTime: cap.at, text: cap.text };
+      if (kind === "master") {
+        if (better(cand, out.master)) out.master = cand;
+      } else if (kind === "audio") {
+        if (better(cand, out.audio)) out.audio = cand;
+      } else {
+        if (better(cand, out.video)) out.video = cand;
+      }
+    });
+    // Attach captured text to timing-log winners too: a manifest
+    // the hook captured AND the log shows is the same playlist.
+    for (const k of ["master", "video", "audio"]) {
+      if (out[k] && !out[k].text) {
+        const cap = capturedManifests.get(out[k].url);
+        if (cap) out[k].text = cap.text;
+      }
+    }
+    // Playlist suppression (see the header note): a playlist
+    // anywhere in this frame makes its direct files ineligible.
+    if (out.master || out.video || out.audio) out.file = null;
     return out;
   }
   // Pick the playlist from a scan: a master is the whole stream
   // (send it alone); otherwise pair the video variant with its
   // audio sibling; an audio-only variant goes alone. Returns
-  // { url, audioUrl? } or null.
+  // { url, audioUrl?, manifestText?, masterText? } or null.
+  // manifestText is the captured text for the returned URL (if
+  // any); masterText is the captured text of the frame's master
+  // playlist (if any) — the popup parses it into variant rows even
+  // when the download URL itself is a variant.
   function pickPlaylist(s) {
-    if (s.master) return { url: s.master.url };
+    const masterText = (s.master && s.master.text) || undefined;
+    if (s.master) return { url: s.master.url, manifestText: s.master.text, masterText: masterText };
     if (s.video) {
-      const out = { url: s.video.url };
+      const out = { url: s.video.url, manifestText: s.video.text, masterText: masterText };
       if (s.audio) out.audioUrl = s.audio.url;
       return out;
     }
-    if (s.audio) return { url: s.audio.url };
+    if (s.audio) return { url: s.audio.url, manifestText: s.audio.text, masterText: masterText };
     return null;
   }
   // Best playlist (master or variant) observed in the log, or
@@ -255,9 +511,11 @@
   function findPlaylistFromResources() {
     return pickPlaylist(scanResourceStreams());
   }
-  // Returns { url, audioUrl? } or null: url is the manifest/file
-  // to send; audioUrl is set only when url is a video variant and
-  // a sibling audio variant was observed alongside it.
+  // Returns { url, audioUrl?, manifestText?, masterText? } or null:
+  // url is the manifest/file to send; audioUrl is set only when
+  // url is a video variant and a sibling audio variant was observed
+  // alongside it. manifestText/masterText ride along from
+  // pickPlaylist (see above) when the hook captured them.
   function findStreamUrlFromResources() {
     const s = scanResourceStreams();
     return pickPlaylist(s) || (s.file ? { url: s.file.url } : null);
@@ -287,6 +545,19 @@
       };
       if (src.viaStream) item.viaStream = true;
       if (src.audioUrl) item.audioUrl = src.audioUrl;
+      if (kind === "video") {
+        // Poster + duration are confirmed metadata for the Media
+        // Detector panel (round 6): the poster only when the
+        // element actually has one, the duration only when it is a
+        // finite number of seconds (NaN = no metadata yet,
+        // Infinity = live stream — both omitted, never guessed).
+        const posterRaw = el.getAttribute && el.getAttribute("poster");
+        if (posterRaw) {
+          const poster = resolveUrl(posterRaw);
+          if (poster && /^https?:\/\//i.test(poster)) item.poster = poster;
+        }
+        if (typeof el.duration === "number" && isFinite(el.duration)) item.duration = el.duration;
+      }
       return item;
     };
   }
@@ -417,6 +688,31 @@
   registerDetector({ kind: "model", selector: "model-viewer", overlay: false, extract: extractModelViewer });
   registerDetector({ kind: "model", selector: "a[href]", overlay: false, extract: extractModelLink });
 
+  // ---- Document detection (round 6) ----
+  //
+  // Links ending in .pdf, reported as kind "document" with the
+  // filename from the URL. No overlay button on documents (same
+  // reasoning as images: a button on every link would spam the
+  // page); documents flow through reportMedia into the popup list
+  // and the Media Detector panel, where the user picks them.
+  const DOCUMENT_EXT_RE = /\.pdf([?#]|$)/i;
+
+  function extractDocumentLink(el) {
+    if (!isVisible(el)) return null;
+    const raw = el.getAttribute && el.getAttribute("href");
+    const u = raw && resolveUrl(raw);
+    if (!u || !DOCUMENT_EXT_RE.test(u)) return null;
+    return {
+      kind: "document",
+      url: u,
+      viaPage: false,
+      title: mediaTitle(el),
+      filename: fileNameFromUrl(u),
+    };
+  }
+
+  registerDetector({ kind: "document", selector: "a[href]", overlay: false, extract: extractDocumentLink });
+
   // Full media list for the popup and for reporting, deduplicated by URL.
   function collectMedia() {
     const items = [];
@@ -466,19 +762,52 @@
   // Only the top frame has a button (see below), so in subframes
   // the shield is inert — but it is registered everywhere, because
   // the top frame is the one that needs it.
+  // The shield also covers the quality popup (round 6): clicks
+  // inside the popup are swallowed before the page's capture-phase
+  // handlers see them, exactly like clicks on the button — and the
+  // popup's own action is dispatched directly from here, because a
+  // swallowed event never reaches the popup's bubble listeners
+  // (same pattern as the button above).
   function overlayButtonFromEvent(e) {
     if (!floatOverlay) return null;
     const path = typeof e.composedPath === "function" ? e.composedPath() : [];
     if (path.indexOf(floatOverlay.button) !== -1) {
       return { button: floatOverlay.button };
     }
+    if (floatOverlay.popup && path.indexOf(floatOverlay.popup) !== -1) {
+      return { popup: true, path: path };
+    }
     return null;
   }
   function onOverlayEventCapture(e) {
     const hit = overlayButtonFromEvent(e);
-    if (!hit) return; // not our button: leave the page alone
-    if (e.type === "click" && !hit.button.disabled) {
-      onOverlayClick(hit.button);
+    if (!hit) return; // not our button/popup: leave the page alone
+    if (hit.popup && floatOverlay.filenameInput && hit.path.indexOf(floatOverlay.filenameInput) !== -1) {
+      // The filename field: a swallowed mousedown never focuses the
+      // input (preventDefault blocks focus), so focus it directly
+      // and select the whole name — one click, type a new name.
+      // The event is still swallowed below, so the page's popunder
+      // handlers never see the click. Typing needs no shield
+      // handling: key events never reach those handlers.
+      if (e.type === "mousedown" || e.type === "pointerdown") {
+        try { floatOverlay.filenameInput.focus(); floatOverlay.filenameInput.select(); } catch (_) {}
+      }
+    }
+    if (e.type === "click") {
+      if (hit.button && !hit.button.disabled) {
+        onOverlayClick(hit.button);
+      } else if (hit.popup) {
+        // Dispatch the clicked row's (or the X button's) action
+        // directly: the swallowed event never reaches the popup's
+        // own bubble listener. The first path element carrying a
+        // popup action wins (rows and the X button carry one).
+        for (const el of hit.path) {
+          if (el && el.dataset && (el.dataset.rowIdx !== undefined || el.dataset.ffClose !== undefined)) {
+            handlePopupClick(el);
+            break;
+          }
+        }
+      }
     }
     e.stopImmediatePropagation();
     e.stopPropagation();
@@ -489,6 +818,22 @@
   window.addEventListener("pointerdown", onOverlayEventCapture, true);
   window.addEventListener("mouseup", onOverlayEventCapture, true);
   window.addEventListener("pointerup", onOverlayEventCapture, true);
+
+  // Clicking anywhere outside the popup (or the button) dismisses
+  // the popup. Bubble phase, so it never sees button/popup clicks:
+  // the capture-phase shield above swallows those first. A click
+  // outside is the page's own business (its popunder handlers may
+  // fire, as for any click); the popup still closes.
+  window.addEventListener("click", function (e) {
+    if (!popupOpen || !floatOverlay) return;
+    const path = typeof e.composedPath === "function" ? e.composedPath() : [];
+    if (path.indexOf(floatOverlay.button) !== -1) return;
+    if (floatOverlay.popup && path.indexOf(floatOverlay.popup) !== -1) return;
+    closeQualityPopup();
+  });
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && popupOpen) closeQualityPopup();
+  });
 
   // ---- Floating download button (viewport-anchored, Top Layer) ----
   //
@@ -567,16 +912,100 @@
     return "see app";
   }
 
-  function onOverlayClick(btn) {
-    // The download source comes from the election verdict (the
-    // stream may live in a subframe this document cannot see).
-    // No verdict yet, or no stream anywhere: nothing to send.
-    if (!currentDownload || !currentDownload.url) return;
-    const dl = currentDownload;
+  // Send one download to the background and drive the button's
+  // Sending…/Sent/Already downloaded/Failed states (the states
+  // themselves are unchanged from round 5). opts overrides the
+  // verdict's fields for a popup choice: { url?, audioUrl?,
+  // formatId?, manifestText? }. `"key" in opts` distinguishes an
+  // EXPLICIT undefined (a variant pick has no audio sibling and no
+  // captured text of its own) from an absent key (fall back to the
+  // verdict's value) — passing the master's text for a variant URL
+  // would hand the engine the wrong playlist.
+  //
+  // Filename from the page title (round 6): the movie name beats
+  // the manifest stem ("index_287.ts"). The popup always offers a
+  // rename field (see openQualityPopup); these helpers compute its
+  // default and the one-click fallback name. The name is the STEM
+  // only — the engine appends the extension for the chosen format
+  // (.mp4 video, .m4a audio-only, .ts muxed HLS) and re-sanitises
+  // on receipt, so the JS sanitise below is for display: what the
+  // user sees in the field is what gets saved.
+  function sanitizeFilenameStem(name) {
+    // Mirror of the engine's sanitize_filename
+    // (crates/engine/src/filename.rs): Windows forbids
+    // < > : " / \ | ? * and control characters; trailing dots and
+    // spaces are silently mangled by Windows Explorer.
+    let out = String(name || "").replace(/[<>:\"/\\|?*\u0000-\u001f]/g, "_");
+    out = out.replace(/[. ]+$/, "").trim();
+    if (out.length > 100) out = out.slice(0, 100).replace(/[. ]+$/, "").trim();
+    return out;
+  }
+  function pageTitleStem() {
+    let title = (document.title || "").trim();
+    if (!title) return "";
+    // Streaming sites wrap the title: "Watch The Odyssey (2026) |
+    // NovaHD". Strip a leading "Watch " and a trailing " | <site>"
+    // suffix — both guarded so a real title is never emptied. A
+    // " - " suffix is NOT stripped: real titles contain hyphens
+    // ("Spider-Man - Homecoming"). Whatever survives, the user can
+    // still edit it in the popup's filename field.
+    title = title.replace(/^watch\s+/i, "").trim();
+    if (!title) return "";
+    title = title.replace(/\s*\|\s*[^|]*$/, "").trim();
+    return sanitizeFilenameStem(title);
+  }
+  function stemOfFilename(filename) {
+    // The verdict filename ("index_287.ts", "movie.mp4") without
+    // its extension — the fallback name when no page title or
+    // server title is available.
+    const base = String(filename || "").split(/[/\\]/).pop() || "";
+    const dot = base.lastIndexOf(".");
+    const stem = dot > 0 ? base.slice(0, dot) : base;
+    return sanitizeFilenameStem(stem);
+  }
+  function popupDefaultName(dl, serverTitle) {
+    // Best name known for the popup's filename field: the server's
+    // title (the formats response carries yt-dlp's clean title),
+    // then the page title, then the verdict filename's stem.
+    if (serverTitle) { const s = sanitizeFilenameStem(serverTitle); if (s) return s; }
+    const t = pageTitleStem();
+    if (t) return t;
+    const f = stemOfFilename(dl && dl.filename);
+    if (f) return f;
+    return "download";
+  }
+  // NOTE: do NOT use isPlaylistUrl here — that helper lives inside
+  // manifestHookMain (the MAIN-world hook) and is invisible to this
+  // scope; calling it threw a ReferenceError that silently killed
+  // the one-click send (caught by the popup harness, 2026-11-22).
+  function isManifestUrl(url) { return /\.(m3u8|mpd)([?#]|$)/i.test(String(url || "")); }
+  function defaultFilenameFor(dl) {
+    // One-click fallback name (no popup). Page URLs (YouTube etc.)
+    // keep the verdict's filename — usually none, so the app names
+    // the file from the extractor's title, which is cleaner than
+    // the page title ("Video Title - YouTube"). Manifest streams
+    // prefer the page title over the manifest stem. Direct files
+    // keep their real filename.
+    if (!dl) return undefined;
+    if (dl.viaPage) return dl.filename;
+    if (isManifestUrl(dl.url)) return pageTitleStem() || dl.filename;
+    return dl.filename;
+  }
+  function currentPopupFilename() {
+    const input = floatOverlay && floatOverlay.filenameInput;
+    const v = input ? sanitizeFilenameStem(input.value) : "";
+    return v || "download";
+  }
+  function sendCurrentDownload(btn, dl, opts) {
+    opts = opts || {};
+    const url = opts.url || dl.url;
+    const audioUrl = ("audioUrl" in opts) ? opts.audioUrl : dl.audioUrl;
+    const manifestText = ("manifestText" in opts) ? opts.manifestText : dl.manifestText;
+    const filename = ("filename" in opts && opts.filename) ? opts.filename : defaultFilenameFor(dl);
     btn.disabled = true;
     btn.textContent = "Sending…";
     btn.title = "";
-    sendRuntimeMessage({ type: "downloadMedia", url: dl.url, filename: dl.filename, audioUrl: dl.audioUrl, referer: dl.referer }).then(function (resp) {
+    sendRuntimeMessage({ type: "downloadMedia", url: url, filename: filename, audioUrl: audioUrl, referer: dl.referer, formatId: opts.formatId, manifestText: manifestText }).then(function (resp) {
       if (resp && resp.duplicate) {
         // Nothing new was queued: the file is already in the
         // app's downloads. Say so honestly — "Sent" would be a
@@ -606,6 +1035,308 @@
         btn.textContent = "↓ FetchForge";
         btn.title = "";
       }, 5000);
+    });
+  }
+
+  function onOverlayClick(btn) {
+    // The download source comes from the election verdict (the
+    // stream may live in a subframe this document cannot see).
+    // No verdict yet, or no stream anywhere: nothing to send.
+    if (!currentDownload || !currentDownload.url) return;
+    // The button toggles the popup: a click while it is open
+    // closes it instead of sending.
+    if (popupOpen) { closeQualityPopup(); return; }
+    const dl = currentDownload;
+    // HLS master with real choices: parse the captured master text
+    // (from the verdict) into variant rows and let the user pick.
+    // A master with a single variant and no audio groups is not a
+    // real choice — it falls through to the one-click send.
+    const masterText = dl.masterText || dl.manifestText;
+    if (masterText) {
+      const parsed = parseHlsMaster(masterText, dl.url);
+      if (parsed && parsed.rows.length >= 2) { openHlsPopup(btn, dl, parsed); return; }
+    }
+    // Page URL (viaPage, e.g. YouTube): ask the app for the
+    // page's formats and let the user pick a quality.
+    if (dl.viaPage) { openFormatsPopup(btn, dl); return; }
+    // Direct files (image/3D/PDF/direct .mp4) and single-variant
+    // streams keep the current one-click send: no popup, no choice
+    // to make.
+    sendCurrentDownload(btn, dl, {});
+  }
+
+  // ---- HLS master parsing (round 6, study C2/C3) ----
+  //
+  // Parses captured master-playlist text into variant rows reading
+  // like `1080p · 5.2 Mbps · H.264` (resolution · bandwidth ·
+  // friendly codec name), sorted by BANDWIDTH descending, plus
+  // audio-only rows from EXT-X-MEDIA audio groups. The top row is
+  // the highest-bandwidth variant, labelled "Best" and pre-selected.
+  // Returns { rows: [{ label, url, audioUrl?, selected }] } or null
+  // when the text is not a master playlist (no #EXT-X-STREAM-INF).
+  // Relative variant URIs resolve against the master URL.
+  function parseHlsAttrs(s) {
+    const out = {};
+    const re = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/g;
+    let m;
+    while ((m = re.exec(s))) {
+      let v = m[2];
+      if (v.length >= 2 && v.charAt(0) === '"' && v.charAt(v.length - 1) === '"') v = v.slice(1, -1);
+      out[m[1]] = v;
+    }
+    return out;
+  }
+  function resolveAgainst(raw, base) {
+    try { return new URL(String(raw).trim(), base).href; } catch (_) { return null; }
+  }
+  function friendlyCodec(codecs) {
+    const first = String(codecs || "").split(",")[0].trim().toLowerCase();
+    if (first.indexOf("avc1") === 0 || first.indexOf("avc3") === 0) return "H.264";
+    if (first.indexOf("hev1") === 0 || first.indexOf("hvc1") === 0) return "H.265";
+    if (first.indexOf("av01") === 0) return "AV1";
+    if (first.indexOf("vp09") === 0 || first.indexOf("vp9") === 0) return "VP9";
+    if (first.indexOf("mp4a") === 0) return "AAC";
+    if (first.indexOf("opus") === 0) return "Opus";
+    if (first.indexOf("ec-3") === 0) return "Dolby Digital+";
+    if (first.indexOf("ac-3") === 0) return "Dolby Digital";
+    return "";
+  }
+  function formatBandwidth(bw) {
+    const n = Number(bw);
+    if (!isFinite(n) || n <= 0) return "";
+    if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/\.0$/, "") + " Mbps";
+    return Math.round(n / 1000) + " kbps";
+  }
+  function hlsVariantHeight(attrs) {
+    const m = /^(\d+)x(\d+)$/.exec(String(attrs.RESOLUTION || ""));
+    return m ? parseInt(m[2], 10) : 0;
+  }
+  function parseHlsMaster(text, masterUrl) {
+    const lines = String(text || "").split(/\r?\n/);
+    const audioGroups = {}; // GROUP-ID -> { uri, name }
+    const variants = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line.indexOf("#EXT-X-MEDIA:") === 0) {
+        const attrs = parseHlsAttrs(line.slice("#EXT-X-MEDIA:".length));
+        if ((attrs.TYPE || "").toUpperCase() === "AUDIO" && attrs["GROUP-ID"] && !audioGroups[attrs["GROUP-ID"]]) {
+          audioGroups[attrs["GROUP-ID"]] = {
+            uri: attrs.URI ? resolveAgainst(attrs.URI, masterUrl) : null,
+            name: attrs.NAME || attrs.LANGUAGE || "",
+          };
+        }
+      } else if (line.indexOf("#EXT-X-STREAM-INF:") === 0) {
+        const attrs = parseHlsAttrs(line.slice("#EXT-X-STREAM-INF:".length));
+        // The variant URI is the next non-empty, non-comment line.
+        let uri = null;
+        for (let j = i + 1; j < lines.length; j++) {
+          const l = lines[j].trim();
+          if (!l) continue;
+          if (l.charAt(0) === "#") break;
+          uri = l; i = j; break;
+        }
+        if (!uri) continue;
+        const url = resolveAgainst(uri, masterUrl);
+        if (url) variants.push({ attrs: attrs, url: url });
+      }
+    }
+    if (!variants.length) return null; // not a master playlist
+    variants.sort(function (a, b) {
+      const ab = Number(a.attrs.BANDWIDTH || a.attrs["AVERAGE-BANDWIDTH"] || 0);
+      const bb = Number(b.attrs.BANDWIDTH || b.attrs["AVERAGE-BANDWIDTH"] || 0);
+      if (bb !== ab) return bb - ab;
+      return hlsVariantHeight(b.attrs) - hlsVariantHeight(a.attrs);
+    });
+    const rows = [];
+    const seenUrls = new Set();
+    variants.forEach(function (v, idx) {
+      if (seenUrls.has(v.url)) return; // duplicate variant URI
+      seenUrls.add(v.url);
+      const parts = [];
+      const h = hlsVariantHeight(v.attrs);
+      if (h) parts.push(h + "p");
+      const bw = formatBandwidth(v.attrs.BANDWIDTH || v.attrs["AVERAGE-BANDWIDTH"]);
+      if (bw) parts.push(bw);
+      const codec = friendlyCodec(v.attrs.CODECS);
+      if (codec) parts.push(codec);
+      let label = parts.join(" · ") || v.url.split("/").pop();
+      if (idx === 0) label = "Best · " + label;
+      // A variant with a separate audio group needs its audio
+      // sibling URL so the engine merges them; without an AUDIO
+      // group the audio is muxed into the variant itself. The
+      // master text is authoritative here — the timing-log sibling
+      // (dl.audioUrl) belongs to the download URL, not necessarily
+      // to this variant.
+      let audioUrl;
+      const groupId = v.attrs.AUDIO;
+      if (groupId && audioGroups[groupId] && audioGroups[groupId].uri) audioUrl = audioGroups[groupId].uri;
+      rows.push({ label: label, url: v.url, audioUrl: audioUrl, selected: idx === 0 });
+    });
+    // Audio-only rows, one per audio group with a downloadable URI.
+    // A group without a URI has its audio embedded in the variants
+    // and offers nothing to download separately.
+    Object.keys(audioGroups).forEach(function (gid) {
+      const g = audioGroups[gid];
+      if (!g.uri || seenUrls.has(g.uri)) return;
+      seenUrls.add(g.uri);
+      rows.push({ label: "Audio only" + (g.name ? " · " + g.name : ""), url: g.uri, audioUrl: undefined, selected: false });
+    });
+    return { rows: rows };
+  }
+
+  // ---- IDM-style quality popup (round 6, study C1–C3) ----
+  //
+  // Lives in the same top-layer popover host as the floating button
+  // (same shadow DOM), positioned above the button, so it inherits
+  // the button's top-layer placement and fullscreen embedding: it
+  // moves with the host and is never covered by page overlays.
+  // Clicking a row sends that choice immediately (the pre-selected
+  // row is only a highlighted default, not a separate confirm
+  // step). Dismissed via the X button, a click outside it, Escape,
+  // a click on the floating button, or a verdict change.
+  let popupOpen = false;
+  let popupRows = []; // [{ pick }] for the open popup, indexed by data-row-idx
+  let popupRequestId = 0; // invalidates a pending getFormats on close
+  let popupFilenameDirty = false; // true once the user edits the filename field
+  const FORMATS_TIMEOUT_MS = 15000;
+  function handlePopupClick(el) {
+    if (!el || !el.dataset) return;
+    if (el.dataset.ffClose !== undefined) { closeQualityPopup(); return; }
+    if (el.dataset.rowIdx !== undefined) {
+      const row = popupRows[Number(el.dataset.rowIdx)];
+      if (row) row.pick();
+    }
+  }
+  function closeQualityPopup() {
+    popupRequestId++; // a pending formats fetch must not send after a close
+    popupRows = [];
+    popupOpen = false;
+    if (floatOverlay && floatOverlay.popup) floatOverlay.popup.style.display = "none";
+  }
+  function openQualityPopup(titleText, subtitleText, defaultName) {
+    if (!floatOverlay) return false;
+    floatOverlay.popupTitle.textContent = titleText;
+    if (subtitleText) {
+      floatOverlay.popupSubtitle.textContent = subtitleText;
+      floatOverlay.popupSubtitle.style.display = "block";
+    } else {
+      floatOverlay.popupSubtitle.style.display = "none";
+    }
+    // The filename field is part of the popup chrome (not the body,
+    // so a rows refresh never wipes it): always present, pre-filled
+    // with the best name known. The formats popup upgrades it to
+    // the server's clean title once the response arrives, unless
+    // the user already typed their own name (dirty flag).
+    popupFilenameDirty = false;
+    if (floatOverlay.filenameInput) floatOverlay.filenameInput.value = defaultName || "download";
+    floatOverlay.popupBody.textContent = "";
+    popupRows = [];
+    floatOverlay.popup.style.display = "flex";
+    popupOpen = true;
+    return true;
+  }
+  function addQualityRow(label, selected, pick) {
+    const idx = popupRows.length;
+    popupRows.push({ pick: pick });
+    const row = document.createElement("button");
+    row.type = "button";
+    row.dataset.rowIdx = String(idx);
+    row.textContent = label;
+    row.title = label;
+    row.style.cssText = "display:block;width:100%;text-align:left;background:" + (selected ? "rgba(34,197,94,.25)" : "transparent")
+      + ";color:#f9fafb;border:0;border-radius:6px;padding:8px 10px;cursor:pointer;"
+      + "font:600 13px system-ui,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+    if (!selected) row.style.fontWeight = "400";
+    row.addEventListener("mouseenter", function () { row.style.background = selected ? "rgba(34,197,94,.35)" : "rgba(255,255,255,.08)"; });
+    row.addEventListener("mouseleave", function () { row.style.background = selected ? "rgba(34,197,94,.25)" : "transparent"; });
+    floatOverlay.popupBody.appendChild(row);
+    return row;
+  }
+  // Captured text for a URL in THIS frame, if the hook saw it.
+  // A variant URL from the master usually has no capture in the top
+  // frame (the player fetched it in a subframe); undefined then,
+  // and the engine fetches it normally from the fresh master URL.
+  function capturedTextFor(url) {
+    const cap = capturedManifests.get(url);
+    return cap ? cap.text : undefined;
+  }
+  function openHlsPopup(btn, dl, parsed) {
+    if (!openQualityPopup("Choose quality", null, popupDefaultName(dl, null))) return;
+    parsed.rows.forEach(function (r) {
+      addQualityRow(r.label, !!r.selected, function () {
+        const name = currentPopupFilename();
+        closeQualityPopup();
+        sendCurrentDownload(btn, dl, { url: r.url, audioUrl: r.audioUrl, manifestText: capturedTextFor(r.url), filename: name });
+      });
+    });
+  }
+  function openFormatsPopup(btn, dl) {
+    if (!openQualityPopup("Choose quality", null, popupDefaultName(dl, null))) return;
+    const loading = document.createElement("div");
+    loading.textContent = "Loading qualities…";
+    loading.style.cssText = "padding:10px;color:#9ca3af;font:400 13px system-ui,sans-serif;";
+    floatOverlay.popupBody.appendChild(loading);
+    const reqId = ++popupRequestId;
+    let settled = false;
+    // On timeout or error, fall back to the one-click send at
+    // default quality — NEVER leave the user with a dead button.
+    // Every path checks reqId: if the popup was closed meanwhile
+    // (X, outside click, verdict change), nothing is sent at all.
+    function fallbackOneClick() {
+      if (reqId !== popupRequestId) return;
+      // If the user typed a name while the qualities were loading,
+      // keep it — the fallback must not throw their rename away.
+      const name = popupFilenameDirty ? currentPopupFilename() : null;
+      closeQualityPopup();
+      sendCurrentDownload(btn, dl, name ? { filename: name } : {});
+    }
+    const timer = window.setTimeout(function () {
+      if (settled) return;
+      settled = true;
+      fallbackOneClick();
+    }, FORMATS_TIMEOUT_MS);
+    sendRuntimeMessage({ type: "getFormats", url: dl.url }).then(function (resp) {
+      if (settled || reqId !== popupRequestId) return;
+      settled = true;
+      window.clearTimeout(timer);
+      if (!resp || !resp.ok || !Array.isArray(resp.formats) || !resp.formats.length) {
+        fallbackOneClick();
+        return;
+      }
+      floatOverlay.popupTitle.textContent = "Choose quality";
+      if (resp.title) {
+        floatOverlay.popupSubtitle.textContent = resp.title;
+        floatOverlay.popupSubtitle.style.display = "block";
+        // Upgrade the filename field to the server's clean title
+        // (yt-dlp's title beats the page title's " - YouTube"
+        // suffix) — unless the user already typed their own name.
+        if (!popupFilenameDirty && floatOverlay.filenameInput) {
+          floatOverlay.filenameInput.value = sanitizeFilenameStem(resp.title) || floatOverlay.filenameInput.value;
+        }
+      }
+      floatOverlay.popupBody.textContent = "";
+      popupRows = [];
+      let anySelected = false;
+      resp.formats.forEach(function (f) {
+        const selected = !anySelected && f.format_id === resp.default_format_id;
+        if (selected) anySelected = true;
+        addQualityRow(f.label || f.format_id, selected, function () {
+          const name = currentPopupFilename();
+          closeQualityPopup();
+          sendCurrentDownload(btn, dl, { formatId: f.format_id, audioUrl: undefined, manifestText: undefined, filename: name });
+        });
+      });
+      // No format matched default_format_id: highlight the first
+      // row (the server lists its best first) instead of none.
+      if (!anySelected && popupRows.length) {
+        const first = floatOverlay.popupBody.querySelector("button");
+        if (first) { first.style.background = "rgba(34,197,94,.25)"; first.style.fontWeight = "600"; }
+      }
+    }).catch(function () {
+      if (settled || reqId !== popupRequestId) return;
+      settled = true;
+      window.clearTimeout(timer);
+      fallbackOneClick();
     });
   }
 
@@ -677,8 +1408,78 @@
       onOverlayClick(btn);
     });
     shadow.appendChild(btn);
+    // Quality popup (round 6): same shadow DOM, same top-layer
+    // host as the button, positioned ABOVE the button (absolute,
+    // bottom edge 8px above the host's top — the host's
+    // overflow:visible lets it paint outside the host's box, and
+    // the host hugs the button so the popup sits right above it).
+    // It inherits the button's fullscreen embedding: when the host
+    // moves inside the fullscreen element, the popup moves too.
+    const popup = document.createElement("div");
+    popup.style.cssText = "display:none;position:absolute;right:0;bottom:calc(100% + 8px);"
+      + "width:300px;max-height:340px;background:#111827;color:#f9fafb;"
+      + "border:1px solid rgba(255,255,255,.14);border-radius:10px;"
+      + "box-shadow:0 8px 24px rgba(0,0,0,.5);font:400 13px system-ui,sans-serif;"
+      + "pointer-events:auto;overflow:hidden;flex-direction:column;";
+    const popupHeader = document.createElement("div");
+    popupHeader.style.cssText = "display:flex;align-items:center;justify-content:space-between;"
+      + "padding:10px 12px 8px;border-bottom:1px solid rgba(255,255,255,.1);flex:none;";
+    const popupTitle = document.createElement("span");
+    popupTitle.textContent = "Choose quality";
+    popupTitle.style.cssText = "font-weight:600;";
+    const popupClose = document.createElement("button");
+    popupClose.type = "button";
+    popupClose.dataset.ffClose = "1";
+    popupClose.textContent = "×";
+    popupClose.title = "Close";
+    popupClose.style.cssText = "background:transparent;color:#9ca3af;border:0;cursor:pointer;"
+      + "font:400 18px/1 system-ui,sans-serif;padding:0 2px;";
+    popupHeader.appendChild(popupTitle);
+    popupHeader.appendChild(popupClose);
+    const popupSubtitle = document.createElement("div");
+    popupSubtitle.style.cssText = "display:none;padding:8px 12px 0;font-size:12px;color:#9ca3af;"
+      + "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:none;";
+    // Filename field (round 6): part of the popup chrome, above the
+    // rows, so a rows refresh (formats response) never wipes it. It
+    // is ALWAYS shown — even when no title could be fetched, the
+    // field is there with the best fallback name. The value is the
+    // stem only; the app adds the extension for the chosen format.
+    const popupNameRow = document.createElement("div");
+    popupNameRow.style.cssText = "padding:8px 12px 0;flex:none;";
+    const popupNameLabel = document.createElement("div");
+    popupNameLabel.textContent = "Filename";
+    popupNameLabel.style.cssText = "font-size:11px;color:#9ca3af;padding-bottom:4px;";
+    const popupNameInput = document.createElement("input");
+    popupNameInput.type = "text";
+    popupNameInput.placeholder = "download";
+    popupNameInput.dataset.ffFilename = "1";
+    popupNameInput.style.cssText = "width:100%;box-sizing:border-box;background:#1f2937;color:#f9fafb;"
+      + "border:1px solid rgba(255,255,255,.14);border-radius:6px;padding:7px 8px;"
+      + "font:400 13px system-ui,sans-serif;outline:none;";
+    popupNameInput.addEventListener("input", function () { popupFilenameDirty = true; });
+    popupNameRow.appendChild(popupNameLabel);
+    popupNameRow.appendChild(popupNameInput);
+    const popupNameNote = document.createElement("div");
+    popupNameNote.textContent = "The file type (.mp4, .m4a, …) is added automatically.";
+    popupNameNote.style.cssText = "font-size:11px;color:#6b7280;padding:4px 12px 0;flex:none;";
+    const popupBody = document.createElement("div");
+    popupBody.style.cssText = "overflow-y:auto;padding:6px;max-height:260px;";
+    popup.appendChild(popupHeader);
+    popup.appendChild(popupSubtitle);
+    popup.appendChild(popupNameRow);
+    popup.appendChild(popupNameNote);
+    popup.appendChild(popupBody);
+    // Fallback for the capture-phase shield (which dispatches
+    // popup clicks directly and swallows the event before it
+    // reaches this listener): same pattern as the button above.
+    popup.addEventListener("click", function (e) {
+      e.stopPropagation();
+      e.preventDefault();
+      handlePopupClick(e.target);
+    });
+    shadow.appendChild(popup);
     (document.body || document.documentElement).appendChild(host);
-    return { host: host, button: btn, popover: isPopover };
+    return { host: host, button: btn, popover: isPopover, popup: popup, popupTitle: popupTitle, popupSubtitle: popupSubtitle, popupBody: popupBody, filenameInput: popupNameInput };
   }
 
   // Show or hide the floating button from the current state.
@@ -694,6 +1495,9 @@
     if (!isTopFrame) return;
     if (!currentDownload) {
       if (floatOverlay) hideOverlayHost(floatOverlay);
+      // No stream anywhere: any open quality popup describes a
+      // stream that no longer exists.
+      if (popupOpen) closeQualityPopup();
       return;
     }
     if (!floatOverlay) floatOverlay = createFloatingButton();
@@ -806,11 +1610,20 @@
         key: overlayKeyFor(el),
         playing: isPlaying(el),
         area: Math.round(r.width * r.height),
+        // Duration in seconds, only when finite and > 0 (study B4):
+        // the background prefers the stream attached to the longest
+        // PLAYING video, so a 15s clip loses to a 2h52m film even
+        // when no playlist was observed anywhere. NaN (no metadata
+        // yet) and Infinity (live) report 0 — unknown, not long.
+        duration: (typeof el.duration === "number" && isFinite(el.duration) && el.duration > 0) ? el.duration : 0,
       };
       // The stream this video would download, resolved in THIS
       // frame (only this frame's timing log can see its playlist).
       // A viaPage source has no URL yet: the background fills in
       // this frame's page URL as the extraction target.
+      // manifestText/masterText ride along for the download: the
+      // captured playlist text for this frame's stream (see
+      // mediaSource).
       const src = mediaSource(el);
       if (src) {
         cand.source = {
@@ -818,6 +1631,8 @@
           viaPage: !!src.viaPage,
           filename: filenameForSource(src),
           audioUrl: src.audioUrl,
+          manifestText: src.manifestText,
+          masterText: src.masterText,
         };
       }
       cands.push(cand);
@@ -925,7 +1740,13 @@
     if (msg && msg.type === "getMedia") {
       sendResponse({ items: collectMedia() });
     } else if (msg && msg.type === "overlayVerdict") {
-      currentDownload = (msg.download && msg.download.url) ? msg.download : null;
+      const newDownload = (msg.download && msg.download.url) ? msg.download : null;
+      // A changed download invalidates any open quality popup:
+      // its rows described the previous stream.
+      if (popupOpen && (!newDownload || !currentDownload || newDownload.url !== currentDownload.url)) {
+        closeQualityPopup();
+      }
+      currentDownload = newDownload;
       refreshFloatingButton();
     }
   });

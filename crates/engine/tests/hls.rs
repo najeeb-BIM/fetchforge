@@ -53,6 +53,7 @@ fn hls_clear_playlist_concatenates_segments() {
         &|_| {},
         &paused,
         &cancelled,
+        None,
     );
     let _ = server.kill();
     let path = result.expect("HLS download should succeed");

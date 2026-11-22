@@ -65,14 +65,14 @@ async function verifyServer(token) {
   for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ j.hmac.charCodeAt(i);
   return diff === 0;
 }
-async function sendViaBridge(url, filename, referer, audioUrl) {
+async function sendViaBridge(url, filename, referer, audioUrl, formatId, manifestText) {
   const token = await getToken();
   if (!token) throw new Error("no-token");
   if (!(await verifyServer(token))) throw new Error("challenge-failed");
   const r = await fetch(BRIDGE + "/downloads", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-FetchForge-Token": token },
-    body: JSON.stringify({ url, filename, referer, audio_url: audioUrl }),
+    body: JSON.stringify({ url, filename, referer, audio_url: audioUrl, format_id: formatId, manifest_text: manifestText }),
   });
   if (!r.ok) throw new Error("bridge-" + r.status);
   // The bridge answers 202 once the download is queued;
@@ -89,11 +89,11 @@ async function sendViaBridge(url, filename, referer, audioUrl) {
   if (rec && rec.duplicate) return { ok: true, duplicate: true };
   return { ok: true };
 }
-async function sendViaNative(url, filename, referer, audioUrl) {
+async function sendViaNative(url, filename, referer, audioUrl, formatId, manifestText) {
   const resp = await callApi(
     (...a) => api.runtime.sendNativeMessage(...a),
     HOST,
-    { type: "addDownload", url, filename, referer, audio_url: audioUrl }
+    { type: "addDownload", url, filename, referer, audio_url: audioUrl, format_id: formatId, manifest_text: manifestText }
   );
   if (resp && resp.type === "error") throw new Error(resp.error);
   // Same as the bridge path: the native host forwards the bridge's
@@ -115,10 +115,18 @@ async function sendViaNative(url, filename, referer, audioUrl) {
 // came from (sent as the Referer header on segment requests —
 // signed CDNs refuse requests without it); audioUrl is a sibling
 // audio variant to download and merge with a video variant.
-async function sendDownload(url, filename, referer, audioUrl) {
+// formatId is the quality the user picked in the popup (a yt-dlp
+// format id for a page URL, undefined for a default send).
+// manifestText is playlist text the extension captured from the
+// player (round 6): the engine uses it instead of re-fetching a
+// possibly single-use signed playlist link. Over the 256 KB cap
+// it is dropped here (defence in depth — the content script
+// already caps at capture) and the engine fetches normally.
+async function sendDownload(url, filename, referer, audioUrl, formatId, manifestText) {
   if (!/^https?:\/\//i.test(url)) return { ok: false, error: "Not a web link" };
+  if (typeof manifestText === "string" && manifestText.length > 262144) manifestText = undefined;
   try {
-    const r = await sendViaNative(url, filename, referer, audioUrl);
+    const r = await sendViaNative(url, filename, referer, audioUrl, formatId, manifestText);
     // A real failure reason from the app (not a transport miss):
     // the native host already asked the bridge, so retrying the
     // bridge directly would only fail the same way again.
@@ -128,11 +136,31 @@ async function sendDownload(url, filename, referer, audioUrl) {
     if (r && r.ok === false) return r;
     return r;
   } catch (_) { /* host not installed */ }
-  try { return await sendViaBridge(url, filename, referer, audioUrl); } catch (_) { /* bridge not running / no token */ }
+  try { return await sendViaBridge(url, filename, referer, audioUrl, formatId, manifestText); } catch (_) { /* bridge not running / no token */ }
   // Documented fallback: let the browser handle it normally, and
   // record it so the popup can say so (not a silent fallback).
   try { await callApi((...a) => api.downloads.download(...a), { url, saveAs: false }); try { await callApi((...a) => api.storage.local.set(...a), { lastFallback: Date.now() }); } catch (_) {} return { ok: true, viaBrowser: true }; }
   catch (_) { return { ok: false, error: "Could not reach the FetchForge app" }; }
+}
+// Format list for the IDM-style quality popup (round 6, study C1):
+// POST the page URL to the bridge's POST /media/formats with the
+// stored token + HMAC challenge (same pattern as sendViaBridge).
+// The bridge probes the page and returns { title, extractor,
+// duration_secs, formats: [{ format_id, label, ext, kind, height,
+// width, abr, vbr, fps, filesize, filesize_approx, needs_merge }],
+// default_format_id, resolved_url? }. Only the page URL is sent —
+// no cookies, no credentials, no page content.
+async function getFormats(url) {
+  const token = await getToken();
+  if (!token) throw new Error("no-token");
+  if (!(await verifyServer(token))) throw new Error("challenge-failed");
+  const r = await fetch(BRIDGE + "/media/formats", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-FetchForge-Token": token },
+    body: JSON.stringify({ url }),
+  });
+  if (!r.ok) throw new Error("bridge-" + r.status);
+  return await r.json();
 }
 api.runtime.onInstalled.addListener(() => {
   try {
@@ -273,17 +301,34 @@ function bgManifestKind(url) {
   return "video";
 }
 // The stream the top frame's button downloads, picked from ALL
-// frames' reported sources. A playlist anywhere beats a direct
-// file anywhere: the playlist is the stream that is playing,
-// while a direct file is often a preview/ad clip (novahd
-// 2026-11-22: the top frame's clip won the election while the
-// movie's playlist sat in the player iframe's timing log, and the
-// click sent the clip). Within playlists — and when no playlist
-// was observed anywhere — the election winner decides, then a
-// playing candidate, then master > video > audio, then the
-// largest area. Returns { url, filename?, audioUrl?, referer? }
-// (referer is the frame the stream came from, sent as the Referer
-// header on segment requests) or null when no frame has a source.
+// frames' reported sources. Ranking order (round 6, study B1/B4):
+//   0. POOL: a playlist anywhere beats a direct file anywhere: the
+//      playlist is the stream that is playing, while a direct file
+//      is often a preview/ad clip (novahd 2026-11-22: the top
+//      frame's clip won the election while the movie's playlist
+//      sat in the player iframe's timing log, and the click sent
+//      the clip).
+//   1. DURATION of the PLAYING video, descending — the primary
+//      signal when no playlist was observed anywhere: a 15-second
+//      clip vs a 2h52m film separates cleanly on duration, while
+//      size does not (the novahd clip is 3.1 MB). Only PLAYING
+//      videos count (a paused/unknown-duration video scores 0),
+//      so a long paused video never beats the stream that is
+//      actually playing.
+//   2. Election winner (playing first, then largest area).
+//   3. Playing.
+//   4. Playlist kind: master > video > audio.
+//   5. Largest area.
+// Duration deliberately outranks the winner: the winner is picked
+// by playing + area alone, and a big autoplaying preview can win
+// the election while the film plays in another frame.
+// Returns { url, filename?, audioUrl?, referer?, viaPage?,
+// manifestText?, masterText? } (referer is the frame the stream
+// came from, sent as the Referer header on segment requests;
+// viaPage marks a page URL for the formats popup; manifestText is
+// the captured text for the download URL, masterText the captured
+// text of the frame's master playlist — see content.js) or null
+// when no frame has a source.
 function bestDownloadSource(tabId, winner) {
   const frames = tabOverlayCandidates.get(tabId);
   if (!frames) return null;
@@ -304,9 +349,18 @@ function bestDownloadSource(tabId, winner) {
     const k = bgManifestKind(e.cand.source.url);
     return k === "master" ? 2 : k === "video" ? 1 : 0;
   };
+  // Playing duration in seconds, else 0 (paused, live, or no
+  // metadata yet — see the ranking comment above).
+  const playingDuration = function (e) {
+    if (!e.cand.playing) return 0;
+    const d = e.cand.duration;
+    return (typeof d === "number" && isFinite(d) && d > 0) ? d : 0;
+  };
   const playlists = all.filter(isPlaylist);
   const pool = playlists.length ? playlists : all;
   pool.sort(function (a, b) {
+    const ad = playingDuration(a), bd = playingDuration(b);
+    if (ad !== bd) return bd - ad;
     const aw = isWinner(a) ? 1 : 0, bw = isWinner(b) ? 1 : 0;
     if (aw !== bw) return bw - aw;
     const ap = a.cand.playing ? 1 : 0, bp = b.cand.playing ? 1 : 0;
@@ -317,7 +371,7 @@ function bestDownloadSource(tabId, winner) {
   });
   const best = pool[0];
   const s = best.cand.source;
-  return { url: s.url, filename: s.filename, audioUrl: s.audioUrl, referer: best.frameUrl };
+  return { url: s.url, filename: s.filename, audioUrl: s.audioUrl, referer: best.frameUrl, viaPage: !!s.viaPage, manifestText: s.manifestText, masterText: s.masterText };
 }
 function electOverlay(tabId) {
   const frames = tabOverlayCandidates.get(tabId);
@@ -375,10 +429,22 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // in the top frame, but the stream may come from a subframe, so
     // the verdict carries the source frame's URL); fall back to the
     // sending frame's URL when no referer was given. The audio URL
-    // is a sibling audio variant to merge.
+    // is a sibling audio variant to merge. formatId is the quality
+    // the user picked in the popup; manifestText is playlist text
+    // the content script captured from the player (round 6).
     if (!_sender || !_sender.tab) { sendResponse({ ok: false, error: "No tab" }); return false; }
     const referer = msg.referer || (_sender && _sender.url) || (_sender.tab && _sender.tab.url) || undefined;
-    sendDownload(msg.url, msg.filename, referer, msg.audioUrl).then((r) => sendResponse({ ok: r.ok, error: r.error, duplicate: r.duplicate }));
+    sendDownload(msg.url, msg.filename, referer, msg.audioUrl, msg.formatId, msg.manifestText).then((r) => sendResponse({ ok: r.ok, error: r.error, duplicate: r.duplicate }));
+    return true;
+  }
+  if (msg && msg.type === "getFormats") {
+    // Quality popup asking for a page's formats (round 6). Only
+    // accept from a real tab's content script; the content script
+    // falls back to a one-click default send on any failure here,
+    // so an error response must never leave the button dead.
+    if (!_sender || !_sender.tab) { sendResponse({ ok: false, error: "No tab" }); return false; }
+    getFormats(msg.url).then((j) => sendResponse(Object.assign({ ok: true }, j)))
+      .catch((e) => sendResponse({ ok: false, error: (e && e.message) || "formats failed" }));
     return true;
   }
   if (msg && msg.type === "overlayCandidates") {

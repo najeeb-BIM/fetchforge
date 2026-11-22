@@ -51,6 +51,7 @@
     <div class="detector-controls">
       <button id="detSelectAllBtn" class="secondary">Select all</button>
       <button id="detDownloadBtn">Download selected</button>
+      <button id="detClearBtn" class="secondary">Clear detector</button>
     </div>
     <p id="detEmpty">No media detected yet. Open a page with video or audio in a paired browser and it will appear here.</p>
     <div id="detList" class="det-list"></div>
@@ -68,6 +69,7 @@
     </select>
     <button id="refreshBtn">Refresh</button>
     <button id="clearFinishedBtn" class="secondary">Clear finished</button>
+    <button id="clearCacheBtn" class="secondary">Clear cache</button>
     <span id="status">Starting...</span>
   </section>
   <section id="tokenBox" class="token-box" hidden>
@@ -171,6 +173,8 @@ async function api(path, method = "GET", body) {
     if (path === "/pair/status" && method === "GET") return invokeTimed("pair_status");
     if (path === "/media/formats" && method === "POST") return invokeTimed("media_formats", body, FORMATS_TIMEOUT_MS);
     if (path === "/media/detected" && method === "GET") return invokeTimed("list_detected_media");
+    if (path === "/media/detected/clear" && method === "POST") return invokeTimed("clear_detected_media");
+    if (path === "/cache/clear" && method === "POST") return invokeTimed("clear_cache");
     const m = path.match(/^\/downloads\/(.+)\/(pause|resume|cancel)$/);
     if (m) return invokeTimed(m[2] + "_download", { id: m[1] });
     throw new Error("Unsupported Tauri call " + path);
@@ -265,6 +269,16 @@ function renderDashboard(all) {
   }
 }
 
+// Last path segment of a URL, decoded, query stripped. "" when the
+// URL has no usable basename (or is not a URL at all).
+function urlBasename(url) {
+  try {
+    const seg = new URL(url).pathname.split("/").filter(Boolean).pop();
+    if (!seg) return "";
+    try { return decodeURIComponent(seg); } catch (_) { return seg; }
+  } catch (_) { return ""; }
+}
+
 // Media Detector panel: only confirmed metadata is shown (spec §8).
 // Every DetectedItem field except url is optional; an unknown field
 // is omitted, never guessed.
@@ -311,12 +325,24 @@ function renderDetector() {
       thumb.src = item.url;
       thumb.alt = "";
       thumb.onerror = () => { thumb.hidden = true; };
+    } else if (item.kind === "video" && item.poster) {
+      // Video poster: same lazy thumbnail pattern as images, so a
+      // video row shows what it is instead of a bare URL.
+      thumb = document.createElement("img");
+      thumb.className = "det-thumb";
+      thumb.loading = "lazy";
+      thumb.src = item.poster;
+      thumb.alt = "";
+      thumb.onerror = () => { thumb.hidden = true; };
     }
     const info = document.createElement("div");
     info.className = "det-info";
     const title = document.createElement("div");
     title.className = "det-title";
-    title.textContent = item.title || item.url;
+    // Never show a raw full URL when a name exists: page title,
+    // then the filename the detector worked out, then the URL's
+    // last path segment, and only then the full URL.
+    title.textContent = item.title || item.filename || urlBasename(item.url) || item.url;
     const meta = document.createElement("div");
     meta.className = "det-meta";
     const parts = [];
@@ -379,6 +405,23 @@ document.getElementById("detDownloadBtn").onclick = async () => {
   setStatus("Added " + added + " of " + urls.length + " selected."
     + (failed ? " " + failed + " failed: " + firstError : ""));
 };
+// Clear detector: removes all detected media from the panel only.
+// Downloads and history are not affected.
+document.getElementById("detClearBtn").onclick = async () => {
+  if (!window.confirm("Clear all detected media? Downloads and history are not affected.")) return;
+  const btn = document.getElementById("detClearBtn");
+  setBusy(btn, true, "Clearing…");
+  try {
+    const r = await api("/media/detected/clear", "POST");
+    // Tauri returns the count directly; bridge mode returns {removed}.
+    const removed = typeof r === "number" ? r : (r && r.removed) || 0;
+    await refresh();
+    clearError();
+    setStatus("Cleared " + removed + " detected items.");
+  } catch (e) {
+    setError("Could not clear detected media: " + e.message, "action");
+  } finally { setBusy(btn, false); }
+};
 async function refresh() {
   try {
     const all = await api("/downloads");
@@ -408,7 +451,11 @@ async function refresh() {
     document.getElementById("empty").hidden = rows.length > 0;
     for (const d of rows) {
       const tr = document.createElement("tr");
-      const pct = d.total_bytes ? Math.round(d.downloaded_bytes / d.total_bytes * 100) : 0;
+      // HLS/DASH downloads often have no total until the manifest is
+      // fully read; the size estimate (when present) stands in so the
+      // percentage and the bar move instead of sitting at 0%.
+      const pctDenom = d.total_bytes || d.estimated_total_bytes;
+      const pct = pctDenom ? Math.round(d.downloaded_bytes / pctDenom * 100) : 0;
       // textContent only: filenames and server error strings are untrusted
       // and must never be parsed as HTML (a file named <img src=x onerror=…>
       // used to be injected via innerHTML before this fix).
@@ -418,10 +465,21 @@ async function refresh() {
       tdStatus.textContent = d.status + (d.error ? " - " + d.error : "");
       const tdProg = document.createElement("td");
       const prog = document.createElement("progress");
-      prog.value = d.downloaded_bytes; prog.max = d.total_bytes || 1;
+      prog.value = d.downloaded_bytes; prog.max = pctDenom || 1;
       tdProg.appendChild(prog);
-      tdProg.appendChild(document.createTextNode(
-        ` ${pct}% (${fmtBytes(d.downloaded_bytes)} / ${d.total_bytes ? fmtBytes(d.total_bytes) : "?"})`));
+      let progText = ` ${pct}% (${fmtBytes(d.downloaded_bytes)} / ${d.total_bytes ? fmtBytes(d.total_bytes) : "?"})`;
+      // HLS/DASH piece progress + size estimate: old records lack
+      // these fields entirely, so every access is null-guarded.
+      if (d.stream_kind === "hls" || d.stream_kind === "dash") {
+        if (d.segments_total != null) {
+          progText += " · " + (d.segments_done != null ? d.segments_done : 0).toLocaleString()
+            + " / " + d.segments_total.toLocaleString() + " pieces";
+        }
+        if (d.estimated_total_bytes != null) {
+          progText += ", ~" + fmtBytes(d.estimated_total_bytes) + " est.";
+        }
+      }
+      tdProg.appendChild(document.createTextNode(progText));
       const tdSpeed = document.createElement("td"); tdSpeed.textContent = "-";
       const td = document.createElement("td");
       tr.append(tdName, tdCat, tdStatus, tdProg, tdSpeed, td);
@@ -467,6 +525,24 @@ document.getElementById("clearFinishedBtn").onclick = async () => {
     setStatus("Cleared " + removed + " finished downloads. Files were not deleted.");
   } catch (e) {
     setError("Could not clear finished downloads: " + e.message, "action");
+  } finally { setBusy(btn, false); }
+};
+// Clear cache: removes temporary download pieces, saved stream
+// lists, and detected media. Downloaded files, the download list,
+// and history are NOT deleted.
+document.getElementById("clearCacheBtn").onclick = async () => {
+  if (!window.confirm("Clear cached files? This removes temporary download pieces, saved stream lists, and detected media. Your downloaded files, download list, and history are NOT deleted.")) return;
+  const btn = document.getElementById("clearCacheBtn");
+  setBusy(btn, true, "Clearing…");
+  try {
+    const r = await api("/cache/clear", "POST");
+    const removed = (r && r.removed_files) || 0;
+    const freed = (r && r.freed_bytes) || 0;
+    await refresh();
+    clearError();
+    setStatus("Cleared " + removed + " cached files (" + fmtBytes(freed) + " freed).");
+  } catch (e) {
+    setError("Could not clear cache: " + e.message, "action");
   } finally { setBusy(btn, false); }
 };
 document.getElementById("search").oninput = refresh;

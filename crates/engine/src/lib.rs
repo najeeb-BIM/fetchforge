@@ -39,8 +39,9 @@ pub use filename::{sanitize_filename, unique_path};
 pub use id::generate_download_id;
 pub use media::{
     download_dash, download_dash_with, download_hls, download_hls_pair, download_hls_variant,
-    is_manifest_url, list_stream_formats, stream_kind_of_content_type, stream_kind_of_url,
-    DashDownloadOptions, StreamKind,
+    estimate_total_bytes, is_manifest_url, list_stream_formats, stream_kind_of_content_type,
+    stream_kind_of_url, CapturedManifest, DashDownloadOptions, StreamKind,
+    MAX_CAPTURED_MANIFEST_BYTES,
 };
 pub use threed::{
     download_gltf_bundle, fetch_gltf_plan, gltf_dependency_uris, is_gltf_url, is_model_url,

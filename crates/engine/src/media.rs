@@ -54,6 +54,12 @@ pub fn stream_kind_of_url(url: &str) -> Option<StreamKind> {
         Some(StreamKind::Hls)
     } else if path.ends_with(".mpd") {
         Some(StreamKind::Dash)
+    } else if proxy_inner_manifest_url(url).is_some() {
+        // Proxy-wrapped HLS manifest (see
+        // [`proxy_inner_manifest_url`]): routed to the HLS engine,
+        // which fetches through the wrapper and resolves segments
+        // against the inner URL.
+        Some(StreamKind::Hls)
     } else {
         None
     }
@@ -129,6 +135,10 @@ pub fn list_stream_formats(url: &str) -> Result<StreamInfo, String> {
 /// folder name is more informative (e.g. `.../bbb/master.m3u8` →
 /// "bbb").
 fn title_from_manifest_url(url: &str) -> String {
+    // A proxy-wrapped manifest has no useful path of its own
+    // (`/`); title it from the inner manifest URL instead.
+    let url = proxy_inner_manifest_url(url).unwrap_or_else(|| url.to_string());
+    let url = url.as_str();
     let path = url::Url::parse(url)
         .map(|u| u.path().to_string())
         .unwrap_or_else(|_| url.to_string());
@@ -222,12 +232,82 @@ fn fetch_bytes_range(
 
 fn resolve(base: &str, rel: &str) -> String {
     if rel.starts_with("http://") || rel.starts_with("https://") {
-        return rel.to_string();
+        return inherit_query(base, rel);
     }
     match url::Url::parse(base).and_then(|b| b.join(rel)) {
-        Ok(u) => u.to_string(),
+        Ok(u) => inherit_query(base, &u.to_string()),
         Err(_) => rel.to_string(),
     }
+}
+
+/// Signed playlists carry their auth in the query string
+/// (`?sign=...`, `?token=...`), and the CDN requires the same
+/// query on every segment request: a segment fetched without it
+/// is refused (HTTP 400 on the CDNs these sites use). URL joining
+/// drops the base's query for relative references, and absolute
+/// segment URLs never had it — so a signed playlist's segments
+/// all failed. Inherit the base's query onto a resolved URL when
+/// the resolved URL has no query of its own AND shares the base's
+/// origin (scheme + host + port): the query is the playlist's
+/// credential for its own CDN, never something to leak to another
+/// origin. A resolved URL that already has a query keeps it.
+fn inherit_query(base: &str, resolved: &str) -> String {
+    let Ok(base_url) = url::Url::parse(base) else {
+        return resolved.to_string();
+    };
+    let Some(query) = base_url.query() else {
+        return resolved.to_string();
+    };
+    if query.is_empty() {
+        return resolved.to_string();
+    }
+    let Ok(mut out) = url::Url::parse(resolved) else {
+        return resolved.to_string();
+    };
+    if out.query().is_some() {
+        return resolved.to_string();
+    }
+    if out.scheme() != base_url.scheme()
+        || out.host_str() != base_url.host_str()
+        || out.port_or_known_default() != base_url.port_or_known_default()
+    {
+        return resolved.to_string();
+    }
+    out.set_query(Some(query));
+    out.to_string()
+}
+
+/// A proxy-wrapped manifest URL: the player fetches its manifest
+/// through a proxy worker whose query carries the real manifest
+/// URL (`https://proxy.example/?origin=...&url=https://cdn.../index.m3u8`).
+/// The wrapper's path is `/`, so extension routing would not
+/// recognise it as a manifest at all — and yt-dlp, handed the
+/// wrapper, resolves the manifest's relative segments against
+/// the PROXY origin, where they 404, retrying each fragment until
+/// the download sits at 0% with no error (seen 2026-11-22 on a
+/// workers.dev proxy). Returns the inner manifest URL when the
+/// query's `url` (or `u`) parameter is itself an HLS manifest
+/// URL; DASH wrappers are not unwrapped (the DASH engine has no
+/// base override, so they keep their current yt-dlp routing).
+pub fn proxy_inner_manifest_url(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    for (k, v) in parsed.query_pairs() {
+        if (k == "url" || k == "u")
+            && stream_kind_of_url(&v) == Some(StreamKind::Hls)
+        {
+            return Some(v.into_owned());
+        }
+    }
+    None
+}
+
+/// The base URL segment/variant references resolve against: the
+/// inner manifest URL for a proxy wrapper (segments live on the
+/// real CDN, not the proxy), else the manifest URL itself. The
+/// manifest is still FETCHED from the wrapper URL — only the
+/// resolution base changes.
+fn manifest_base_url(url: &str) -> String {
+    proxy_inner_manifest_url(url).unwrap_or_else(|| url.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -420,11 +500,11 @@ pub fn list_hls_formats(manifest_url: &str) -> Result<StreamInfo, String> {
                 .to_string(),
         );
     }
-    let master = parse_hls_master(&text, &manifest_url);
+    let master = parse_hls_master(&text, &manifest_base_url(&manifest_url));
     let title = title_from_manifest_url(&manifest_url);
     if master.variants.is_empty() {
         // Media playlist: validate it has segments, then one format.
-        parse_hls_segments(&text, &manifest_url)?;
+        parse_hls_segments(&text, &manifest_base_url(&manifest_url))?;
         return Ok(StreamInfo {
             kind: StreamKind::Hls,
             title,
@@ -658,7 +738,7 @@ pub fn download_hls(
                 .to_string(),
         );
     }
-    let master = parse_hls_master(&text, &manifest_url);
+    let master = parse_hls_master(&text, &manifest_base_url(&manifest_url));
     let variant_uri = match pick_default_variant(&master.variants) {
         Some(v) => v.uri.clone(),
         None => manifest_url.clone(),
@@ -708,7 +788,7 @@ pub fn download_hls_variant(
                     .to_string(),
             );
         }
-        let master = parse_hls_master(&master_text, &manifest_url);
+        let master = parse_hls_master(&master_text, &manifest_base_url(&manifest_url));
         master
             .variants
             .iter()
@@ -732,7 +812,10 @@ pub fn download_hls_variant(
         );
     }
     let variant_text = fetch_text(&variant_uri, referer)?;
-    let video_segments = parse_hls_segments(&variant_text, &variant_uri)?
+    // Segments resolve against the variant playlist's own URL —
+    // unwrapped when the variant came through a proxy worker, so
+    // they are fetched from the real CDN, not the proxy origin.
+    let video_segments = parse_hls_segments(&variant_text, &manifest_base_url(&variant_uri))?
         .into_iter()
         .map(|url| Segment { url, range: None })
         .collect::<Vec<_>>();
@@ -790,6 +873,90 @@ pub fn download_hls_variant(
         cancelled,
     )?;
     let ffmpeg = ffmpeg.expect("audio merge checked ffmpeg above");
+    let merged = crate::ffmpeg::merge_av(ffmpeg, &video_part, &audio_part, &final_path);
+    let _ = std::fs::remove_file(&video_part);
+    let _ = std::fs::remove_file(&audio_part);
+    merged?;
+    Ok(final_path)
+}
+
+/// Download a PAIRED video + audio variant: two media playlists
+/// observed together (no master playlist was available — the
+/// extension saw only the variants, e.g. `v0.m3u8` + `audio_1.m3u8`
+/// on a streaming site). Both tracks download in full and merge
+/// with ffmpeg into one `.mp4`; a video-only variant must never
+/// again be delivered as a silent `.ts` when its audio sibling was
+/// right there. ffmpeg is required (the caller resolves it when
+/// the plan says the download needs a merge).
+#[allow(clippy::too_many_arguments)]
+pub fn download_hls_pair(
+    video_uri: &str,
+    audio_uri: &str,
+    destination_dir: &Path,
+    filename: &str,
+    referer: &Option<String>,
+    ffmpeg: &Path,
+    progress: &dyn Fn(Progress),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+) -> Result<PathBuf, String> {
+    let video_uri = validate_url(video_uri)?;
+    let audio_uri = validate_url(audio_uri)?;
+    let video_text = fetch_text(&video_uri, referer)?;
+    if video_text.contains("#EXT-X-KEY") {
+        return Err(
+            "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
+                .to_string(),
+        );
+    }
+    let audio_text = fetch_text(&audio_uri, referer)?;
+    if audio_text.contains("#EXT-X-KEY") {
+        return Err(
+            "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
+                .to_string(),
+        );
+    }
+    let video_segments = parse_hls_segments(&video_text, &manifest_base_url(&video_uri))?
+        .into_iter()
+        .map(|url| Segment { url, range: None })
+        .collect::<Vec<_>>();
+    let audio_segments = parse_hls_segments(&audio_text, &manifest_base_url(&audio_uri))?
+        .into_iter()
+        .map(|url| Segment { url, range: None })
+        .collect::<Vec<_>>();
+    let clean = crate::filename::sanitize_filename(filename);
+    std::fs::create_dir_all(destination_dir).map_err(|e| e.to_string())?;
+    let final_path = crate::filename::unique_path(destination_dir, &clean);
+    let video_part = part_path_for(&final_path);
+    let video_bytes = download_segments(
+        &video_segments,
+        &video_part,
+        referer,
+        0,
+        progress,
+        paused,
+        cancelled,
+    )?;
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = std::fs::remove_file(&video_part);
+        return Err("__CANCELLED__".to_string());
+    }
+    if paused.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("__PAUSED__".to_string());
+    }
+    let audio_part = final_path.with_file_name(format!(
+        "{}.audio.part",
+        final_path.file_name().unwrap().to_string_lossy()
+    ));
+    download_segments(
+        &audio_segments,
+        &audio_part,
+        referer,
+        video_bytes,
+        progress,
+        paused,
+        cancelled,
+    )?;
     let merged = crate::ffmpeg::merge_av(ffmpeg, &video_part, &audio_part, &final_path);
     let _ = std::fs::remove_file(&video_part);
     let _ = std::fs::remove_file(&audio_part);
@@ -1963,9 +2130,22 @@ mod tests {
         hits: std::sync::Arc<Mutex<Vec<String>>>,
         stop: std::sync::Arc<AtomicBool>,
     ) -> (u16, std::thread::JoinHandle<()>) {
-        use std::io::{Read, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        serve_map_bound(listener, files, hits, stop)
+    }
+
+    /// `serve_map` on a listener the caller already bound (the port
+    /// is known before serving starts, so served paths can contain
+    /// it — needed for the proxy-wrapper test, where the manifest
+    /// URL's query embeds the inner URL with its port).
+    fn serve_map_bound(
+        listener: std::net::TcpListener,
+        files: HashMap<String, Vec<u8>>,
+        hits: std::sync::Arc<Mutex<Vec<String>>>,
+        stop: std::sync::Arc<AtomicBool>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || loop {
@@ -2304,6 +2484,258 @@ mod tests {
         assert!(err.contains("ffmpeg"), "error: {err}");
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn signed_playlist_query_inherits_to_segments() {
+        // Regression (2026-11-22, atlantic.bz): a signed playlist
+        // (`audio_1.m3u8?sign=...`) whose segments were fetched
+        // WITHOUT the query got HTTP 400 on every segment. Relative
+        // and absolute same-origin segments inherit the playlist's
+        // query; cross-origin segments and segments with their own
+        // query are left alone.
+        let base = "https://totallyacdn.cc/aws/hls/024781/audio_1.m3u8?sign=abc123&exp=999";
+        let text = "#EXTM3U\n#EXTINF:10,\nseg0.ts\n#EXTINF:10,\nhttps://totallyacdn.cc/aws/hls/024781/seg1.ts\n#EXTINF:10,\nhttps://othercdn.example.com/x/seg2.ts\n#EXTINF:10,\nseg3.ts?token=zzz\n";
+        let segs = parse_hls_segments(text, base).unwrap();
+        assert_eq!(segs.len(), 4);
+        assert_eq!(
+            segs[0],
+            "https://totallyacdn.cc/aws/hls/024781/seg0.ts?sign=abc123&exp=999",
+            "relative segment must carry the playlist query"
+        );
+        assert_eq!(
+            segs[1],
+            "https://totallyacdn.cc/aws/hls/024781/seg1.ts?sign=abc123&exp=999",
+            "absolute same-origin segment must carry the playlist query"
+        );
+        assert_eq!(
+            segs[2], "https://othercdn.example.com/x/seg2.ts",
+            "cross-origin segment must NOT inherit the query"
+        );
+        assert_eq!(
+            segs[3],
+            "https://totallyacdn.cc/aws/hls/024781/seg3.ts?token=zzz",
+            "a segment with its own query keeps it"
+        );
+        // An unsigned playlist resolves plainly (no query invented).
+        let plain = parse_hls_segments("#EXTM3U\n#EXTINF:10,\nseg0.ts\n", "https://cdn.example.com/p/play.m3u8").unwrap();
+        assert_eq!(plain, vec!["https://cdn.example.com/p/seg0.ts".to_string()]);
+    }
+
+    #[test]
+    fn download_hls_variant_signed_playlist_downloads() {
+        // End-to-end version of the 400 regression: the test server
+        // serves segments ONLY under their signed paths (an unsigned
+        // request 404s, as the real CDN 400s it). Before the fix the
+        // download failed on segment 1; now it completes.
+        let mut files = HashMap::new();
+        files.insert(
+            "/audio_1.m3u8?sign=s3cret".to_string(),
+            b"#EXTM3U\n#EXTINF:10,\nseg0.ts\n#EXTINF:10,\nseg1.ts\n#EXT-X-ENDLIST\n".to_vec(),
+        );
+        files.insert("/seg0.ts?sign=s3cret".to_string(), b"SEGMENT-ZERO-".to_vec());
+        files.insert("/seg1.ts?sign=s3cret".to_string(), b"SEGMENT-ONE".to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits.clone(), stop.clone());
+        let dir = unique_temp_dir("hls-signed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("http://127.0.0.1:{port}/audio_1.m3u8?sign=s3cret");
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let out = download_hls_variant(
+            &url,
+            &url,
+            &dir,
+            "audio.ts",
+            &None,
+            None,
+            &|_| {},
+            &paused,
+            &cancelled,
+        )
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"SEGMENT-ZERO-SEGMENT-ONE");
+        let hits = hits.lock().unwrap();
+        assert!(hits.contains(&"/seg0.ts?sign=s3cret".to_string()), "hits: {hits:?}");
+        assert!(hits.contains(&"/seg1.ts?sign=s3cret".to_string()), "hits: {hits:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proxy_inner_manifest_url_detection() {
+        // A workers.dev-style wrapper: the real manifest is the
+        // `url` query parameter.
+        assert_eq!(
+            proxy_inner_manifest_url(
+                "https://frappe.hybrows.workers.dev/?origin=https%3A%2F%2Fvidly.pro&url=https%3A%2F%2Fimg.rousav.tech%2Fmedia%2Fabc%2Findex.m3u8"
+            )
+            .as_deref(),
+            Some("https://img.rousav.tech/media/abc/index.m3u8")
+        );
+        assert_eq!(
+            proxy_inner_manifest_url("https://proxy.example/?u=https://cdn.example.com/v/play.m3u8").as_deref(),
+            Some("https://cdn.example.com/v/play.m3u8")
+        );
+        // Not a manifest wrapper: no url param, or the param is not
+        // an HLS manifest (DASH wrappers keep yt-dlp routing).
+        assert_eq!(proxy_inner_manifest_url("https://proxy.example/?q=1"), None);
+        assert_eq!(
+            proxy_inner_manifest_url("https://proxy.example/?url=https://cdn.example.com/v/movie.mp4"),
+            None
+        );
+        assert_eq!(
+            proxy_inner_manifest_url("https://proxy.example/?url=https://cdn.example.com/v/manifest.mpd"),
+            None
+        );
+        // And the wrapper itself routes to the HLS engine.
+        assert_eq!(
+            stream_kind_of_url("https://proxy.example/?url=https://cdn.example.com/v/play.m3u8"),
+            Some(StreamKind::Hls)
+        );
+        assert_eq!(stream_kind_of_url("https://proxy.example/?url=https://cdn.example.com/v/manifest.mpd"), None);
+    }
+
+    #[test]
+    fn proxy_wrapped_manifest_downloads_from_inner_cdn() {
+        // Regression (2026-11-22, nime.pro): a proxy-wrapped m3u8
+        // went to yt-dlp, which resolved the manifest's relative
+        // segments against the PROXY origin, 404ing and retrying
+        // until the download sat at 0% with no error. The HLS
+        // engine now fetches the manifest through the wrapper but
+        // resolves segments against the inner URL. The test server
+        // serves the manifest only under the wrapper path and the
+        // segments only under the inner paths.
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let inner = format!("http://127.0.0.1:{port}/media/index.m3u8");
+        let proxy = format!(
+            "http://127.0.0.1:{port}/?origin=https%3A%2F%2Fvidly.pro&url={}",
+            url::form_urlencoded::byte_serialize(inner.as_bytes()).collect::<String>()
+        );
+        let proxy_path = proxy
+            .split_once(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .1
+            .to_string();
+        let mut files = HashMap::new();
+        files.insert(
+            proxy_path,
+            b"#EXTM3U\n#EXTINF:10,\nseg0.ts\n#EXTINF:10,\nseg1.ts\n#EXT-X-ENDLIST\n".to_vec(),
+        );
+        files.insert("/media/seg0.ts".to_string(), b"SEGMENT-ZERO-".to_vec());
+        files.insert("/media/seg1.ts".to_string(), b"SEGMENT-ONE".to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (_port, server) = serve_map_bound(listener, files, hits.clone(), stop.clone());
+        // Listing works through the wrapper (title from the inner URL).
+        let info = list_hls_formats(&proxy).unwrap();
+        assert_eq!(info.formats.len(), 1);
+        assert_eq!(info.title, "media");
+        let dir = unique_temp_dir("hls-proxy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let out = download_hls_variant(
+            &proxy,
+            &proxy,
+            &dir,
+            "movie.ts",
+            &None,
+            None,
+            &|_| {},
+            &paused,
+            &cancelled,
+        )
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"SEGMENT-ZERO-SEGMENT-ONE");
+        // Segments came from the inner paths, never the proxy origin.
+        let hits = hits.lock().unwrap();
+        assert!(hits.contains(&"/media/seg0.ts".to_string()), "hits: {hits:?}");
+        assert!(hits.contains(&"/media/seg1.ts".to_string()), "hits: {hits:?}");
+        assert!(
+            !hits.iter().any(|h| h == "/seg0.ts" || h == "/seg1.ts"),
+            "segments must not resolve against the proxy origin: {hits:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_hls_pair_merges_video_and_audio_variants() {
+        // Paired variants (no master): v0.m3u8 + audio_1.m3u8 merge
+        // into one mp4 with video and audio. Needs a real ffmpeg;
+        // skip where none exists.
+        let ffmpeg = match crate::ffmpeg::find_on_path("ffmpeg") {
+            Some(p) => p,
+            None => return,
+        };
+        let dir = unique_temp_dir("hls-pair");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |args: &[&str]| {
+            use std::process::{Command, Stdio};
+            Command::new(&ffmpeg)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let vts = dir.join("v.ts");
+        let ats = dir.join("a.ts");
+        assert!(mk(&[
+            "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts",
+            vts.to_str().unwrap()
+        ]));
+        assert!(mk(&[
+            "-y", "-f", "lavfi", "-i", "sine=frequency=440:d=1",
+            "-c:a", "aac", "-f", "mpegts", ats.to_str().unwrap()
+        ]));
+        let vbytes = std::fs::read(&vts).unwrap();
+        let abytes = std::fs::read(&ats).unwrap();
+        let (v0, v1) = vbytes.split_at(vbytes.len() / 2);
+        let (a0, a1) = abytes.split_at(abytes.len() / 2);
+        let vplay = "#EXTM3U\n#EXTINF:1,\nv0.ts\n#EXTINF:1,\nv1.ts\n#EXT-X-ENDLIST\n";
+        let aplay = "#EXTM3U\n#EXTINF:1,\na0.ts\n#EXTINF:1,\na1.ts\n#EXT-X-ENDLIST\n";
+        let mut files = HashMap::new();
+        files.insert("/v0.m3u8".to_string(), vplay.as_bytes().to_vec());
+        files.insert("/audio_1.m3u8".to_string(), aplay.as_bytes().to_vec());
+        files.insert("/v0.ts".to_string(), v0.to_vec());
+        files.insert("/v1.ts".to_string(), v1.to_vec());
+        files.insert("/a0.ts".to_string(), a0.to_vec());
+        files.insert("/a1.ts".to_string(), a1.to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let video_url = format!("http://127.0.0.1:{port}/v0.m3u8");
+        let audio_url = format!("http://127.0.0.1:{port}/audio_1.m3u8");
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let out = download_hls_pair(
+            &video_url,
+            &audio_url,
+            &dir,
+            "movie.mp4",
+            &None,
+            &ffmpeg,
+            &|_| {},
+            &paused,
+            &cancelled,
+        )
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(out.is_file());
+        assert!(std::fs::metadata(&out).unwrap().len() > 0);
+        assert_eq!(out.extension().and_then(|e| e.to_str()), Some("mp4"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

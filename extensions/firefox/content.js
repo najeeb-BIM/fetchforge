@@ -123,7 +123,7 @@
       // including the manifest the player loaded. Send that instead
       // of the bare page URL when it is found.
       const stream = findStreamUrlFromResources();
-      if (stream) return { url: stream, viaPage: false, viaStream: true };
+      if (stream) return { url: stream.url, viaPage: false, viaStream: true, audioUrl: stream.audioUrl };
       return { url: null, viaPage: true };
     }
     return null;
@@ -141,33 +141,76 @@
   // playing stream is the freshest entry. Only this document's
   // entries are visible (an iframe player has its own log, read by
   // the content script running in that frame).
+  //
+  // Master vs variant: a master playlist (master/index/playlist/
+  // manifest.m3u8) describes the whole stream — video AND audio —
+  // while a variant (v0.m3u8, audio_1.m3u8) is one track only.
+  // Sending the first manifest seen used to pick a bare video
+  // variant (v0.m3u8) and deliver a silent file. A master is now
+  // preferred whenever one was observed; when only variants were
+  // observed, the best video variant is sent TOGETHER with its
+  // sibling audio variant, so the app downloads both and merges
+  // them instead of delivering half a movie.
   const STREAM_EXT_RE = /\.(m3u8|mpd)([?#]|$)/i;
   const MEDIA_FILE_EXT_RE = /\.(mp4|webm|mov|mkv)([?#]|$)/i;
+  const MASTER_STEM_RE = /^(master|index|playlist|manifest)$/i;
+  const AUDIO_STEM_RE = /audio/i;
+  function manifestKind(url) {
+    const name = url.split(/[?#]/)[0].split("/").pop() || "";
+    const stem = name.replace(/\.(m3u8|mpd)$/i, "");
+    if (MASTER_STEM_RE.test(stem)) return "master";
+    if (AUDIO_STEM_RE.test(stem)) return "audio";
+    return "video";
+  }
+  // Returns { url, audioUrl? } or null: url is the manifest/file
+  // to send; audioUrl is set only when url is a video variant and
+  // a sibling audio variant was observed alongside it.
   function findStreamUrlFromResources() {
     let entries = [];
     try {
       entries = performance.getEntriesByType("resource") || [];
     } catch (_) { return null; }
-    let bestManifest = null; // { url, rank, startTime }
+    const rankOf = function (e) {
+      const it = e.initiatorType || "";
+      return (it === "video" || it === "audio" || it === "fetch" || it === "xmlhttprequest") ? 1 : 0;
+    };
+    const better = function (a, b) {
+      return !b || a.rank > b.rank || (a.rank === b.rank && a.startTime >= b.startTime);
+    };
+    let bestMaster = null;
+    let bestVideo = null;
+    let bestAudio = null;
     let bestFile = null;
     for (const e of entries) {
       const name = e && e.name;
       if (!name || !/^https?:\/\//i.test(name)) continue;
-      const it = e.initiatorType || "";
-      const rank = (it === "video" || it === "audio" || it === "fetch" || it === "xmlhttprequest") ? 1 : 0;
-      const t = typeof e.startTime === "number" ? e.startTime : 0;
-      const cand = { url: name, rank: rank, startTime: t };
-      const better = function (a, b) {
-        return !b || a.rank > b.rank || (a.rank === b.rank && a.startTime >= b.startTime);
-      };
+      const cand = { url: name, rank: rankOf(e), startTime: typeof e.startTime === "number" ? e.startTime : 0 };
       if (STREAM_EXT_RE.test(name)) {
-        if (better(cand, bestManifest)) bestManifest = cand;
+        const kind = manifestKind(name);
+        if (kind === "master") {
+          if (better(cand, bestMaster)) bestMaster = cand;
+        } else if (kind === "audio") {
+          if (better(cand, bestAudio)) bestAudio = cand;
+        } else {
+          if (better(cand, bestVideo)) bestVideo = cand;
+        }
       } else if (MEDIA_FILE_EXT_RE.test(name)) {
         if (better(cand, bestFile)) bestFile = cand;
       }
     }
-    const best = bestManifest || bestFile;
-    return best ? best.url : null;
+    // A master playlist is the whole stream: send it alone.
+    if (bestMaster) return { url: bestMaster.url };
+    // No master: pair the video variant with its audio sibling.
+    if (bestVideo) {
+      const out = { url: bestVideo.url };
+      if (bestAudio) out.audioUrl = bestAudio.url;
+      return out;
+    }
+    // An audio-only variant with no video observed: send it alone
+    // (better than the page URL, which would fail extraction).
+    if (bestAudio) return { url: bestAudio.url };
+    if (bestFile) return { url: bestFile.url };
+    return null;
   }
 
   // Filename for a resolved media source: none for a page URL (the
@@ -193,6 +236,7 @@
         filename: filenameForSource(src),
       };
       if (src.viaStream) item.viaStream = true;
+      if (src.audioUrl) item.audioUrl = src.audioUrl;
       return item;
     };
   }
@@ -354,6 +398,46 @@
     sendRuntimeMessage({ type: "reportMedia", items: items }).catch(function () { /* background unreachable */ });
   }
 
+  // ---- Popunder shield (streaming sites) ----
+  //
+  // Some streaming pages register capture-phase click/mousedown
+  // handlers on window/document that open a popunder tab on ANY
+  // click — including a click on our overlay button. The button's
+  // own bubble-phase listener runs too late: the popunder has
+  // already fired by the time it stops propagation. So a
+  // capture-phase interceptor is registered on window FIRST (this
+  // script runs at document_start, before page scripts), and it
+  // swallows the event before the page ever sees it. It only
+  // touches events whose target path includes one of our own
+  // overlay buttons; every other click passes through untouched.
+  // The button's own click listener stays as a fallback (it never
+  // double-fires: the interceptor stops propagation, and a disabled
+  // button does not fire click events at all).
+  function overlayButtonFromEvent(e) {
+    const path = typeof e.composedPath === "function" ? e.composedPath() : [];
+    for (const t of path) {
+      for (const entry of overlays) {
+        if (entry[1].button === t) return { button: t, video: entry[0] };
+      }
+    }
+    return null;
+  }
+  function onOverlayEventCapture(e) {
+    const hit = overlayButtonFromEvent(e);
+    if (!hit) return; // not our button: leave the page alone
+    if (e.type === "click" && !hit.button.disabled) {
+      onOverlayClick(hit.video, hit.button);
+    }
+    e.stopImmediatePropagation();
+    e.stopPropagation();
+    e.preventDefault();
+  }
+  window.addEventListener("click", onOverlayEventCapture, true);
+  window.addEventListener("mousedown", onOverlayEventCapture, true);
+  window.addEventListener("pointerdown", onOverlayEventCapture, true);
+  window.addEventListener("mouseup", onOverlayEventCapture, true);
+  window.addEventListener("pointerup", onOverlayEventCapture, true);
+
   // ---- IDM-style overlay button on videos ----
 
   // media element -> { host, button }
@@ -384,7 +468,7 @@
     btn.disabled = true;
     btn.textContent = "Sending…";
     btn.title = "";
-    sendRuntimeMessage({ type: "downloadMedia", url: url, filename: filename }).then(function (resp) {
+    sendRuntimeMessage({ type: "downloadMedia", url: url, filename: filename, audioUrl: src.audioUrl }).then(function (resp) {
       if (resp && resp.ok) {
         btn.textContent = "Sent to FetchForge";
       } else {
@@ -446,10 +530,53 @@
         o.host.style.display = "none";
         continue;
       }
+      // Cross-frame election verdict (see below): undefined means
+      // no verdict has arrived yet, so the button shows; null means
+      // another frame won, so every button in this frame hides.
+      if (electedKey !== undefined && overlayKeyFor(video) !== electedKey) {
+        o.host.style.display = "none";
+        continue;
+      }
       o.host.style.display = "block";
       o.host.style.left = Math.round(rect.right - 8) + "px";
       o.host.style.top = Math.round(rect.top + 8) + "px";
     }
+  }
+
+  // ---- One button per tab: cross-frame overlay election ----
+  //
+  // The same-document dedupe above cannot help when the player
+  // lives in an iframe: the content script in the top page and the
+  // one in the frame each see their own video and each inject a
+  // button, so the user gets two identical buttons on one player
+  // (novahd). Frames therefore report their representative
+  // candidates to the background script, which elects exactly ONE
+  // winner per tab (playing first, then largest area) and tells
+  // each frame whether it holds the winner. Buttons show until the
+  // first verdict arrives, so election never delays the button.
+  const overlayKeys = new WeakMap();
+  let overlayKeyCounter = 0;
+  function overlayKeyFor(el) {
+    let k = overlayKeys.get(el);
+    if (!k) { k = "v" + (++overlayKeyCounter); overlayKeys.set(el, k); }
+    return k;
+  }
+  let electedKey = undefined;
+  let lastCandidatesKey = "";
+  function reportOverlayCandidates(reps) {
+    const cands = [];
+    for (const el of reps) {
+      const r = el.getBoundingClientRect();
+      cands.push({
+        key: overlayKeyFor(el),
+        playing: isPlaying(el),
+        area: Math.round(r.width * r.height),
+      });
+    }
+    const key = JSON.stringify(cands);
+    if (key === lastCandidatesKey) return;
+    lastCandidatesKey = key;
+    sendRuntimeMessage({ type: "overlayCandidates", candidates: cands }).catch(function () { /* background unreachable */ });
   }
 
   // ---- Overlay dedupe by position (stacked videos) ----
@@ -515,6 +642,9 @@
         candidates.push(el);
       }
       const reps = pickOverlayRepresentatives(candidates);
+      // Cross-frame election: report this frame's representatives
+      // so the background can elect one winner per tab.
+      reportOverlayCandidates(reps);
       // Prune overlays for elements that are no longer their group's
       // representative (e.g. the main player started playing and
       // took over from the preview).
@@ -541,12 +671,6 @@
   }
 
   const observer = new MutationObserver(scheduleScan);
-  observer.observe(document.documentElement, {
-    childList: true,
-    subtree: true,
-    attributes: true,
-    attributeFilter: ["src"],
-  });
 
   let rafPending = false;
   function scheduleReposition() {
@@ -557,12 +681,40 @@
   window.addEventListener("scroll", scheduleReposition, true);
   window.addEventListener("resize", scheduleReposition);
 
-  // Popup asks for the media on this tab.
+  // Popup asks for the media on this tab; background sends the
+  // overlay-election verdict for this frame.
   api.runtime.onMessage.addListener(function (msg, _sender, sendResponse) {
     if (msg && msg.type === "getMedia") {
       sendResponse({ items: collectMedia() });
+    } else if (msg && msg.type === "overlayVerdict") {
+      electedKey = msg.winnerKey === undefined ? undefined : msg.winnerKey;
+      positionOverlays();
     }
   });
 
-  scan();
+  // Startup: this script runs at document_start (so the popunder
+  // shield registers before page scripts), when documentElement
+  // may not exist yet. Defer the observer + first scan until the
+  // DOM is ready.
+  function start() {
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["src"],
+    });
+    scan();
+  }
+  if (document.documentElement) {
+    start();
+  } else {
+    document.addEventListener("DOMContentLoaded", start, { once: true });
+  }
+
+  // Re-report candidates every 10 s so a restarted service worker
+  // rebuilds its election state (and a stale verdict is refreshed).
+  window.setInterval(function () {
+    lastCandidatesKey = "";
+    scan();
+  }, 10000);
 })();

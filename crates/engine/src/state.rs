@@ -68,6 +68,22 @@ pub struct DownloadRecord {
     /// `#[serde(default)]` so older history files still load.
     #[serde(default)]
     pub stream_kind: Option<String>,
+    /// The page the download came from (sent by the extension when
+    /// the user clicks Download on a page). Sent as the Referer
+    /// header on segment, probe and yt-dlp requests: some CDNs and
+    /// proxies refuse requests without the Referer they expect.
+    /// None for pasted links (no page context).
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub referer: Option<String>,
+    /// HLS paired-variant downloads only: the sibling audio variant
+    /// playlist URL (e.g. `audio_1.m3u8`) the extension observed
+    /// next to the video variant (`v0.m3u8`). When set, the worker
+    /// downloads both tracks and merges them with ffmpeg instead of
+    /// delivering a silent video. None for every other download.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub audio_url: Option<String>,
 }
 
 pub struct Store {
@@ -507,6 +523,8 @@ mod tests {
             needs_merge: false,
             format_selector: None,
             stream_kind: None,
+            referer: None,
+            audio_url: None,
         });
         s.save().unwrap();
         let mut s2 = Store::load(path);
@@ -536,6 +554,8 @@ mod tests {
             needs_merge: false,
             format_selector: None,
             stream_kind: None,
+            referer: None,
+            audio_url: None,
         }
     }
 

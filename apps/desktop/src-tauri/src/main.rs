@@ -9,8 +9,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use fetchforge_engine::{
-    category_for_filename, download, download_dash, download_gltf_bundle, download_hls_variant,
-    download_media, drive_direct_url, drive_file_id, ensure_ffmpeg, ensure_image_extension,
+    category_for_filename, download, download_dash, download_gltf_bundle, download_hls_pair,
+    download_hls_variant, download_media, drive_direct_url, drive_file_id, ensure_ffmpeg,
+    ensure_image_extension,
     fetch_gltf_plan, find_ytdlp, generate_download_id, is_gltf_url, is_image_content_type,
     list_formats, plan_media_download, probe, sanitize_filename, stop_reason,
     DashDownloadOptions, DownloadOptions, DownloadRecord, GltfDownloadOptions,
@@ -105,8 +106,12 @@ fn spawn_bridge(data_dir: &PathBuf) -> Option<std::process::Child> {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct DetectedItem {
     url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Mirrors the bridge's struct (detected.json is shared): the
+    // extension sends pageUrl/audioUrl in camelCase.
+    #[serde(default, alias = "pageUrl", skip_serializing_if = "Option::is_none")]
     page_url: Option<String>,
+    #[serde(default, alias = "audioUrl", skip_serializing_if = "Option::is_none")]
+    audio_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -209,6 +214,8 @@ async fn add_download(
     url: String,
     filename: Option<String>,
     format_id: Option<String>,
+    referer: Option<String>,
+    audio_url: Option<String>,
 ) -> Result<DownloadRecord, String> {
     let clean = fetchforge_engine::validate_url(&url)?;
     // HLS (.m3u8) / DASH (.mpd) manifests go straight to the media
@@ -216,7 +223,7 @@ async fn add_download(
     // manifest must never reach the direct path, which would save
     // the manifest text itself as a file.
     if fetchforge_engine::is_manifest_url(&clean) {
-        return add_media_download(&state, &clean, filename, format_id);
+        return add_media_download(&state, &clean, filename, format_id, referer, audio_url);
     }
     // glTF models (.gltf) carry dependencies (buffers, textures)
     // that must be downloaded with the model and kept in the same
@@ -229,6 +236,7 @@ async fn add_download(
     }
     let probe_opts = DownloadOptions {
         url: clean.clone(),
+        referer: referer.clone(),
         ..Default::default()
     };
     let probe_result = probe(&probe_opts);
@@ -243,7 +251,7 @@ async fn add_download(
             .is_some_and(|ct| ct.starts_with("text/html"))
     });
     if is_page {
-        return add_media_download(&state, &clean, filename, format_id);
+        return add_media_download(&state, &clean, filename, format_id, referer, audio_url);
     }
     match probe_result {
         Ok(p) => {
@@ -252,7 +260,7 @@ async fn add_download(
             if p.content_type.as_deref().is_some_and(|ct| {
                 fetchforge_engine::stream_kind_of_content_type(ct).is_some()
             }) {
-                return add_media_download(&state, &clean, filename, format_id);
+                return add_media_download(&state, &clean, filename, format_id, referer, audio_url);
             }
             let (mut filename, total, resumable) = (
                 filename
@@ -275,7 +283,7 @@ async fn add_download(
             {
                 filename = ensure_image_extension(&filename, p.content_type.as_deref());
             }
-            queue_direct_download(&state, clean, filename, total, resumable)
+            queue_direct_download(&state, clean, filename, total, resumable, referer)
         }
         Err(mut e) => {
             // Probe failed: try media extraction as a fallback, but
@@ -286,7 +294,14 @@ async fn add_download(
             // the page) — the probe error is replaced by it, not
             // recorded. Mirrors the bridge's probe-failure branch.
             if find_ytdlp(&state.data_dir).is_ok() {
-                match try_media_download(&state, &clean, filename.clone(), format_id.clone()) {
+                match try_media_download(
+                    &state,
+                    &clean,
+                    filename.clone(),
+                    format_id.clone(),
+                    referer.clone(),
+                    audio_url.clone(),
+                ) {
                     Ok(rec) => return Ok(rec),
                     Err(extract_err) => e = extract_err,
                 }
@@ -321,6 +336,8 @@ fn failed_record(
         needs_merge: false,
         format_selector: None,
         stream_kind: None,
+        referer: None,
+        audio_url: None,
     };
     state.store.lock().unwrap().upsert(rec.clone());
     let _ = state.store.lock().unwrap().save();
@@ -335,14 +352,17 @@ fn add_media_download(
     clean_url: &str,
     filename: Option<String>,
     format_id: Option<String>,
+    referer: Option<String>,
+    audio_url: Option<String>,
 ) -> Result<DownloadRecord, String> {
-    match try_media_download(state, clean_url, filename.clone(), format_id) {
+    match try_media_download(state, clean_url, filename.clone(), format_id, referer.clone(), audio_url) {
         Ok(rec) => Ok(rec),
         Err(e) => {
             if let Some(file_id) = drive_file_id(clean_url) {
                 let direct = drive_direct_url(&file_id);
                 let probe_opts = DownloadOptions {
                     url: direct.clone(),
+                    referer: referer.clone(),
                     ..Default::default()
                 };
                 if let Ok(p) = probe(&probe_opts) {
@@ -361,6 +381,7 @@ fn add_media_download(
                             fname,
                             p.content_length,
                             p.accept_ranges,
+                            referer,
                         );
                     }
                 }
@@ -436,6 +457,8 @@ fn try_gltf_download(
         needs_merge: false,
         format_selector: None,
         stream_kind: Some("gltf".to_string()),
+        referer: None,
+        audio_url: None,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -451,13 +474,30 @@ fn try_media_download(
     clean_url: &str,
     filename: Option<String>,
     format_id: Option<String>,
+    referer: Option<String>,
+    audio_url: Option<String>,
 ) -> Result<DownloadRecord, String> {
-    let plan = plan_media_download(
+    let mut plan = plan_media_download(
         &state.data_dir,
         clean_url,
         format_id.as_deref(),
         filename.as_deref(),
     )?;
+    // Paired HLS variants (extension observed a video variant AND
+    // its audio sibling, no master): the plan from the video variant
+    // alone would be a silent .ts with no merge. Same override as
+    // the bridge: needs_merge, .mp4 filename, audio URL stored.
+    let paired_audio = if audio_url.is_some()
+        && plan.stream_kind == Some(fetchforge_engine::StreamKind::Hls)
+    {
+        plan.needs_merge = true;
+        if let Some((stem, _)) = plan.filename.rsplit_once('.') {
+            plan.filename = format!("{stem}.mp4");
+        }
+        audio_url
+    } else {
+        None
+    };
     // The HTML fallback may have resolved the page to an embedded
     // stream/file URL: the record and the worker both use the
     // resolved URL, not the page URL.
@@ -496,6 +536,8 @@ fn try_media_download(
         needs_merge: plan.needs_merge,
         format_selector: Some(plan.selector),
         stream_kind: plan.stream_kind.map(|k| k.as_str().to_string()),
+        referer,
+        audio_url: paired_audio,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -514,6 +556,7 @@ fn queue_direct_download(
     filename: String,
     total: Option<u64>,
     resumable: bool,
+    referer: Option<String>,
 ) -> Result<DownloadRecord, String> {
     // Same idempotent-add rule as the bridge (see
     // Store::find_duplicate): an already-active or
@@ -548,6 +591,8 @@ fn queue_direct_download(
         needs_merge: false,
         format_selector: None,
         stream_kind: None,
+        referer,
+        audio_url: None,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -650,7 +695,7 @@ fn run_download(state: &Arc<State>, id: &str, job: &Job) {
         max_segments: 4,
         max_retries: 3,
         bandwidth_kbps: None,
-        referer: None,
+        referer: rec.referer.clone(),
         user_agent: None,
         organise_by_category: true,
     };
@@ -731,6 +776,7 @@ fn run_media_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
         expected_ext: ext,
         expected_total: rec.total_bytes,
         organise_by_category: true,
+        referer: rec.referer.clone(),
     };
     let id2 = id.clone();
     let state2 = Arc::clone(state);
@@ -817,17 +863,50 @@ fn run_stream_hls_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) 
             let _ = store.save();
         }
     };
-    match download_hls_variant(
-        &rec.url,
-        &variant_uri,
-        &dir,
-        &rec.filename,
-        &None,
-        ffmpeg.as_deref(),
-        &progress,
-        &job.paused,
-        &job.cancelled,
-    ) {
+    // Paired variants (the extension saw a video variant and its
+    // audio sibling, no master): download both tracks and merge
+    // them. Otherwise the normal variant path, with the page
+    // Referer on every manifest/segment request. Mirrors the
+    // bridge's run_stream_hls.
+    let result = match &rec.audio_url {
+        Some(audio_uri) => {
+            let ffmpeg = match &ffmpeg {
+                Some(f) => f.clone(),
+                None => {
+                    set_status(
+                        state,
+                        &id,
+                        Status::Failed,
+                        Some("This quality keeps its audio on a separate track, which needs ffmpeg to merge.".to_string()),
+                    );
+                    return;
+                }
+            };
+            download_hls_pair(
+                &variant_uri,
+                audio_uri,
+                &dir,
+                &rec.filename,
+                &rec.referer,
+                &ffmpeg,
+                &progress,
+                &job.paused,
+                &job.cancelled,
+            )
+        }
+        None => download_hls_variant(
+            &rec.url,
+            &variant_uri,
+            &dir,
+            &rec.filename,
+            &rec.referer,
+            ffmpeg.as_deref(),
+            &progress,
+            &job.paused,
+            &job.cancelled,
+        ),
+    };
+    match result {
         Ok(final_path) => {
             let mut store = state.store.lock().unwrap();
             if let Some(mut r) = store.get(&id).cloned() {
@@ -875,7 +954,7 @@ fn run_stream_dash_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job)
         representation_id: rec.format_id.clone(),
         destination_dir: dir,
         filename: rec.filename.clone(),
-        referer: None,
+        referer: rec.referer.clone(),
     };
     let id2 = id.clone();
     let state2 = Arc::clone(state);

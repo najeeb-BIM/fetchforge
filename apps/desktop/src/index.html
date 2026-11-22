@@ -352,18 +352,22 @@ document.getElementById("detSelectAllBtn").onclick = () => {
 };
 document.getElementById("detDownloadBtn").onclick = async () => {
   // Read from the Set, intersected with the current items, so a
-  // stale URL from a page that closed is never downloaded.
-  const urls = detectedItems.map((item) => item.url).filter((u) => detSelected.has(u));
+  // stale URL from a page that closed is never downloaded. The
+  // item's page URL goes as the Referer (signed CDNs refuse
+  // requests without it) and a paired audio variant is passed
+  // through so the two tracks download and merge as one file.
+  const items = detectedItems.filter((item) => detSelected.has(item.url));
+  const urls = items.map((item) => item.url);
   if (!urls.length) { setError("Select at least one detected item first.", "action"); return; }
   const btn = document.getElementById("detDownloadBtn");
   setBusy(btn, true, "Adding…");
   let added = 0, failed = 0, firstError = "";
-  for (const url of urls) {
+  for (const item of items) {
     try {
       // Direct add, no picker: the Rust side auto-picks a quality for
       // a page URL, so a batch never opens the picker once per item.
-      await api("/downloads", "POST", { url });
-      detSelected.delete(url);
+      await api("/downloads", "POST", { url: item.url, audio_url: item.audio_url, referer: item.page_url });
+      detSelected.delete(item.url);
       added += 1;
     } catch (e) { failed += 1; if (!firstError) firstError = e.message; }
   }

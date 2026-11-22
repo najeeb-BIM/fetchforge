@@ -71,6 +71,15 @@ pub const YTDLP_SHA256_UNIX: &str =
 /// cold first run without hanging the UI forever.
 const EXTRACT_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// How long a yt-dlp download may go without ANY output (no progress
+/// line, no status line) before it is declared stalled and killed.
+/// A healthy download prints progress lines constantly; a merge
+/// prints its own lines. Five silent minutes means yt-dlp is stuck
+/// retrying a dead fragment or a dead server — seen 2026-11-22 as
+/// a download sitting at 0% with no error. The watchdog turns that
+/// into a clear failure instead of an endless hang.
+const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+
 fn ytdlp_exe_name() -> &'static str {
     if cfg!(windows) {
         "yt-dlp.exe"
@@ -1325,6 +1334,11 @@ pub struct MediaDownloadOptions {
     pub expected_ext: String,
     pub expected_total: Option<u64>,
     pub organise_by_category: bool,
+    /// Referer header for the download (the page the user clicked
+    /// Download on, sent by the extension). Some CDNs and proxies
+    /// refuse requests without the Referer they expect; yt-dlp gets
+    /// it as `--referer`. None for pasted links (no page context).
+    pub referer: Option<String>,
 }
 
 /// Download a media page with yt-dlp, resolving (and if needed
@@ -1468,6 +1482,29 @@ pub fn download_media_with(
     paused: &AtomicBool,
     cancelled: &AtomicBool,
 ) -> Result<PathBuf, String> {
+    download_media_with_stall(
+        ytdlp,
+        ffmpeg,
+        opts,
+        progress,
+        paused,
+        cancelled,
+        DOWNLOAD_STALL_TIMEOUT,
+    )
+}
+
+/// [`download_media_with`] with an explicit stall timeout, so tests
+/// can use a short one instead of waiting out five real minutes.
+#[allow(clippy::too_many_arguments)]
+pub fn download_media_with_stall(
+    ytdlp: &Path,
+    ffmpeg: Option<&Path>,
+    opts: &MediaDownloadOptions,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+    stall_timeout: Duration,
+) -> Result<PathBuf, String> {
     let clean_url = validate_url(&opts.url)?;
     if opts.needs_merge && ffmpeg.is_none() {
         return Err(
@@ -1500,12 +1537,25 @@ pub fn download_media_with(
     cmd.args(["--no-playlist", "--no-warnings", "--progress", "--newline"])
         .arg("--socket-timeout")
         .arg("30")
+        // Bound the retry loops: yt-dlp's defaults (10 fragment
+        // retries) let a dead fragment or a dead proxy stall a
+        // download for many minutes at 0% with no error. Three
+        // retries still ride out transient blips.
+        .arg("--retries")
+        .arg("3")
+        .arg("--fragment-retries")
+        .arg("3")
         .arg("-f")
         .arg(&selector)
         .arg("-o")
         .arg(&out_template)
         .arg("--print")
         .arg("after_move:filepath");
+    if let Some(r) = &opts.referer {
+        // The page the download came from: some CDNs and proxies
+        // refuse requests without the Referer they expect.
+        cmd.arg("--referer").arg(r);
+    }
     if let Some(ff) = ffmpeg {
         cmd.arg("--ffmpeg-location").arg(ff);
     }
@@ -1545,16 +1595,41 @@ pub fn download_media_with(
     let mut tracker = ProgressTracker::new(opts.expected_total);
     let mut stdout_lines: Vec<String> = Vec::new();
     let mut stop: Option<crate::download::StopReason> = None;
+    // Stall watchdog: the last time yt-dlp printed ANYTHING. A
+    // download that goes silent for the whole timeout is killed
+    // with a clear error instead of sitting at 0% forever.
+    let mut last_output = Instant::now();
     let status = loop {
         // Drain available lines without blocking the stop checks.
         match line_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(line) => {
+                last_output = Instant::now();
                 if let Some((pct, total, speed)) = parse_progress_line(&line) {
                     progress(tracker.feed(pct, total, speed));
                 }
                 stdout_lines.push(line);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if last_output.elapsed() > stall_timeout
+                    && child.try_wait().map(|s| s.is_none()).unwrap_or(false)
+                {
+                    // Still running but silent for the whole
+                    // timeout: stuck retrying a dead fragment or a
+                    // dead server. Kill it and fail plainly.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let span = if stall_timeout.as_secs() >= 60 {
+                        format!("{} minutes", stall_timeout.as_secs() / 60)
+                    } else {
+                        format!("{} seconds", stall_timeout.as_secs())
+                    };
+                    return Err(format!(
+                        "The download stalled: no progress or output for {span}. \
+                         The server may be too slow, the link may have expired, or the \
+                         stream may need a different quality. Try again, or pick another quality."
+                    ));
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // Stdout closed: the child is exiting; wait for it.
                 match child.try_wait() {
@@ -2336,6 +2411,7 @@ exit 0
             expected_ext: "mp4".to_string(),
             expected_total: Some(10 * 1024),
             organise_by_category: true,
+            referer: None,
         };
         let paused = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
@@ -2382,6 +2458,7 @@ exit 0
             expected_ext: "mp4".to_string(),
             expected_total: None,
             organise_by_category: false,
+            referer: None,
         };
         let paused = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
@@ -2405,6 +2482,55 @@ exit 0
     }
 
     #[test]
+    fn download_media_with_stall_kills_silent_stub() {
+        // Regression (2026-11-22, nime.pro): a yt-dlp download
+        // that prints nothing (stuck retrying a dead fragment)
+        // used to sit at 0% with no error indefinitely. The stall
+        // watchdog kills it with a clear error instead.
+        let dir = unique_temp_dir("stub-stall");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Stub that would sleep 60 s silently if not killed.
+        let stub = write_stub_ytdlp(
+            &dir,
+            "fake-yt-dlp",
+            "#!/bin/sh\nsleep 60\nexit 0\n",
+            "Start-Sleep -Seconds 60\nexit 0\n",
+        );
+        let opts = MediaDownloadOptions {
+            url: "https://www.youtube.com/watch?v=aqz-KE-bpKQ".to_string(),
+            selector: "22".to_string(),
+            needs_merge: false,
+            destination_dir: dir.clone(),
+            filename_stem: "Stalled Video".to_string(),
+            expected_ext: "mp4".to_string(),
+            expected_total: None,
+            organise_by_category: false,
+            referer: None,
+        };
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let progress = |_p: Progress| {};
+        let start = Instant::now();
+        let err = download_media_with_stall(
+            &stub,
+            None,
+            &opts,
+            &progress,
+            &paused,
+            &cancelled,
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(err.contains("stalled"), "error: {err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "stall watchdog took {:?}; the stub was not killed",
+            start.elapsed()
+        );
+    }
+
+    #[test]
     fn merge_without_ffmpeg_is_a_clear_error() {
         let dir = std::env::temp_dir().join("fetchforge-test-no-ffmpeg");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2419,6 +2545,7 @@ exit 0
             expected_ext: "mp4".to_string(),
             expected_total: None,
             organise_by_category: false,
+            referer: None,
         };
         let paused = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);

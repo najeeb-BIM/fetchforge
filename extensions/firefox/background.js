@@ -65,14 +65,14 @@ async function verifyServer(token) {
   for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ j.hmac.charCodeAt(i);
   return diff === 0;
 }
-async function sendViaBridge(url, filename) {
+async function sendViaBridge(url, filename, referer, audioUrl) {
   const token = await getToken();
   if (!token) throw new Error("no-token");
   if (!(await verifyServer(token))) throw new Error("challenge-failed");
   const r = await fetch(BRIDGE + "/downloads", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-FetchForge-Token": token },
-    body: JSON.stringify({ url, filename }),
+    body: JSON.stringify({ url, filename, referer, audio_url: audioUrl }),
   });
   if (!r.ok) throw new Error("bridge-" + r.status);
   // The bridge answers 201 even when the download itself failed at
@@ -82,11 +82,11 @@ async function sendViaBridge(url, filename) {
   if (rec && rec.status === "failed") return { ok: false, error: rec.error || "Download failed" };
   return { ok: true };
 }
-async function sendViaNative(url, filename) {
+async function sendViaNative(url, filename, referer, audioUrl) {
   const resp = await callApi(
     (...a) => api.runtime.sendNativeMessage(...a),
     HOST,
-    { type: "addDownload", url, filename }
+    { type: "addDownload", url, filename, referer, audio_url: audioUrl }
   );
   if (resp && resp.type === "error") throw new Error(resp.error);
   // Same as the bridge path: the native host forwards the bridge's
@@ -100,18 +100,21 @@ async function sendViaNative(url, filename) {
 // accepted the request but the download itself failed at once, or
 // when no path could take the URL at all. Callers surface `error`
 // to the user (overlay button, popup status) instead of a silent
-// revert or a bare "could not send".
-async function sendDownload(url, filename) {
+// revert or a bare "could not send". referer is the page the media
+// came from (sent as the Referer header on segment requests —
+// signed CDNs refuse requests without it); audioUrl is a sibling
+// audio variant to download and merge with a video variant.
+async function sendDownload(url, filename, referer, audioUrl) {
   if (!/^https?:\/\//i.test(url)) return { ok: false, error: "Not a web link" };
   try {
-    const r = await sendViaNative(url, filename);
+    const r = await sendViaNative(url, filename, referer, audioUrl);
     // A real failure reason from the app (not a transport miss):
     // the native host already asked the bridge, so retrying the
     // bridge directly would only fail the same way again.
     if (r && r.ok === false) return r;
     return { ok: true };
   } catch (_) { /* host not installed */ }
-  try { return await sendViaBridge(url, filename); } catch (_) { /* bridge not running / no token */ }
+  try { return await sendViaBridge(url, filename, referer, audioUrl); } catch (_) { /* bridge not running / no token */ }
   // Documented fallback: let the browser handle it normally, and
   // record it so the popup can say so (not a silent fallback).
   try { await callApi((...a) => api.downloads.download(...a), { url, saveAs: false }); try { await callApi((...a) => api.storage.local.set(...a), { lastFallback: Date.now() }); } catch (_) {} return { ok: true, viaBrowser: true }; }
@@ -222,10 +225,52 @@ if (api.tabs && api.tabs.onActivated) {
     if (typeof mediaCounts[info.tabId] === "number") setBadge(info.tabId, mediaCounts[info.tabId]);
   });
 }
+// ---- One button per tab: cross-frame overlay election ----
+// Content scripts report their overlay representatives per frame;
+// the background elects exactly ONE winner per tab (playing first,
+// then largest area, then the lowest frameId, then the lowest key)
+// and tells each frame whether it holds the winner. Frames
+// re-report every 10 s, so a service-worker restart rebuilds the
+// state from the next report; frames that stopped reporting are
+// pruned after 12 s. Election state is in memory only — losing it
+// just means buttons show until the next verdict.
+const tabOverlayCandidates = new Map(); // tabId -> Map(frameId -> { candidates, at })
+const OVERLAY_CANDIDATE_TTL_MS = 12000;
+function sendToFrame(tabId, frameId, msg) {
+  try {
+    const p = api.tabs.sendMessage(tabId, msg, { frameId: frameId });
+    if (p && typeof p.catch === "function") p.catch(function () { /* frame gone */ });
+  } catch (_) { /* tabs API unavailable */ }
+}
+function electOverlay(tabId) {
+  const frames = tabOverlayCandidates.get(tabId);
+  if (!frames) return;
+  const now = Date.now();
+  for (const [fid, entry] of Array.from(frames.entries())) {
+    if (now - entry.at > OVERLAY_CANDIDATE_TTL_MS) frames.delete(fid);
+  }
+  let winner = null; // { frameId, key, playing, area }
+  for (const [fid, entry] of frames.entries()) {
+    for (const c of entry.candidates) {
+      const cand = { frameId: fid, key: c.key, playing: !!c.playing, area: c.area || 0 };
+      if (!winner) { winner = cand; continue; }
+      if (cand.playing !== winner.playing) { if (cand.playing) winner = cand; continue; }
+      if (cand.area !== winner.area) { if (cand.area > winner.area) winner = cand; continue; }
+      if (cand.frameId !== winner.frameId) { if (cand.frameId < winner.frameId) winner = cand; continue; }
+      if (cand.key < winner.key) winner = cand;
+    }
+  }
+  for (const fid of frames.keys()) {
+    const winnerKey = winner && winner.frameId === fid ? winner.key : null;
+    sendToFrame(tabId, fid, { type: "overlayVerdict", winnerKey: winnerKey });
+  }
+}
+
 if (api.tabs && api.tabs.onRemoved) {
   api.tabs.onRemoved.addListener((tabId) => {
     tabFrames.delete(tabId);
     tabLastPosted.delete(tabId);
+    tabOverlayCandidates.delete(tabId);
     if (tabPostTimers.has(tabId)) { clearTimeout(tabPostTimers.get(tabId)); tabPostTimers.delete(tabId); }
     delete mediaCounts[tabId];
     saveMediaCounts();
@@ -233,7 +278,7 @@ if (api.tabs && api.tabs.onRemoved) {
 }
 api.contextMenus.onClicked.addListener((info) => {
   const url = info.linkUrl || info.srcUrl;
-  if (url) sendDownload(url);
+  if (url) sendDownload(url, undefined, info.pageUrl);
 });
 // Popup asks the background to send a pasted URL (keeps token handling here).
 api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -244,9 +289,26 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.type === "downloadMedia") {
     // Content-script overlay click: same sendDownload path as the popup
     // and context menu. Only accept from a real tab's content script.
+    // The referer is the sending frame's URL (the page the media came
+    // from); the audio URL is a sibling audio variant to merge.
     if (!_sender || !_sender.tab) { sendResponse({ ok: false, error: "No tab" }); return false; }
-    sendDownload(msg.url, msg.filename).then((r) => sendResponse({ ok: r.ok, error: r.error }));
+    const referer = (_sender && _sender.url) || (_sender.tab && _sender.tab.url) || undefined;
+    sendDownload(msg.url, msg.filename, referer, msg.audioUrl).then((r) => sendResponse({ ok: r.ok, error: r.error }));
     return true;
+  }
+  if (msg && msg.type === "overlayCandidates") {
+    // Content-script overlay election report (fire-and-forget).
+    if (_sender && _sender.tab && typeof _sender.tab.id === "number") {
+      const tabId = _sender.tab.id;
+      const frameId = _sender.frameId || 0;
+      if (!tabOverlayCandidates.has(tabId)) tabOverlayCandidates.set(tabId, new Map());
+      tabOverlayCandidates.get(tabId).set(frameId, {
+        candidates: Array.isArray(msg.candidates) ? msg.candidates : [],
+        at: Date.now(),
+      });
+      electOverlay(tabId);
+    }
+    return false;
   }
   if (msg && msg.type === "reportMedia") {
     // Content-script detected-media report (fire-and-forget, no response).

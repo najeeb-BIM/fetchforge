@@ -15,8 +15,9 @@
 //!   fetchforge-bridge print-token [--data-dir DIR]
 
 use fetchforge_engine::{
-    category_for_filename, download, download_dash, download_gltf_bundle, download_hls_variant,
-    download_media, drive_direct_url, drive_file_id, ensure_ffmpeg, ensure_image_extension,
+    category_for_filename, download, download_dash, download_gltf_bundle, download_hls_pair,
+    download_hls_variant, download_media, drive_direct_url, drive_file_id, ensure_ffmpeg,
+    ensure_image_extension,
     fetch_gltf_plan, find_ytdlp, generate_download_id, generate_secure_token, is_gltf_url,
     is_image_content_type, list_formats, plan_media_download, probe, sanitize_filename,
     stop_reason, DashDownloadOptions, DownloadOptions, DownloadRecord, GltfDownloadOptions,
@@ -334,6 +335,8 @@ impl App {
         url: &str,
         filename: Option<String>,
         format_id: Option<String>,
+        referer: Option<String>,
+        audio_url: Option<String>,
     ) -> Result<DownloadRecord, String> {
         let clean_url = fetchforge_engine::validate_url(url)?;
         // HLS (.m3u8) / DASH (.mpd) manifests go straight to the
@@ -341,7 +344,7 @@ impl App {
         // media.rs): a manifest must never reach the direct path,
         // which would save the manifest text itself as a file.
         if fetchforge_engine::is_manifest_url(&clean_url) {
-            return self.add_media_download(&clean_url, filename, format_id);
+            return self.add_media_download(&clean_url, filename, format_id, referer, audio_url);
         }
         // glTF models (.gltf) carry dependencies (buffers, textures)
         // that must be downloaded with the model and kept in the same
@@ -355,8 +358,11 @@ impl App {
         }
         // Probe first so we can record a real filename / size / resumability
         // and fail fast on 404 / denied links instead of queueing a dead job.
+        // The probe carries the page Referer when one was sent: some
+        // servers refuse a bare probe but answer a referred one.
         let probe_opts = DownloadOptions {
             url: clean_url.clone(),
+            referer: referer.clone(),
             ..Default::default()
         };
         let probe_result = probe(&probe_opts);
@@ -374,7 +380,7 @@ impl App {
                     .is_some_and(|ct| ct.starts_with("text/html"))
             });
         if is_page {
-            return self.add_media_download(&clean_url, filename, format_id);
+            return self.add_media_download(&clean_url, filename, format_id, referer, audio_url);
         }
         match probe_result {
             Ok(p) => {
@@ -383,7 +389,7 @@ impl App {
                 if p.content_type.as_deref().is_some_and(|ct| {
                     fetchforge_engine::stream_kind_of_content_type(ct).is_some()
                 }) {
-                    return self.add_media_download(&clean_url, filename, format_id);
+                    return self.add_media_download(&clean_url, filename, format_id, referer, audio_url);
                 }
                 let (mut filename, total, resumable) = (
                     filename
@@ -406,7 +412,7 @@ impl App {
                 {
                     filename = ensure_image_extension(&filename, p.content_type.as_deref());
                 }
-                self.add_direct_record(&clean_url, filename, total, resumable)
+                self.add_direct_record(&clean_url, filename, total, resumable, referer)
             }
             Err(mut e) => {
                 // Probe failed. Some video pages refuse HEAD/GET probes
@@ -423,8 +429,13 @@ impl App {
                 // refused it. Record the extraction error, not the
                 // probe error.
                 if find_ytdlp(&self.data_dir).is_ok() {
-                    match self.try_media_download(&clean_url, filename.clone(), format_id.clone())
-                    {
+                    match self.try_media_download(
+                        &clean_url,
+                        filename.clone(),
+                        format_id.clone(),
+                        referer.clone(),
+                        audio_url.clone(),
+                    ) {
                         Ok(rec) => return Ok(rec),
                         Err(extract_err) => e = extract_err,
                     }
@@ -448,6 +459,8 @@ impl App {
                     needs_merge: false,
                     format_selector: None,
                     stream_kind: None,
+                    referer: None,
+                    audio_url: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -466,8 +479,10 @@ impl App {
         clean_url: &str,
         filename: Option<String>,
         format_id: Option<String>,
+        referer: Option<String>,
+        audio_url: Option<String>,
     ) -> Result<DownloadRecord, String> {
-        match self.try_media_download(clean_url, filename.clone(), format_id) {
+        match self.try_media_download(clean_url, filename.clone(), format_id, referer.clone(), audio_url) {
             Ok(rec) => Ok(rec),
             Err(e) => {
                 // Google Drive fallback: yt-dlp's Drive extractor can
@@ -480,6 +495,7 @@ impl App {
                     let direct = drive_direct_url(&file_id);
                     let probe_opts = DownloadOptions {
                         url: direct.clone(),
+                        referer: referer.clone(),
                         ..Default::default()
                     };
                     if let Ok(p) = probe(&probe_opts) {
@@ -497,6 +513,7 @@ impl App {
                                 fname,
                                 p.content_length,
                                 p.accept_ranges,
+                                referer,
                             );
                         }
                     }
@@ -519,6 +536,8 @@ impl App {
                     needs_merge: false,
                     format_selector: None,
                     stream_kind: None,
+                    referer: None,
+                    audio_url: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -575,6 +594,8 @@ impl App {
                         needs_merge: false,
                         format_selector: None,
                         stream_kind: Some("gltf".to_string()),
+                        referer: None,
+                        audio_url: None,
                     };
                     store.upsert(rec.clone());
                     let _ = store.save();
@@ -602,6 +623,8 @@ impl App {
                     needs_merge: false,
                     format_selector: None,
                     stream_kind: None,
+                    referer: None,
+                    audio_url: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -617,13 +640,33 @@ impl App {
         clean_url: &str,
         filename: Option<String>,
         format_id: Option<String>,
+        referer: Option<String>,
+        audio_url: Option<String>,
     ) -> Result<DownloadRecord, String> {
-        let plan = plan_media_download(
+        let mut plan = plan_media_download(
             &self.data_dir,
             clean_url,
             format_id.as_deref(),
             filename.as_deref(),
         )?;
+        // Paired HLS variants (extension observed a video variant
+        // AND its audio sibling, no master): the plan from the video
+        // variant alone would be a silent .ts with no merge. The
+        // worker downloads both tracks and merges them, so the plan
+        // must say so: needs_merge, and an .mp4 filename (the merge
+        // output). Only for HLS: DASH keeps its audio inside the
+        // manifest, so an audio URL with a DASH plan is ignored.
+        let paired_audio = if audio_url.is_some()
+            && plan.stream_kind == Some(fetchforge_engine::StreamKind::Hls)
+        {
+            plan.needs_merge = true;
+            if let Some((stem, _)) = plan.filename.rsplit_once('.') {
+                plan.filename = format!("{stem}.mp4");
+            }
+            audio_url
+        } else {
+            None
+        };
         // The HTML fallback may have resolved the page to an
         // embedded stream/file URL: the record and the worker both
         // use the resolved URL, not the page URL.
@@ -661,6 +704,8 @@ impl App {
                 needs_merge: plan.needs_merge,
                 format_selector: Some(plan.selector),
                 stream_kind: plan.stream_kind.map(|k| k.as_str().to_string()),
+                referer,
+                audio_url: paired_audio,
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -678,6 +723,7 @@ impl App {
         filename: String,
         total: Option<u64>,
         resumable: bool,
+        referer: Option<String>,
     ) -> Result<DownloadRecord, String> {
         // Idempotent add (safe to run twice): if the same URL +
         // filename is already Queued, Downloading, or Completed,
@@ -714,6 +760,8 @@ impl App {
                 needs_merge: false,
                 format_selector: None,
                 stream_kind: None,
+                referer,
+                audio_url: None,
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -801,7 +849,7 @@ impl App {
             max_segments: self.settings.max_segments,
             max_retries: self.settings.max_retries,
             bandwidth_kbps: self.settings.bandwidth_kbps,
-            referer: None,
+            referer: rec.referer.clone(),
             user_agent: None,
             organise_by_category: self.settings.organise_by_category,
         };
@@ -887,6 +935,7 @@ impl App {
             expected_ext: ext,
             expected_total: rec.total_bytes,
             organise_by_category: self.settings.organise_by_category,
+            referer: rec.referer.clone(),
         };
         let app_id = id.clone();
         let store_clone = &self.store;
@@ -981,17 +1030,48 @@ impl App {
                 let _ = store.save();
             }
         };
-        match download_hls_variant(
-            &rec.url,
-            &variant_uri,
-            &dir,
-            &rec.filename,
-            &None,
-            ffmpeg.as_deref(),
-            &progress,
-            &job.paused,
-            &job.cancelled,
-        ) {
+        // Paired variants (the extension saw a video variant and
+        // its audio sibling, no master): download both tracks and
+        // merge them. Otherwise the normal variant path, with the
+        // page Referer on every manifest/segment request.
+        let result = match &rec.audio_url {
+            Some(audio_uri) => {
+                let ffmpeg = match &ffmpeg {
+                    Some(f) => f.clone(),
+                    None => {
+                        self.set_status(
+                            &id,
+                            Status::Failed,
+                            Some("This quality keeps its audio on a separate track, which needs ffmpeg to merge.".to_string()),
+                        );
+                        return Err("download failed".to_string());
+                    }
+                };
+                download_hls_pair(
+                    &variant_uri,
+                    audio_uri,
+                    &dir,
+                    &rec.filename,
+                    &rec.referer,
+                    &ffmpeg,
+                    &progress,
+                    &job.paused,
+                    &job.cancelled,
+                )
+            }
+            None => download_hls_variant(
+                &rec.url,
+                &variant_uri,
+                &dir,
+                &rec.filename,
+                &rec.referer,
+                ffmpeg.as_deref(),
+                &progress,
+                &job.paused,
+                &job.cancelled,
+            ),
+        };
+        match result {
             Ok(final_path) => {
                 let mut store = self.store.lock().unwrap();
                 if let Some(mut r) = store.get(&id).cloned() {
@@ -1043,7 +1123,7 @@ impl App {
             representation_id: rec.format_id.clone(),
             destination_dir: dir,
             filename: rec.filename.clone(),
-            referer: None,
+            referer: rec.referer.clone(),
         };
         let app_id = id.clone();
         let store_clone = &self.store;
@@ -1197,6 +1277,16 @@ struct AddRequest {
     /// Media downloads only: the yt-dlp format id picked in the format
     /// picker. Absent means "pick the default" (extension path).
     format_id: Option<String>,
+    /// The page the download came from (extension sends only):
+    /// sent as the Referer header on later requests.
+    #[serde(default)]
+    referer: Option<String>,
+    /// HLS paired-variant downloads only (extension sends only):
+    /// the sibling audio variant playlist URL observed next to the
+    /// video variant. When set, the worker downloads both tracks
+    /// and merges them.
+    #[serde(default)]
+    audio_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1213,8 +1303,16 @@ struct FormatsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DetectedItem {
     url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // The extension sends pageUrl (camelCase); accept it so the
+    // page a detection came from is actually stored (it used to be
+    // dropped on ingest, so detector downloads had no Referer).
+    #[serde(default, alias = "pageUrl", skip_serializing_if = "Option::is_none")]
     page_url: Option<String>,
+    /// A sibling audio variant observed with a video variant (the
+    /// extension sends audioUrl); the detector download passes it
+    /// through so the pair is downloaded and merged.
+    #[serde(default, alias = "audioUrl", skip_serializing_if = "Option::is_none")]
+    audio_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     title: Option<String>,
     /// The extension's word for the kind ("video", "audio", ...).
@@ -1520,7 +1618,7 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
     if method == "POST" && path == "/downloads" {
         let req: Result<AddRequest, _> = serde_json::from_str(&body);
         match req {
-            Ok(r) => match app.add_download(&r.url, r.filename, r.format_id) {
+            Ok(r) => match app.add_download(&r.url, r.filename, r.format_id, r.referer, r.audio_url) {
                 Ok(rec) => {
                     let b = serde_json::to_string(&rec).unwrap();
                     let _ = stream.write_all(http_response(201, &b).as_bytes());
@@ -1718,6 +1816,8 @@ fn forward_add_to_bridge(
     port: u16,
     url: &str,
     filename: Option<&str>,
+    referer: Option<&str>,
+    audio_url: Option<&str>,
 ) -> Result<DownloadRecord, String> {
     let token = std::fs::read_to_string(data_dir.join("bridge-token.txt"))
         .map_err(|_| "Bridge token file not found.".to_string())?;
@@ -1725,7 +1825,7 @@ fn forward_add_to_bridge(
     if token.is_empty() {
         return Err("Bridge token file is empty.".to_string());
     }
-    let body = serde_json::json!({"url": url, "filename": filename}).to_string();
+    let body = serde_json::json!({"url": url, "filename": filename, "referer": referer, "audio_url": audio_url}).to_string();
     let (status, resp) = loopback_http(port, "POST", "/downloads", Some(token), Some(&body))?;
     if status != 201 {
         let detail: String = resp.chars().take(200).collect();
@@ -1811,6 +1911,14 @@ fn native_host(app: &Arc<App>) {
                     .get("filename")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let referer = value
+                    .get("referer")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let audio_url = value
+                    .get("audio_url")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 // A download started from the extension must survive
                 // this host process exiting: Chrome/Firefox terminate
                 // the native host after its sendNativeMessage reply,
@@ -1838,16 +1946,16 @@ fn native_host(app: &Arc<App>) {
                 //      would be worse: the extension would then hand
                 //      the URL to the browser's own downloader, which
                 //      saves a YouTube page as a useless .html file.
-                match forward_add_to_bridge(&app.data_dir, DEFAULT_PORT, url, filename.as_deref()) {
+                match forward_add_to_bridge(&app.data_dir, DEFAULT_PORT, url, filename.as_deref(), referer.as_deref(), audio_url.as_deref()) {
                     Ok(rec) => {
                         serde_json::json!({"type": "added", "download": rec, "via": "bridge"})
                     }
                     Err(_first_err) => {
                         match spawn_detached_bridge(&app.data_dir, DEFAULT_PORT).and_then(|()| {
-                            forward_add_to_bridge(&app.data_dir, DEFAULT_PORT, url, filename.as_deref())
+                            forward_add_to_bridge(&app.data_dir, DEFAULT_PORT, url, filename.as_deref(), referer.as_deref(), audio_url.as_deref())
                         }) {
                             Ok(rec) => serde_json::json!({"type": "added", "download": rec, "via": "bridge", "bridge_started": true}),
-                            Err(_second_err) => match app.add_download(url, filename, None) {
+                            Err(_second_err) => match app.add_download(url, filename, None, referer, audio_url) {
                                 Ok(rec) => serde_json::json!({"type": "added", "download": rec, "via": "in-process", "warning": "The FetchForge bridge is not running, so this download started inside the browser connection and may stop if the browser closes it. Open the FetchForge app to keep downloads running."}),
                                 Err(e) => serde_json::json!({"type": "error", "error": e}),
                             },
@@ -1994,7 +2102,7 @@ mod tests {
             record_json()
         );
         let (port, handle) = stub_server(response);
-        let rec = forward_add_to_bridge(&dir, port, "https://example.com/x.zip", Some("x.zip"))
+        let rec = forward_add_to_bridge(&dir, port, "https://example.com/x.zip", Some("x.zip"), None, None)
             .unwrap();
         assert_eq!(rec.id, "dl-1");
         assert_eq!(rec.filename, "x.zip");
@@ -2024,7 +2132,7 @@ mod tests {
             .unwrap()
             .port();
         let start = std::time::Instant::now();
-        let err = forward_add_to_bridge(&dir, port, "https://example.com/x.zip", None).unwrap_err();
+        let err = forward_add_to_bridge(&dir, port, "https://example.com/x.zip", None, None, None).unwrap_err();
         assert!(err.contains("not reachable"), "error: {err}");
         assert!(start.elapsed() < Duration::from_secs(5));
     }
@@ -2039,7 +2147,7 @@ mod tests {
             body
         );
         let (port, _handle) = stub_server(response);
-        let err = forward_add_to_bridge(&dir, port, "https://example.com/x.zip", None).unwrap_err();
+        let err = forward_add_to_bridge(&dir, port, "https://example.com/x.zip", None, None, None).unwrap_err();
         assert!(err.contains("401"), "error: {err}");
     }
 
@@ -2081,6 +2189,7 @@ mod tests {
         DetectedItem {
             url: url.to_string(),
             page_url: None,
+            audio_url: None,
             title: None,
             kind: None,
             mime_type: None,

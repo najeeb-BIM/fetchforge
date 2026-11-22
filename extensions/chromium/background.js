@@ -75,7 +75,12 @@ async function sendViaBridge(url, filename) {
     body: JSON.stringify({ url, filename }),
   });
   if (!r.ok) throw new Error("bridge-" + r.status);
-  return true;
+  // The bridge answers 201 even when the download itself failed at
+  // once (e.g. an unsupported page): the record carries the
+  // outcome, so read it instead of claiming success.
+  const rec = await r.json().catch(() => null);
+  if (rec && rec.status === "failed") return { ok: false, error: rec.error || "Download failed" };
+  return { ok: true };
 }
 async function sendViaNative(url, filename) {
   const resp = await callApi(
@@ -84,16 +89,33 @@ async function sendViaNative(url, filename) {
     { type: "addDownload", url, filename }
   );
   if (resp && resp.type === "error") throw new Error(resp.error);
-  return true;
+  // Same as the bridge path: the native host forwards the bridge's
+  // record, which may already say the download failed.
+  if (resp && resp.download && resp.download.status === "failed") {
+    return { ok: false, error: resp.download.error || "Download failed" };
+  }
+  return { ok: true };
 }
+// Returns { ok, error? }: ok=false with a reason when the app
+// accepted the request but the download itself failed at once, or
+// when no path could take the URL at all. Callers surface `error`
+// to the user (overlay button, popup status) instead of a silent
+// revert or a bare "could not send".
 async function sendDownload(url, filename) {
-  if (!/^https?:\/\//i.test(url)) return false;
-  try { return await sendViaNative(url, filename); } catch (_) { /* host not installed */ }
+  if (!/^https?:\/\//i.test(url)) return { ok: false, error: "Not a web link" };
+  try {
+    const r = await sendViaNative(url, filename);
+    // A real failure reason from the app (not a transport miss):
+    // the native host already asked the bridge, so retrying the
+    // bridge directly would only fail the same way again.
+    if (r && r.ok === false) return r;
+    return { ok: true };
+  } catch (_) { /* host not installed */ }
   try { return await sendViaBridge(url, filename); } catch (_) { /* bridge not running / no token */ }
   // Documented fallback: let the browser handle it normally, and
   // record it so the popup can say so (not a silent fallback).
-  try { await callApi((...a) => api.downloads.download(...a), { url, saveAs: false }); try { await callApi((...a) => api.storage.local.set(...a), { lastFallback: Date.now() }); } catch (_) {} return true; }
-  catch (_) { return false; }
+  try { await callApi((...a) => api.downloads.download(...a), { url, saveAs: false }); try { await callApi((...a) => api.storage.local.set(...a), { lastFallback: Date.now() }); } catch (_) {} return { ok: true, viaBrowser: true }; }
+  catch (_) { return { ok: false, error: "Could not reach the FetchForge app" }; }
 }
 api.runtime.onInstalled.addListener(() => {
   try {
@@ -178,6 +200,22 @@ function handleReport(tabId, frameId, items, pageUrl) {
     postDetected(tabId, pageUrl);
   }, 1000));
 }
+// Ad blocker: apply the stored on/off pref at startup (the ruleset
+// is enabled by default in the manifest; the popup toggle persists
+// the choice in storage.local). Chrome also persists the enabled
+// state itself, so this is belt-and-braces after an update/reload.
+async function applyStoredAdBlockPref() {
+  try {
+    const s = await callApi((...a) => api.storage.local.get(...a), "adBlockEnabled");
+    const enabled = !s || typeof s.adBlockEnabled !== "boolean" ? true : s.adBlockEnabled;
+    if (api.declarativeNetRequest && api.declarativeNetRequest.updateEnabledRulesets) {
+      await api.declarativeNetRequest.updateEnabledRulesets(
+        enabled ? { enableRulesetIds: ["ff-ads"] } : { disableRulesetIds: ["ff-ads"] }
+      );
+    }
+  } catch (_) { /* DNR unavailable; blocking stays as the manifest left it */ }
+}
+applyStoredAdBlockPref();
 loadMediaCounts();
 if (api.tabs && api.tabs.onActivated) {
   api.tabs.onActivated.addListener((info) => {
@@ -200,14 +238,14 @@ api.contextMenus.onClicked.addListener((info) => {
 // Popup asks the background to send a pasted URL (keeps token handling here).
 api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.type === "sendUrl") {
-    sendDownload(msg.url, msg.filename).then((ok) => sendResponse({ ok }));
+    sendDownload(msg.url, msg.filename).then((r) => sendResponse({ ok: r.ok, error: r.error }));
     return true;
   }
   if (msg && msg.type === "downloadMedia") {
     // Content-script overlay click: same sendDownload path as the popup
     // and context menu. Only accept from a real tab's content script.
-    if (!_sender || !_sender.tab) { sendResponse({ ok: false }); return false; }
-    sendDownload(msg.url, msg.filename).then((ok) => sendResponse({ ok }));
+    if (!_sender || !_sender.tab) { sendResponse({ ok: false, error: "No tab" }); return false; }
+    sendDownload(msg.url, msg.filename).then((r) => sendResponse({ ok: r.ok, error: r.error }));
     return true;
   }
   if (msg && msg.type === "reportMedia") {

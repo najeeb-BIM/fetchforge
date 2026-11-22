@@ -47,4 +47,4 @@ pub use threed::{
 };
 pub use state::{DownloadRecord, Status, Store};
 pub use token::generate_secure_token;
-pub use validate::validate_url;
+pub use validate::{normalize_url_for_dedupe, validate_url};

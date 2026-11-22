@@ -404,17 +404,16 @@ fn try_gltf_download(
         .as_deref()
         .map(sanitize_filename)
         .unwrap_or_else(|| plan.filename.clone());
-    // Same idempotent-add rule as the other paths.
+    // Same idempotent-add rule as the other paths (see
+    // Store::find_duplicate): an already-active or already-completed
+    // download for the same URL + filename is returned, never
+    // queued twice.
     {
         let store = state.store.lock().unwrap();
-        for existing in store.all() {
-            if existing.url == clean_url
-                && existing.filename == record_filename
-                && existing.destination == state.download_dir.to_string_lossy().to_string()
-                && (existing.status == Status::Queued || existing.status == Status::Downloading)
-            {
-                return Ok(existing.clone());
-            }
+        if let Some(existing) =
+            store.find_duplicate(clean_url, &record_filename, &state.download_dir.to_string_lossy())
+        {
+            return Ok(existing);
         }
     }
     let id = generate_download_id();
@@ -459,24 +458,29 @@ fn try_media_download(
         format_id.as_deref(),
         filename.as_deref(),
     )?;
-    // Same idempotent-add rule as the bridge: an already-active job for
-    // the same URL + filename is returned, never duplicated.
+    // The HTML fallback may have resolved the page to an embedded
+    // stream/file URL: the record and the worker both use the
+    // resolved URL, not the page URL.
+    let record_url = plan
+        .effective_url
+        .clone()
+        .unwrap_or_else(|| clean_url.to_string());
+    // Same idempotent-add rule as the bridge (see
+    // Store::find_duplicate): an already-active or
+    // already-completed download for the same URL + filename is
+    // returned, never queued twice.
     {
         let store = state.store.lock().unwrap();
-        for existing in store.all() {
-            if existing.url == clean_url
-                && existing.filename == plan.filename
-                && existing.destination == state.download_dir.to_string_lossy().to_string()
-                && (existing.status == Status::Queued || existing.status == Status::Downloading)
-            {
-                return Ok(existing.clone());
-            }
+        if let Some(existing) =
+            store.find_duplicate(&record_url, &plan.filename, &state.download_dir.to_string_lossy())
+        {
+            return Ok(existing);
         }
     }
     let id = generate_download_id();
     let rec = DownloadRecord {
         id: id.clone(),
-        url: clean_url.to_string(),
+        url: record_url,
         filename: plan.filename.clone(),
         destination: state.download_dir.to_string_lossy().to_string(),
         category: category_for_filename(&plan.filename).to_string(),
@@ -511,22 +515,19 @@ fn queue_direct_download(
     total: Option<u64>,
     resumable: bool,
 ) -> Result<DownloadRecord, String> {
-    // Same idempotent-add rule as the bridge: an already-active job for
-    // the same URL + filename is returned, never duplicated (two workers
-    // would share one .part path and corrupt each other). This check
-    // runs before `clean` is moved into the new record below, so the
-    // same value is never used after a move (E0382 fix).
+    // Same idempotent-add rule as the bridge (see
+    // Store::find_duplicate): an already-active or
+    // already-completed download for the same URL + filename is
+    // returned, never queued twice (two workers would share one
+    // .part path and corrupt each other). This check runs before
+    // `clean` is moved into the new record below, so the same value
+    // is never used after a move (E0382 fix).
     {
         let store = state.store.lock().unwrap();
-        for existing in store.all() {
-            if existing.url == clean
-                && existing.filename == filename
-                && existing.destination == state.download_dir.to_string_lossy().to_string()
-                && (existing.status == Status::Queued
-                    || existing.status == Status::Downloading)
-            {
-                return Ok(existing.clone());
-            }
+        if let Some(existing) =
+            store.find_duplicate(&clean, &filename, &state.download_dir.to_string_lossy())
+        {
+            return Ok(existing);
         }
     }
     let id = generate_download_id();

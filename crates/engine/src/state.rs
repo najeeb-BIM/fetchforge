@@ -158,6 +158,19 @@ fn bak_path(path: &std::path::Path) -> PathBuf {
     path.with_extension("json.bak")
 }
 
+/// Does a record's destination belong to this download folder?
+/// True when it IS the folder (a not-yet-run record) or a file
+/// under it (a completed record stores the final file path, which
+/// may sit in a category subfolder and may carry a `(1)`-style
+/// collision suffix, so only the folder — never the file name —
+/// is compared here).
+fn same_download_root(destination: &str, download_dir: &str) -> bool {
+    if destination == download_dir {
+        return true;
+    }
+    std::path::Path::new(destination).starts_with(std::path::Path::new(download_dir))
+}
+
 impl Store {
     pub fn load(path: PathBuf) -> Self {
         // No file yet: normal first run.
@@ -352,6 +365,42 @@ impl Store {
     }
     pub fn get(&self, id: &str) -> Option<&DownloadRecord> {
         self.records.get(id)
+    }
+    /// Find an existing record for the same download: same
+    /// normalised URL, same filename, same download folder, and a
+    /// status that means the file is already coming or already here
+    /// (Queued, Downloading, or Completed). A duplicate add returns
+    /// this record instead of queueing a second download. Failed,
+    /// Cancelled and Paused records never match: a failed download
+    /// must stay retryable, and a paused one is resumed from its
+    /// own row, not re-added.
+    ///
+    /// The destination check accepts both shapes a record takes:
+    /// Queued/Downloading records store the download folder itself,
+    /// while Completed records store the final file path (which
+    /// sits under the download folder, possibly in a category
+    /// subfolder). A record whose file lives under a DIFFERENT
+    /// folder (the user moved the download folder since) is not a
+    /// duplicate.
+    pub fn find_duplicate(
+        &self,
+        url: &str,
+        filename: &str,
+        download_dir: &str,
+    ) -> Option<DownloadRecord> {
+        let want = crate::validate::normalize_url_for_dedupe(url);
+        self.records
+            .values()
+            .find(|r| {
+                crate::validate::normalize_url_for_dedupe(&r.url) == want
+                    && r.filename == filename
+                    && matches!(
+                        r.status,
+                        Status::Queued | Status::Downloading | Status::Completed
+                    )
+                    && same_download_root(&r.destination, download_dir)
+            })
+            .cloned()
     }
     pub fn all(&self) -> Vec<&DownloadRecord> {
         self.records.values().collect()
@@ -798,5 +847,81 @@ mod tests {
             disk.contains_key("fresh"),
             "a just-created record must be saved"
         );
+    }
+
+    #[test]
+    fn find_duplicate_matches_active_and_completed_not_failed() {
+        let dir = std::env::temp_dir().join("fetchforge-test-store-dedupe");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let mut s = Store::load(dir.join("downloads.json"));
+        let now = now_secs();
+        // A completed direct download: destination is the final file
+        // path (with a collision suffix), under the download folder.
+        let mut done = rec_status("done", Status::Completed, now, now);
+        done.url = "https://cdn.example.com/v/clip.mp4".to_string();
+        done.filename = "clip.mp4".to_string();
+        done.destination = "/home/user/Downloads/Video/clip (1).mp4".to_string();
+        s.upsert(done);
+        // A queued media download: destination is the folder itself.
+        let mut queued = rec_status("queued", Status::Queued, now, now);
+        queued.url = "https://www.youtube.com/watch?v=abc".to_string();
+        queued.filename = "Video.mp4".to_string();
+        queued.destination = "/home/user/Downloads".to_string();
+        s.upsert(queued);
+        // A failed download for a third URL: must stay retryable.
+        let mut failed = rec_status("failed", Status::Failed, now, now);
+        failed.url = "https://example.com/dead.mp4".to_string();
+        failed.filename = "dead.mp4".to_string();
+        failed.destination = "/home/user/Downloads".to_string();
+        s.upsert(failed);
+
+        // Completed + same URL/filename/folder: duplicate, even with
+        // a trailing slash and whitespace on the incoming URL.
+        let dup = s.find_duplicate(
+            "  https://cdn.example.com/v/clip.mp4/ ",
+            "clip.mp4",
+            "/home/user/Downloads",
+        );
+        assert_eq!(dup.as_ref().map(|r| r.id.as_str()), Some("done"));
+        // Queued: duplicate too.
+        let dup = s.find_duplicate(
+            "https://www.youtube.com/watch?v=abc",
+            "Video.mp4",
+            "/home/user/Downloads",
+        );
+        assert_eq!(dup.as_ref().map(|r| r.id.as_str()), Some("queued"));
+        // Failed: NOT a duplicate (retry must work).
+        assert!(s
+            .find_duplicate(
+                "https://example.com/dead.mp4",
+                "dead.mp4",
+                "/home/user/Downloads",
+            )
+            .is_none());
+        // Different filename: not a duplicate.
+        assert!(s
+            .find_duplicate(
+                "https://cdn.example.com/v/clip.mp4",
+                "other.mp4",
+                "/home/user/Downloads",
+            )
+            .is_none());
+        // Different query string: a different file, not a duplicate.
+        assert!(s
+            .find_duplicate(
+                "https://cdn.example.com/v/clip.mp4?token=zzz",
+                "clip.mp4",
+                "/home/user/Downloads",
+            )
+            .is_none());
+        // Same file under a different download folder: not a duplicate.
+        assert!(s
+            .find_duplicate(
+                "https://cdn.example.com/v/clip.mp4",
+                "clip.mp4",
+                "/home/user/OtherDownloads",
+            )
+            .is_none());
     }
 }

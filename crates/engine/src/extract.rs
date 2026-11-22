@@ -207,6 +207,13 @@ pub struct MediaInfo {
     /// The format the extension path (no UI) downloads. The UI
     /// pre-selects it in the picker.
     pub default_format_id: Option<String>,
+    /// Set only when yt-dlp could not read the page ("Unsupported
+    /// URL") and the HTML fallback found the real stream/file URL
+    /// embedded in the page instead: the worker must download THIS
+    /// URL, not the page URL (a manifest goes to the stream engine,
+    /// a direct file to yt-dlp). None for normal extraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_url: Option<String>,
 }
 
 fn opt_str<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -495,6 +502,7 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
         webpage_url,
         formats,
         default_format_id,
+        resolved_url: None,
     })
 }
 
@@ -712,6 +720,14 @@ fn friendly_media_error(stderr: &str) -> String {
 /// List formats for a page, using an explicit yt-dlp binary (the
 /// testable core; production callers use [`list_formats`]).
 pub fn list_formats_with(ytdlp: &Path, url: &str) -> Result<MediaInfo, String> {
+    list_formats_with_fallback(ytdlp, url, true)
+}
+
+fn list_formats_with_fallback(
+    ytdlp: &Path,
+    url: &str,
+    allow_fallback: bool,
+) -> Result<MediaInfo, String> {
     let clean = validate_url(url)?;
     let mut cmd = Command::new(ytdlp);
     cmd.args([
@@ -733,7 +749,23 @@ pub fn list_formats_with(ytdlp: &Path, url: &str) -> Result<MediaInfo, String> {
     let (_success, stdout, stderr) = output;
     match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
         Ok(v) if !v.is_null() => parse_media_info(&v, &clean),
-        _ => Err(friendly_media_error(&stderr)),
+        _ => {
+            // yt-dlp has no extractor for this page ("Unsupported
+            // URL") — but the page may still embed its stream in
+            // HTML/JS that the generic extractor cannot see (a JS
+            // player that loads its manifest at runtime). Try the
+            // embedded URLs before failing. Any other error
+            // (private, DRM, bot-check, ...) goes straight to the
+            // friendly message: a plain HTML fetch has no cookies
+            // or session, so it cannot unlock what yt-dlp was
+            // refused, and re-fetching would only waste a request.
+            if allow_fallback && stderr.to_lowercase().contains("unsupported url") {
+                if let Some(result) = try_html_embedded_fallback(ytdlp, &clean) {
+                    return result;
+                }
+            }
+            Err(friendly_media_error(&stderr))
+        }
     }
 }
 
@@ -748,6 +780,248 @@ pub fn list_formats(data_dir: &Path, url: &str) -> Result<MediaInfo, String> {
     }
     let ytdlp = ensure_ytdlp(data_dir)?;
     list_formats_with(&ytdlp, url)
+}
+
+// ---------------------------------------------------------------------------
+// HTML fallback for pages yt-dlp cannot read ("Unsupported URL")
+// ---------------------------------------------------------------------------
+
+/// Maximum page HTML the fallback reads: a page's markup is small,
+/// and a huge body is not a page worth scanning.
+const MAX_FALLBACK_HTML_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Media extensions the HTML fallback looks for: manifests first
+/// (the real stream), then direct files.
+const FALLBACK_MANIFEST_EXTS: [&str; 2] = [".m3u8", ".mpd"];
+const FALLBACK_FILE_EXTS: [&str; 4] = [".mp4", ".webm", ".mov", ".mkv"];
+
+/// Fetch a page's HTML for the embedded-stream fallback: a plain GET
+/// with the engine's user agent, no cookies (this reqwest client has
+/// no cookie store), no auth headers, 60 s timeout, at most 10
+/// redirects — the same discipline as the manifest fetches in
+/// media.rs. A non-HTML response is still scanned (some players
+/// serve the player page as JSON), but the body is capped.
+fn fetch_page_html(url: &str) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("FetchForge/0.2")
+        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client.get(url).send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("Page request failed: HTTP {}", resp.status()));
+    }
+    let mut buf = Vec::new();
+    resp.take(MAX_FALLBACK_HTML_BYTES)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// A byte that can appear inside a URL in HTML/JS text. Quotes,
+/// angle brackets, whitespace, braces and backslashes end a URL.
+/// (`=` is allowed here — it belongs in query strings — but the
+/// left-expansion below stops at it, so `src=/path/file.mp4` does
+/// not swallow the attribute name.)
+fn is_url_byte(b: u8) -> bool {
+    b.is_ascii()
+        && !b.is_ascii_whitespace()
+        && !matches!(
+            b,
+            b'"' | b'\''
+                | b'<'
+                | b'>'
+                | b'('
+                | b')'
+                | b'{'
+                | b'}'
+                | b'['
+                | b']'
+                | b'`'
+                | b'\\'
+                | b'|'
+                | b','
+                | b';'
+        )
+}
+
+/// Resolve an embedded URL candidate against the page URL: absolute
+/// URLs pass through, protocol-relative URLs take the page's scheme,
+/// relative URLs join against the page.
+fn resolve_embedded_url(raw: &str, page_url: &str) -> Option<String> {
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Some(raw.to_string());
+    }
+    if let Some(rest) = raw.strip_prefix("//") {
+        let scheme = page_url.split("://").next().unwrap_or("https");
+        return Some(format!("{scheme}://{rest}"));
+    }
+    url::Url::parse(page_url)
+        .and_then(|base| base.join(raw))
+        .map(|u| u.to_string())
+        .ok()
+}
+
+/// Extract the URL around one extension occurrence: expand left to
+/// the URL start and right to the URL end (including a query
+/// string), unescape JSON/HTML escaping, resolve against the page,
+/// and validate. Returns None when the text around the extension
+/// is not a usable http(s) URL.
+fn extract_url_around(
+    html: &str,
+    ext_start: usize,
+    ext_end: usize,
+    page_url: &str,
+) -> Option<String> {
+    let bytes = html.as_bytes();
+    let mut start = ext_start;
+    // Left: stop at `=` as well as at the URL terminators, so an
+    // unquoted attribute (`src=/videos/clip.mp4`) does not swallow
+    // the attribute name into the URL.
+    while start > 0 && bytes[start - 1] != b'=' && is_url_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = ext_end;
+    while end < bytes.len() && is_url_byte(bytes[end]) {
+        end += 1;
+    }
+    // Byte-walking can land inside a multi-byte char (a non-ASCII
+    // byte stops the walk mid-character); snap to boundaries.
+    while start < html.len() && !html.is_char_boundary(start) {
+        start += 1;
+    }
+    while end > 0 && !html.is_char_boundary(end) {
+        end -= 1;
+    }
+    if start >= end {
+        return None;
+    }
+    // A trailing full stop is sentence punctuation, not part of
+    // the URL (a URL at the end of a sentence).
+    let raw = html[start..end].trim_end_matches('.');
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(absolute) = resolve_embedded_url(raw, page_url) {
+        if let Ok(valid) = validate_url(&absolute) {
+            return Some(valid);
+        }
+    }
+    // The left-expansion may have swallowed a prefix
+    // (`url:https://cdn/...`): retry from the last http(s)://
+    // inside the candidate.
+    let pos = raw.rfind("https://").or_else(|| raw.rfind("http://"))?;
+    if pos == 0 {
+        return None;
+    }
+    validate_url(&raw[pos..]).ok()
+}
+
+/// Scan page HTML for embedded media URLs: absolute http(s) URLs and
+/// relative URLs ending in a media extension, wherever they appear —
+/// `src` attributes, JSON blobs (`"file":"..."`), `data-*`
+/// attributes, or bare text. Returns absolute URLs in priority
+/// order (manifests first, then direct files), document order
+/// within each class, deduplicated. Anything that fails URL
+/// validation (wrong scheme, embedded credentials) is dropped.
+pub fn find_embedded_media_urls(html: &str, page_url: &str) -> Vec<String> {
+    // JSON/HTML escaping hides URLs from the scanner
+    // (`https:\/\/cdn...` has no contiguous `https://`, and `&amp;`
+    // breaks query strings): unescape the whole page first, then
+    // scan the clean text throughout.
+    let clean = html
+        .replace("\\/", "/")
+        .replace("\\u0026", "&")
+        .replace("&amp;", "&");
+    let html = clean.as_str();
+    let lower = html.to_ascii_lowercase();
+    // Every extension occurrence, in document order.
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for ext in FALLBACK_MANIFEST_EXTS
+        .iter()
+        .chain(FALLBACK_FILE_EXTS.iter())
+    {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(ext) {
+            let at = from + rel;
+            hits.push((at, ext.len()));
+            from = at + ext.len();
+        }
+    }
+    hits.sort_unstable();
+    let mut found: Vec<String> = Vec::new();
+    for (at, ext_len) in hits {
+        let after = at + ext_len;
+        // The extension must end the path part: the next char starts
+        // a query/fragment or ends the URL. A `/` or a letter after
+        // it means the extension is mid-path (`/video.mp4/thumb.jpg`)
+        // or a longer word (`video.mp4x`).
+        let next_ok = match lower.as_bytes().get(after) {
+            None => true,
+            Some(b) => {
+                matches!(
+                    b,
+                    b'?' | b'#' | b'&' | b'"' | b'\'' | b'<' | b'>' | b')' | b',' | b';'
+                ) || b.is_ascii_whitespace()
+            }
+        };
+        if !next_ok {
+            continue;
+        }
+        if let Some(url) = extract_url_around(html, at, after, page_url) {
+            if !found.contains(&url) {
+                found.push(url);
+            }
+        }
+    }
+    // Manifests first (the real stream), then direct files; stable
+    // within each class, so document order survives.
+    let (mut manifests, mut files): (Vec<String>, Vec<String>) = found
+        .into_iter()
+        .partition(|u| crate::media::is_manifest_url(u));
+    manifests.append(&mut files);
+    manifests
+}
+
+/// HTML fallback for a page yt-dlp cannot read: fetch the page, scan
+/// for embedded stream/file URLs, and extract the first one that
+/// lists formats. Returns None when the page has no embedded media
+/// (the caller then reports the original friendly error), or
+/// Some(result) when a candidate was found — Ok on success, Err
+/// with the candidate's own error when every candidate failed. A
+/// manifest candidate lists through media.rs (no yt-dlp); a
+/// direct-file candidate lists through yt-dlp's generic extractor
+/// with no second HTML fallback (the file URL either lists or it
+/// doesn't, and re-fetching it as HTML would only download media
+/// bytes). The returned MediaInfo carries `resolved_url` so the
+/// planner routes the worker to the found URL.
+fn try_html_embedded_fallback(ytdlp: &Path, page_url: &str) -> Option<Result<MediaInfo, String>> {
+    let html = fetch_page_html(page_url).ok()?;
+    let candidates = find_embedded_media_urls(&html, page_url);
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut last_err: Option<String> = None;
+    for candidate in &candidates {
+        let attempt: Result<MediaInfo, String> = if crate::media::is_manifest_url(candidate) {
+            crate::media::list_stream_formats(candidate)
+                .map(|info| stream_info_to_media_info(&info))
+        } else {
+            list_formats_with_fallback(ytdlp, candidate, false)
+        };
+        match attempt {
+            Ok(mut info) => {
+                info.resolved_url = Some(candidate.clone());
+                return Some(Ok(info));
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Some(Err(last_err.unwrap_or_else(|| {
+        "No downloadable video was found on this page.".to_string()
+    })))
 }
 
 /// Convert a parsed HLS/DASH stream into the same MediaInfo shape
@@ -825,6 +1099,7 @@ fn stream_info_to_media_info(info: &crate::media::StreamInfo) -> MediaInfo {
         webpage_url: info.manifest_url.clone(),
         formats,
         default_format_id,
+        resolved_url: None,
     }
 }
 
@@ -856,6 +1131,11 @@ pub struct MediaPlan {
     /// is. None means a yt-dlp download (or a direct download,
     /// which never produces a plan).
     pub stream_kind: Option<crate::media::StreamKind>,
+    /// The URL the worker must actually download. None means the
+    /// requested page URL (normal extraction). Set when the HTML
+    /// fallback resolved the page to an embedded stream/file URL:
+    /// the record URL and the worker input both use this value.
+    pub effective_url: Option<String>,
 }
 
 fn stem_for_title(title: &str) -> String {
@@ -963,7 +1243,7 @@ fn plan_from_info(
             total = Some(total.unwrap_or(0) + audio);
         }
     }
-    Ok(MediaPlan {
+    let mut plan = MediaPlan {
         title: info.title.clone(),
         filename,
         total_bytes: total,
@@ -972,7 +1252,23 @@ fn plan_from_info(
         needs_merge: chosen.needs_merge,
         selector: format_selector(chosen),
         stream_kind: None,
-    })
+        // HTML-fallback plans: extraction resolved the page to an
+        // embedded stream/file URL, and the worker downloads the
+        // resolved URL, not the page. Normal extraction leaves
+        // this None.
+        effective_url: info.resolved_url.clone(),
+    };
+    // A resolved manifest is routed to the stream engine (empty
+    // yt-dlp selector, stream_kind set) exactly as if the user had
+    // pasted the manifest URL directly; a resolved direct file keeps
+    // its yt-dlp selector.
+    if let Some(resolved) = &info.resolved_url {
+        if let Some(kind) = crate::media::stream_kind_of_url(resolved) {
+            plan.stream_kind = Some(kind);
+            plan.selector = String::new();
+        }
+    }
+    Ok(plan)
 }
 
 // ---------------------------------------------------------------------------
@@ -1809,6 +2105,188 @@ mod tests {
         );
         let err = list_formats_with(&stub, "https://www.youtube.com/watch?v=abc").unwrap_err();
         assert!(err.contains("private"), "error: {err}");
+    }
+
+    #[test]
+    fn find_embedded_media_urls_finds_manifests_first() {
+        // A JS-player page: the manifest lives in a JS var, a direct
+        // file in a <source>, plus traps (a mid-path extension, a
+        // duplicate, an unquoted attribute, JSON escaping).
+        let html = r##"<html><head><title>Movie Night</title></head><body>
+<script>var player = { "file": "https:\/\/cdn.example.com\/v\/master.m3u8?token=abc&amp;x=1", "poster": "/img/poster.jpg" };</script>
+<video controls><source src="/videos/trailer.mp4" type="video/mp4"></video>
+<video src=/videos/preview.mp4></video>
+<a href="https://cdn.example.com/v/master.m3u8?token=abc&x=1">again</a>
+<img src="/thumbs/video.mp4/frame.jpg">
+</body></html>"##;
+        let urls = find_embedded_media_urls(html, "https://watch.example.com/watch/m/1");
+        // Manifest first, then direct files in document order; the
+        // duplicate manifest and the mid-path .mp4 are dropped.
+        assert_eq!(
+            urls,
+            vec![
+                "https://cdn.example.com/v/master.m3u8?token=abc&x=1".to_string(),
+                "https://watch.example.com/videos/trailer.mp4".to_string(),
+                "https://watch.example.com/videos/preview.mp4".to_string(),
+            ],
+            "urls: {urls:?}"
+        );
+    }
+
+    #[test]
+    fn find_embedded_media_urls_empty_and_relative() {
+        // A page with no media at all finds nothing.
+        let bare = "<html><body><p>No video here.</p></body></html>";
+        assert!(find_embedded_media_urls(bare, "https://example.com/p").is_empty());
+        // Relative and protocol-relative URLs resolve against the page.
+        let html = r##"<script>var s = "play/list.m3u8"; var t = "//cdn.example.com/x/manifest.mpd";</script>"##;
+        let urls = find_embedded_media_urls(html, "https://watch.example.com/a/b/page");
+        assert_eq!(
+            urls,
+            vec![
+                "https://watch.example.com/a/b/play/list.m3u8".to_string(),
+                "https://cdn.example.com/x/manifest.mpd".to_string(),
+            ],
+            "urls: {urls:?}"
+        );
+    }
+
+    #[test]
+    fn find_embedded_media_urls_rejects_bad_schemes_and_credentials() {
+        let html = r##"<a href="ftp://example.com/v/movie.mp4">ftp</a>
+<a href="https://user:secret@example.com/v/movie.mp4">creds</a>
+<a href="https://example.com/v/ok.mp4">ok</a>"##;
+        let urls = find_embedded_media_urls(html, "https://example.com/p");
+        assert_eq!(urls, vec!["https://example.com/v/ok.mp4".to_string()]);
+    }
+
+    #[test]
+    fn list_formats_with_falls_back_to_embedded_manifest() {
+        // yt-dlp has no extractor for the page ("Unsupported URL"),
+        // but the page HTML embeds its HLS manifest: the fallback
+        // must list the stream instead of failing.
+        let dir = unique_temp_dir("stub-fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = write_stub_ytdlp(
+            &dir,
+            "fake-yt-dlp",
+            "#!/bin/sh\necho 'ERROR: Unsupported URL: https://novahd.cc/watch/m/1' >&2\nexit 1\n",
+            "[Console]::Error.WriteLine('ERROR: Unsupported URL: https://novahd.cc/watch/m/1')\nexit 1\n",
+        );
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "/watch".to_string(),
+            b"<html><body><script>var p={\"file\":\"/stream/master.m3u8\"};</script></body></html>"
+                .to_vec(),
+        );
+        files.insert(
+            "/stream/master.m3u8".to_string(),
+            TEST_MASTER.as_bytes().to_vec(),
+        );
+        files.insert(
+            "/stream/low.m3u8".to_string(),
+            TEST_MEDIA.as_bytes().to_vec(),
+        );
+        files.insert(
+            "/stream/mid.m3u8".to_string(),
+            TEST_MEDIA.as_bytes().to_vec(),
+        );
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_files(files, stop.clone());
+        let page = format!("http://127.0.0.1:{port}/watch");
+        let info = list_formats_with(&stub, &page).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(info.extractor, "HLS");
+        assert_eq!(info.formats.len(), 2);
+        assert_eq!(
+            info.resolved_url.as_deref(),
+            Some(format!("http://127.0.0.1:{port}/stream/master.m3u8").as_str()),
+            "resolved_url: {:?}",
+            info.resolved_url
+        );
+    }
+
+    #[test]
+    fn list_formats_with_no_embedded_media_keeps_friendly_error() {
+        // Same "Unsupported URL", but the page embeds nothing: the
+        // original friendly "not supported" error is returned, not
+        // a fallback error.
+        let dir = unique_temp_dir("stub-fallback-none");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = write_stub_ytdlp(
+            &dir,
+            "fake-yt-dlp",
+            "#!/bin/sh\necho 'ERROR: Unsupported URL: https://example.com/x' >&2\nexit 1\n",
+            "[Console]::Error.WriteLine('ERROR: Unsupported URL: https://example.com/x')\nexit 1\n",
+        );
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "/watch".to_string(),
+            b"<html><body><p>Just text, no player.</p></body></html>".to_vec(),
+        );
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_files(files, stop.clone());
+        let page = format!("http://127.0.0.1:{port}/watch");
+        let err = list_formats_with(&stub, &page).unwrap_err();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(err.contains("not a supported video"), "error: {err}");
+    }
+
+    #[test]
+    fn plan_from_info_routes_resolved_manifest_to_stream_engine() {
+        // A plan from fallback-extracted HLS info: the worker must
+        // download the manifest (effective_url), via the stream
+        // engine (stream_kind set, empty yt-dlp selector).
+        use crate::media::{StreamFormat, StreamInfo, StreamKind};
+        let stream = StreamInfo {
+            kind: StreamKind::Hls,
+            title: "clip".to_string(),
+            duration_secs: Some(120),
+            manifest_url: "https://cdn.example.com/clip/master.m3u8".to_string(),
+            formats: vec![StreamFormat {
+                id: "https://cdn.example.com/clip/mid.m3u8".to_string(),
+                ext: "ts".to_string(),
+                is_video: true,
+                is_audio: true,
+                height: Some(720),
+                width: Some(1280),
+                abr_kbps: None,
+                vbr_kbps: Some(2800.0),
+                fps: Some(30.0),
+                filesize: None,
+                needs_merge: false,
+            }],
+        };
+        let mut info = stream_info_to_media_info(&stream);
+        info.resolved_url = Some("https://cdn.example.com/clip/master.m3u8".to_string());
+        let plan = plan_from_info(&info, None, None).unwrap();
+        assert_eq!(
+            plan.effective_url.as_deref(),
+            Some("https://cdn.example.com/clip/master.m3u8")
+        );
+        assert_eq!(plan.stream_kind, Some(StreamKind::Hls));
+        assert_eq!(plan.selector, "");
+        assert_eq!(plan.format_id, "https://cdn.example.com/clip/mid.m3u8");
+        // A resolved direct file keeps its yt-dlp selector and no
+        // stream kind.
+        let mut yt = parse_media_info(&youtube_json(), "https://example.com").unwrap();
+        yt.resolved_url = Some("https://cdn.example.com/v/movie.mp4".to_string());
+        let plan = plan_from_info(&yt, Some("22"), None).unwrap();
+        assert_eq!(
+            plan.effective_url.as_deref(),
+            Some("https://cdn.example.com/v/movie.mp4")
+        );
+        assert_eq!(plan.stream_kind, None);
+        assert_eq!(plan.selector, "22");
+        // Normal extraction: no effective URL.
+        let plain = parse_media_info(&youtube_json(), "https://example.com").unwrap();
+        let plan = plan_from_info(&plain, Some("22"), None).unwrap();
+        assert_eq!(plan.effective_url, None);
+        assert_eq!(plan.stream_kind, None);
     }
 
     #[test]

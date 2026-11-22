@@ -70,7 +70,7 @@ async function refreshMedia() {
       btn.onclick = async () => {
         btn.disabled = true;
         const res = await sendMessage({ type: "sendUrl", url: item.url, filename: item.filename });
-        status.textContent = res && res.ok ? "Sent (or fell back to browser download)." : "Could not send.";
+        status.textContent = res && res.ok ? "Sent (or fell back to browser download)." : "Could not send: " + (res && res.error ? res.error : "unknown error");
         btn.disabled = false;
       };
       row.appendChild(check);
@@ -141,7 +141,37 @@ document.getElementById("send").onclick = async () => {
   const url = document.getElementById("url").value.trim();
   const filename = document.getElementById("filename").value.trim() || undefined;
   const r = await sendMessage({ type: "sendUrl", url, filename });
-  status.textContent = r && r.ok ? "Sent (or fell back to browser download)." : "Could not send. Is the link http/https?";
+  status.textContent = r && r.ok ? "Sent (or fell back to browser download)." : "Could not send: " + (r && r.error ? r.error : "is the link http/https?");
+};
+// Ad blocker toggle: the static ruleset (rules/ads.json) is enabled
+// by default in the manifest; this checkbox persists the choice in
+// storage.local and enables/disables the ruleset. Default ON.
+const AD_BLOCK_RULESET_ID = "ff-ads";
+function applyAdBlock(enabled) {
+  if (!api.declarativeNetRequest || !api.declarativeNetRequest.updateEnabledRulesets) return;
+  try {
+    const p = api.declarativeNetRequest.updateEnabledRulesets(
+      enabled ? { enableRulesetIds: [AD_BLOCK_RULESET_ID] } : { disableRulesetIds: [AD_BLOCK_RULESET_ID] }
+    );
+    if (p && p.catch) p.catch(function () {});
+  } catch (_) { /* DNR unavailable; the manifest default stands */ }
+}
+async function refreshAdBlock() {
+  const box = document.getElementById("adBlock");
+  if (!box) return;
+  let enabled = true;
+  try {
+    const s = await getStorage("adBlockEnabled");
+    if (typeof s.adBlockEnabled === "boolean") enabled = s.adBlockEnabled;
+  } catch (_) {}
+  box.checked = enabled;
+  applyAdBlock(enabled);
+}
+document.getElementById("adBlock").onchange = async (e) => {
+  const enabled = e.target.checked;
+  await setStorage({ adBlockEnabled: enabled });
+  applyAdBlock(enabled);
 };
 refresh();
 refreshMedia();
+refreshAdBlock();

@@ -18,8 +18,15 @@
 // deliberately keeps no <all_urls> host permission. blob: sources (e.g.
 // YouTube's MSE player) cannot be downloaded directly, so for those the
 // button sends the PAGE URL and the desktop app extracts the media
-// server-side. data: URLs are skipped entirely. No DRM, auth, paywall,
-// or encryption bypass is attempted anywhere.
+// server-side — unless the resource-timing log reveals the real stream
+// URL the player fetched (see findStreamUrlFromResources), in which
+// case that URL is sent instead. data: URLs are skipped entirely. No
+// DRM, auth, paywall, or encryption bypass is attempted anywhere.
+//
+// Stacked videos (a preview/ad <video> on top of the main player,
+// common on streaming sites) share one on-screen box: only one
+// overlay button is shown for the whole stack, attached to the
+// playing (or largest) element — see pickOverlayRepresentatives.
 (function () {
   "use strict";
   if (window.location.protocol !== "http:" && window.location.protocol !== "https:") return;
@@ -87,9 +94,11 @@
   function registerDetector(detector) { detectors.push(detector); }
 
   // Best downloadable source for a <video>/<audio> element, or null.
-  // Returns { url, viaPage }: url is a direct http(s) media URL, or null
-  // with viaPage=true when the only source is a blob: URL (the page URL
-  // must be sent instead so the desktop app can extract the media).
+  // Returns { url, viaPage, viaStream? }: url is a direct http(s)
+  // media URL, or null with viaPage=true when the only source is a
+  // blob: URL (the page URL must be sent instead so the desktop app
+  // can extract the media). viaStream is set when the URL came from
+  // the resource-timing log rather than the DOM (see below).
   function mediaSource(el) {
     const candidates = [];
     if (el.currentSrc) candidates.push(el.currentSrc);
@@ -107,8 +116,68 @@
       if (u.startsWith("blob:")) { sawBlob = true; continue; }
       if (/^https?:\/\//i.test(u)) return { url: u, viaPage: false };
     }
-    if (sawBlob) return { url: null, viaPage: true };
+    if (sawBlob) {
+      // The player loads its stream through Media Source Extensions:
+      // the real URL is not in the DOM, but the browser's
+      // resource-timing log lists every URL this document fetched,
+      // including the manifest the player loaded. Send that instead
+      // of the bare page URL when it is found.
+      const stream = findStreamUrlFromResources();
+      if (stream) return { url: stream, viaPage: false, viaStream: true };
+      return { url: null, viaPage: true };
+    }
     return null;
+  }
+
+  // Resource-timing stream detection for blob:/JS players.
+  // Entry names are visible cross-origin (only the detailed timing
+  // fields need a Timing-Allow-Origin header), so this works for
+  // third-party stream CDNs too. No cookies, headers, or credentials
+  // are involved: the names are read-only metadata about this
+  // document's own fetches. Manifests (.m3u8/.mpd) beat direct
+  // files; within a kind, a fetch the player itself made
+  // (initiator "video"/"audio"/"fetch"/"xmlhttprequest") beats page
+  // furniture, and the most recent fetch wins — the currently
+  // playing stream is the freshest entry. Only this document's
+  // entries are visible (an iframe player has its own log, read by
+  // the content script running in that frame).
+  const STREAM_EXT_RE = /\.(m3u8|mpd)([?#]|$)/i;
+  const MEDIA_FILE_EXT_RE = /\.(mp4|webm|mov|mkv)([?#]|$)/i;
+  function findStreamUrlFromResources() {
+    let entries = [];
+    try {
+      entries = performance.getEntriesByType("resource") || [];
+    } catch (_) { return null; }
+    let bestManifest = null; // { url, rank, startTime }
+    let bestFile = null;
+    for (const e of entries) {
+      const name = e && e.name;
+      if (!name || !/^https?:\/\//i.test(name)) continue;
+      const it = e.initiatorType || "";
+      const rank = (it === "video" || it === "audio" || it === "fetch" || it === "xmlhttprequest") ? 1 : 0;
+      const t = typeof e.startTime === "number" ? e.startTime : 0;
+      const cand = { url: name, rank: rank, startTime: t };
+      const better = function (a, b) {
+        return !b || a.rank > b.rank || (a.rank === b.rank && a.startTime >= b.startTime);
+      };
+      if (STREAM_EXT_RE.test(name)) {
+        if (better(cand, bestManifest)) bestManifest = cand;
+      } else if (MEDIA_FILE_EXT_RE.test(name)) {
+        if (better(cand, bestFile)) bestFile = cand;
+      }
+    }
+    const best = bestManifest || bestFile;
+    return best ? best.url : null;
+  }
+
+  // Filename for a resolved media source: none for a page URL (the
+  // app derives it from the title) and none for a stream manifest
+  // (the app names it from the manifest, not "master.m3u8"); a
+  // direct file keeps its own name.
+  function filenameForSource(src) {
+    if (!src || src.viaPage) return undefined;
+    if (src.viaStream && STREAM_EXT_RE.test(src.url)) return undefined;
+    return fileNameFromUrl(src.url);
   }
 
   function extractHtmlMedia(kind) {
@@ -116,13 +185,15 @@
       if (!isVisible(el)) return null;
       const src = mediaSource(el);
       if (!src) return null;
-      return {
+      const item = {
         kind: kind,
         url: src.viaPage ? window.location.href : src.url,
         viaPage: src.viaPage,
         title: mediaTitle(el),
-        filename: src.viaPage ? undefined : fileNameFromUrl(src.url),
+        filename: filenameForSource(src),
       };
+      if (src.viaStream) item.viaStream = true;
+      return item;
     };
   }
 
@@ -288,26 +359,54 @@
   // media element -> { host, button }
   const overlays = new Map();
 
+  // Short button-sized reason from the engine's friendly error
+  // string (the full reason goes in the button's tooltip).
+  function shortFailureReason(error) {
+    const e = String(error || "").toLowerCase();
+    if (e.indexOf("not a supported video") !== -1) return "unsupported page";
+    if (e.indexOf("drm") !== -1) return "DRM-protected";
+    if (e.indexOf("private") !== -1 || e.indexOf("sign-in") !== -1 || e.indexOf("sign in") !== -1) return "needs sign-in";
+    if (e.indexOf("unavailable") !== -1) return "unavailable";
+    if (e.indexOf("403") !== -1 || e.indexOf("access denied") !== -1) return "access denied";
+    if (e.indexOf("404") !== -1 || e.indexOf("not found") !== -1) return "not found";
+    if (e.indexOf("timed out") !== -1 || e.indexOf("too long") !== -1) return "timed out";
+    if (e.indexOf("could not reach") !== -1) return "unreachable";
+    if (e.indexOf("not reach the fetchforge app") !== -1) return "app not running";
+    return "see app";
+  }
+
   function onOverlayClick(video, btn) {
     // Re-resolve at click time: the source may have changed since scan.
     const src = mediaSource(video);
     if (!src) return;
     const url = src.viaPage ? window.location.href : src.url;
-    const filename = src.viaPage ? undefined : fileNameFromUrl(src.url);
+    const filename = filenameForSource(src);
     btn.disabled = true;
     btn.textContent = "Sending…";
+    btn.title = "";
     sendRuntimeMessage({ type: "downloadMedia", url: url, filename: filename }).then(function (resp) {
-      btn.textContent = resp && resp.ok ? "Sent to FetchForge" : "Failed — try the popup";
+      if (resp && resp.ok) {
+        btn.textContent = "Sent to FetchForge";
+      } else {
+        // Show WHY it failed on the button (and the full reason as
+        // a tooltip) instead of silently reverting: a failed send
+        // used to look identical to a successful one.
+        btn.textContent = "Failed — " + shortFailureReason(resp && resp.error);
+        btn.title = (resp && resp.error) || "Download failed";
+      }
       window.setTimeout(function () {
         btn.disabled = false;
         btn.textContent = "↓ FetchForge";
-      }, 2500);
+        btn.title = "";
+      }, 5000);
     }).catch(function () {
-      btn.textContent = "Failed — try the popup";
+      btn.textContent = "Failed — app not running";
+      btn.title = "Could not reach the FetchForge app";
       window.setTimeout(function () {
         btn.disabled = false;
         btn.textContent = "↓ FetchForge";
-      }, 2500);
+        btn.title = "";
+      }, 5000);
     });
   }
 
@@ -353,13 +452,80 @@
     }
   }
 
+  // ---- Overlay dedupe by position (stacked videos) ----
+  //
+  // Streaming players often stack two <video> elements in one box
+  // (a preview/ad video under the main player, or a pre-roll ad
+  // over it). Each element would get its own button — two identical
+  // FetchForge buttons on one video, both working. Group elements
+  // whose boxes overlap almost exactly and show ONE button per
+  // group, attached to the playing element (else the largest).
+  // Genuinely separate videos (side by side, different boxes) still
+  // get one button each. Only same-document stacking is deduped: a
+  // video inside an iframe is seen only by the content script
+  // running in that frame.
+  const STACK_TOLERANCE_PX = 8;
+  function rectsStacked(a, b) {
+    return Math.abs(a.left - b.left) <= STACK_TOLERANCE_PX
+      && Math.abs(a.top - b.top) <= STACK_TOLERANCE_PX
+      && Math.abs(a.right - b.right) <= STACK_TOLERANCE_PX
+      && Math.abs(a.bottom - b.bottom) <= STACK_TOLERANCE_PX;
+  }
+
+  function isPlaying(el) {
+    return !el.paused && !el.ended && el.readyState >= 2;
+  }
+
+  // One representative element per stacked group, as a Set.
+  function pickOverlayRepresentatives(candidates) {
+    const groups = [];
+    for (const el of candidates) {
+      const rect = el.getBoundingClientRect();
+      let placed = false;
+      for (const g of groups) {
+        if (rectsStacked(rect, g.rect)) { g.els.push(el); placed = true; break; }
+      }
+      if (!placed) groups.push({ rect: rect, els: [el] });
+    }
+    const reps = new Set();
+    for (const g of groups) {
+      let best = g.els[0];
+      for (const el of g.els) {
+        const elPlaying = isPlaying(el);
+        const bestPlaying = isPlaying(best);
+        if (elPlaying && !bestPlaying) { best = el; continue; }
+        if (elPlaying === bestPlaying) {
+          const r = el.getBoundingClientRect();
+          const br = best.getBoundingClientRect();
+          if (r.width * r.height > br.width * br.height) best = el;
+        }
+      }
+      reps.add(best);
+    }
+    return reps;
+  }
+
   function scan() {
     for (const detector of detectors) {
       if (!detector.overlay) continue;
       const els = document.querySelectorAll(detector.selector);
+      const candidates = [];
       for (const el of els) {
-        if (overlays.has(el)) continue;
         if (!detector.extract(el)) continue; // no usable source yet; caught later
+        candidates.push(el);
+      }
+      const reps = pickOverlayRepresentatives(candidates);
+      // Prune overlays for elements that are no longer their group's
+      // representative (e.g. the main player started playing and
+      // took over from the preview).
+      for (const el of Array.from(overlays.keys())) {
+        if (candidates.indexOf(el) !== -1 && !reps.has(el)) {
+          overlays.get(el).host.remove();
+          overlays.delete(el);
+        }
+      }
+      for (const el of reps) {
+        if (overlays.has(el)) continue;
         overlays.set(el, createOverlay(el));
       }
     }

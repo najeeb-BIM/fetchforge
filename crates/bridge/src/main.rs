@@ -547,15 +547,12 @@ impl App {
                 // Same idempotent-add rule as the other paths.
                 {
                     let mut store = self.store.lock().unwrap();
-                    for existing in store.all() {
-                        if existing.url == clean_url
-                            && existing.filename == record_filename
-                            && existing.destination == self.settings.download_dir
-                            && (existing.status == Status::Queued
-                                || existing.status == Status::Downloading)
-                        {
-                            return Ok(existing.clone());
-                        }
+                    if let Some(existing) = store.find_duplicate(
+                        clean_url,
+                        &record_filename,
+                        &self.settings.download_dir,
+                    ) {
+                        return Ok(existing);
                     }
                     let id = generate_download_id();
                     let rec = DownloadRecord {
@@ -627,23 +624,27 @@ impl App {
             format_id.as_deref(),
             filename.as_deref(),
         )?;
-        // Same idempotent-add rule as direct downloads: an already-active
-        // job for the same URL + filename is returned, never duplicated.
+        // The HTML fallback may have resolved the page to an
+        // embedded stream/file URL: the record and the worker both
+        // use the resolved URL, not the page URL.
+        let record_url = plan
+            .effective_url
+            .clone()
+            .unwrap_or_else(|| clean_url.to_string());
+        // Idempotent add (see Store::find_duplicate): an
+        // already-active or already-completed download for the same
+        // URL + filename is returned, never queued twice.
         {
             let mut store = self.store.lock().unwrap();
-            for existing in store.all() {
-                if existing.url == clean_url
-                    && existing.filename == plan.filename
-                    && existing.destination == self.settings.download_dir
-                    && (existing.status == Status::Queued || existing.status == Status::Downloading)
-                {
-                    return Ok(existing.clone());
-                }
+            if let Some(existing) =
+                store.find_duplicate(&record_url, &plan.filename, &self.settings.download_dir)
+            {
+                return Ok(existing);
             }
             let id = generate_download_id();
             let rec = DownloadRecord {
                 id: id.clone(),
-                url: clean_url.to_string(),
+                url: record_url,
                 filename: plan.filename.clone(),
                 destination: self.settings.download_dir.clone(),
                 category: category_for_filename(&plan.filename).to_string(),
@@ -678,23 +679,22 @@ impl App {
         total: Option<u64>,
         resumable: bool,
     ) -> Result<DownloadRecord, String> {
-        // Idempotent add (safe to run twice): if the same URL + filename
-        // is already Queued or Downloading, return that job instead of
-        // starting a second worker. Without this, two workers derive the
-        // same .part path and corrupt each other (found by the duplicate
-        // test on 2026-10-26: one record reported "got 0 bytes" while
-        // progress said complete). The check + insert happen under one
-        // store lock so two simultaneous POSTs cannot both slip through.
+        // Idempotent add (safe to run twice): if the same URL +
+        // filename is already Queued, Downloading, or Completed,
+        // return that record instead of starting a second download
+        // (see Store::find_duplicate). Without this, two workers
+        // derive the same .part path and corrupt each other (found
+        // by the duplicate test on 2026-10-26: one record reported
+        // "got 0 bytes" while progress said complete) — and a
+        // repeated click re-downloads a file that already finished.
+        // The check + insert happen under one store lock so two
+        // simultaneous POSTs cannot both slip through.
         {
             let mut store = self.store.lock().unwrap();
-            for existing in store.all() {
-                if existing.url == clean_url
-                    && existing.filename == filename
-                    && existing.destination == self.settings.download_dir
-                    && (existing.status == Status::Queued || existing.status == Status::Downloading)
-                {
-                    return Ok(existing.clone());
-                }
+            if let Some(existing) =
+                store.find_duplicate(clean_url, &filename, &self.settings.download_dir)
+            {
+                return Ok(existing);
             }
             let id = generate_download_id();
             let rec = DownloadRecord {

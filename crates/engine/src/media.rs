@@ -14,6 +14,7 @@
 //! type="dynamic" is refused outright.
 
 use crate::download::Progress;
+use crate::extract::DOWNLOAD_STALL_TIMEOUT;
 use crate::validate::validate_url;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -584,6 +585,50 @@ struct Segment {
 /// the part file when done. `progress_base` offsets the reported
 /// bytes (a DASH audio phase reports after the video bytes).
 #[allow(clippy::too_many_arguments)]
+/// Does this segment-fetch error look like a timeout (the server
+/// never answered) rather than a fast refusal (HTTP error,
+/// connection refused)? Timeout errors are the silent ones: each
+/// attempt burns the whole fetch timeout, so at 0 bytes they fail
+/// fast instead of retrying into minutes of silence (see
+/// [`should_retry_segment`]).
+fn looks_like_timeout(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("timed out") || e.contains("timeout") || e.contains("deadline exceeded")
+}
+
+/// Retry decision for a failed segment attempt (`attempt` is
+/// 0-based; 3 attempts total normally) — except a timeout before
+/// ANY byte has downloaded fails immediately. At 0 bytes a timeout
+/// means the stream endpoint is not answering at all (wrong URL,
+/// dead CDN); retrying just burns minutes of silence, and the user
+/// can resume. Mid-download timeouts keep all 3 attempts: a
+/// transient blip must not kill a movie that is already flowing.
+fn should_retry_segment(attempt: usize, downloaded_so_far: u64, err: &str) -> bool {
+    if downloaded_so_far == 0 && looks_like_timeout(err) {
+        return false;
+    }
+    attempt < 2
+}
+
+/// Stall watchdog for segment downloads: no completed segment for
+/// `timeout` means the stream is dead — seen 2026-11-22 as a
+/// paired HLS download sitting at 0% for 5+ minutes with no
+/// error, because the yt-dlp watchdog never covered this path.
+/// Fails with a clear reason instead of hanging.
+fn check_stall(last_progress: Instant, timeout: Duration) -> Result<(), String> {
+    if last_progress.elapsed() > timeout {
+        let span = if timeout.as_secs() >= 60 {
+            format!("{} minutes", timeout.as_secs() / 60)
+        } else {
+            format!("{} seconds", timeout.as_secs())
+        };
+        return Err(format!(
+            "The download stalled: no progress for {span}. The server may be too slow, the link may have expired, or the stream may need a different quality. Try again, or pick another quality."
+        ));
+    }
+    Ok(())
+}
+
 fn download_segments(
     segments: &[Segment],
     part_path: &Path,
@@ -592,6 +637,7 @@ fn download_segments(
     progress: &dyn Fn(Progress),
     paused: &AtomicBool,
     cancelled: &AtomicBool,
+    stall_timeout: Duration,
 ) -> Result<u64, String> {
     let sidecar = part_path.with_file_name(format!(
         "{}.segments",
@@ -638,6 +684,7 @@ fn download_segments(
         std::fs::File::create(part_path).map_err(|e| e.to_string())?
     };
     let started = Instant::now();
+    let mut last_progress = Instant::now();
     for (i, seg) in segments.iter().enumerate().skip(start) {
         if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             drop(out);
@@ -648,12 +695,20 @@ fn download_segments(
         if paused.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("__PAUSED__".to_string());
         }
+        // Stall watchdog: no completed segment for the whole
+        // timeout means the stream is dead — fail plainly instead
+        // of sitting at 0% forever (see check_stall).
+        check_stall(last_progress, stall_timeout)?;
         // Retry transient failures (a dropped segment must not fail
         // a whole stream); a persistent failure keeps the .part and
-        // sidecar so a later resume continues from here.
+        // sidecar so a later resume continues from here. A timeout
+        // at 0 bytes fails fast (see should_retry_segment).
         let mut bytes = None;
         let mut last_err = String::new();
+        let mut attempts = 0;
         for attempt in 0..3 {
+            check_stall(last_progress, stall_timeout)?;
+            attempts = attempt + 1;
             match fetch_bytes_range(&seg.url, seg.range, referer) {
                 Ok(b) => {
                     bytes = Some(b);
@@ -661,17 +716,19 @@ fn download_segments(
                 }
                 Err(e) => {
                     last_err = e;
-                    if attempt < 2 {
-                        std::thread::sleep(Duration::from_millis(500 * (attempt + 1) as u64));
+                    if !should_retry_segment(attempt, downloaded, &last_err) {
+                        break;
                     }
+                    std::thread::sleep(Duration::from_millis(500 * (attempt + 1) as u64));
                 }
             }
         }
         let bytes = match bytes {
             Some(b) => b,
             None => {
+                let tries = if attempts == 1 { "try" } else { "tries" };
                 return Err(format!(
-                    "Segment {} of {} could not be downloaded after 3 tries. ({last_err})",
+                    "Segment {} of {} could not be downloaded after {attempts} {tries}. ({last_err})",
                     i + 1,
                     segments.len()
                 ));
@@ -680,6 +737,7 @@ fn download_segments(
         use std::io::Write;
         out.write_all(&bytes).map_err(|e| e.to_string())?;
         downloaded += bytes.len() as u64;
+        last_progress = Instant::now();
         // Record progress before reporting it, so a crash or pause
         // right after this segment still resumes correctly.
         let mut sidecar_text = format!("done={}\n", i + 1);
@@ -843,6 +901,7 @@ pub fn download_hls_variant(
         progress,
         paused,
         cancelled,
+        DOWNLOAD_STALL_TIMEOUT,
     )?;
     let Some(audio_segments) = audio_segments else {
         std::fs::rename(&video_part, &final_path).map_err(|e| e.to_string())?;
@@ -871,6 +930,7 @@ pub fn download_hls_variant(
         progress,
         paused,
         cancelled,
+        DOWNLOAD_STALL_TIMEOUT,
     )?;
     let ffmpeg = ffmpeg.expect("audio merge checked ffmpeg above");
     let merged = crate::ffmpeg::merge_av(ffmpeg, &video_part, &audio_part, &final_path);
@@ -936,6 +996,7 @@ pub fn download_hls_pair(
         progress,
         paused,
         cancelled,
+        DOWNLOAD_STALL_TIMEOUT,
     )?;
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = std::fs::remove_file(&video_part);
@@ -956,6 +1017,7 @@ pub fn download_hls_pair(
         progress,
         paused,
         cancelled,
+        DOWNLOAD_STALL_TIMEOUT,
     )?;
     let merged = crate::ffmpeg::merge_av(ffmpeg, &video_part, &audio_part, &final_path);
     let _ = std::fs::remove_file(&video_part);
@@ -1934,6 +1996,7 @@ pub fn download_dash_with(
         progress,
         paused,
         cancelled,
+        DOWNLOAD_STALL_TIMEOUT,
     )?;
     let Some(audio_rep) = audio else {
         std::fs::rename(&video_part, &final_path).map_err(|e| e.to_string())?;
@@ -1963,6 +2026,7 @@ pub fn download_dash_with(
         progress,
         paused,
         cancelled,
+        DOWNLOAD_STALL_TIMEOUT,
     )?;
     let ffmpeg = ffmpeg.expect("audio merge checked ffmpeg above");
     let merged = crate::ffmpeg::merge_av(ffmpeg, &video_part, &audio_part, &final_path);
@@ -2736,6 +2800,140 @@ mod tests {
         assert!(out.is_file());
         assert!(std::fs::metadata(&out).unwrap().len() > 0);
         assert_eq!(out.extension().and_then(|e| e.to_str()), Some("mp4"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_retry_and_stall_helpers() {
+        // Timeout-looking errors…
+        assert!(looks_like_timeout("error sending request: operation timed out"));
+        assert!(looks_like_timeout("request timeout"));
+        assert!(looks_like_timeout("deadline exceeded"));
+        assert!(!looks_like_timeout("Segment request failed: HTTP 404"));
+        assert!(!looks_like_timeout("connection refused"));
+        // …fail fast at 0 bytes (no retry), but keep retrying
+        // mid-download and for fast refusals.
+        assert!(!should_retry_segment(0, 0, "operation timed out"));
+        assert!(should_retry_segment(0, 1024, "operation timed out"));
+        assert!(should_retry_segment(0, 0, "Segment request failed: HTTP 500"));
+        assert!(should_retry_segment(1, 0, "Segment request failed: HTTP 500"));
+        assert!(!should_retry_segment(2, 0, "Segment request failed: HTTP 500"));
+        // Stall check: fresh is fine, expired fails plainly.
+        assert!(check_stall(Instant::now(), Duration::from_secs(300)).is_ok());
+        let old = Instant::now() - Duration::from_secs(301);
+        let err = check_stall(old, Duration::from_secs(300)).unwrap_err();
+        assert!(err.contains("stalled"), "error: {err}");
+        assert!(err.contains("5 minutes"), "error: {err}");
+    }
+
+    /// Loopback server that waits `delay` then answers 500 to every
+    /// request: models a slow, failing CDN for the stall-watchdog
+    /// test.
+    fn serve_delayed_500(
+        delay: Duration,
+        stop: std::sync::Arc<AtomicBool>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut buf = [0u8; 8192];
+                    let _ = stream.read(&mut buf);
+                    std::thread::sleep(delay);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    let _ = stream.flush();
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn download_segments_stall_watchdog_fires() {
+        // A paired HLS download sat at 0% for 5+ minutes with no
+        // error because no watchdog covered the segment path. With
+        // a short watchdog the same shape fails fast and plainly.
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_delayed_500(Duration::from_secs(3), stop.clone());
+        let dir = unique_temp_dir("seg-stall");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let segments = vec![Segment {
+            url: format!("http://127.0.0.1:{port}/seg0.ts"),
+            range: None,
+        }];
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let start = Instant::now();
+        let err = download_segments(
+            &segments,
+            &part,
+            &None,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(err.contains("stalled"), "error: {err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "watchdog took {:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_segments_retries_fast_failures_three_times() {
+        // Fast refusals (404) still get all 3 attempts: the
+        // watchdog must not turn a quick, clear failure into a
+        // stall error.
+        let files = HashMap::new();
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits.clone(), stop.clone());
+        let dir = unique_temp_dir("seg-retry");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let segments = vec![Segment {
+            url: format!("http://127.0.0.1:{port}/missing.ts"),
+            range: None,
+        }];
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let err = download_segments(
+            &segments,
+            &part,
+            &None,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .unwrap_err();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(
+            err.contains("after 3 tries"),
+            "error: {err}"
+        );
+        assert_eq!(hits.lock().unwrap().len(), 3, "hits: {:?}", hits.lock().unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

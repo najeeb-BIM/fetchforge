@@ -75,9 +75,11 @@ async function sendViaBridge(url, filename, referer, audioUrl) {
     body: JSON.stringify({ url, filename, referer, audio_url: audioUrl }),
   });
   if (!r.ok) throw new Error("bridge-" + r.status);
-  // The bridge answers 201 even when the download itself failed at
-  // once (e.g. an unsupported page): the record carries the
-  // outcome, so read it instead of claiming success.
+  // The bridge answers 202 once the download is queued;
+  // extraction and the download itself run in the worker, so a
+  // failure surfaces later as a Failed row in the app, not here.
+  // The record is still checked: a "failed" status is reported
+  // rather than claimed as success.
   const rec = await r.json().catch(() => null);
   if (rec && rec.status === "failed") return { ok: false, error: rec.error || "Download failed" };
   return { ok: true };

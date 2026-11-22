@@ -16,12 +16,11 @@
 
 use fetchforge_engine::{
     category_for_filename, download, download_dash, download_gltf_bundle, download_hls_pair,
-    download_hls_variant, download_media, drive_direct_url, drive_file_id, ensure_ffmpeg,
-    ensure_image_extension,
+    download_hls_variant, download_media, ensure_ffmpeg, ensure_image_extension,
     fetch_gltf_plan, find_ytdlp, generate_download_id, generate_secure_token, is_gltf_url,
-    is_image_content_type, list_formats, plan_media_download, probe, sanitize_filename,
-    stop_reason, DashDownloadOptions, DownloadOptions, DownloadRecord, GltfDownloadOptions,
-    MediaDownloadOptions, Status, Store,
+    is_image_content_type, list_formats, plan_media_download_or_drive_fallback, probe,
+    sanitize_filename, stop_reason, DashDownloadOptions, DownloadOptions, DownloadRecord,
+    GltfDownloadOptions, MediaDownloadOptions, PlanOutcome, Status, Store,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -485,39 +484,11 @@ impl App {
         match self.try_media_download(clean_url, filename.clone(), format_id, referer.clone(), audio_url) {
             Ok(rec) => Ok(rec),
             Err(e) => {
-                // Google Drive fallback: yt-dlp's Drive extractor can
-                // break while the file itself is still publicly
-                // downloadable. Rewrite to the direct uc URL and probe
-                // it; only a NON-HTML probe result is a real file
-                // (large files get Google's virus-scan warning page
-                // instead, which must never be saved as a download).
-                if let Some(file_id) = drive_file_id(clean_url) {
-                    let direct = drive_direct_url(&file_id);
-                    let probe_opts = DownloadOptions {
-                        url: direct.clone(),
-                        referer: referer.clone(),
-                        ..Default::default()
-                    };
-                    if let Ok(p) = probe(&probe_opts) {
-                        if !p.content_type
-                            .as_deref()
-                            .is_some_and(|ct| ct.starts_with("text/html"))
-                        {
-                            let fname = filename
-                                .as_deref()
-                                .map(sanitize_filename)
-                                .or(p.filename.as_deref().map(sanitize_filename))
-                                .unwrap_or_else(|| "download".to_string());
-                            return self.add_direct_record(
-                                &direct,
-                                fname,
-                                p.content_length,
-                                p.accept_ranges,
-                                referer,
-                            );
-                        }
-                    }
-                }
+                // Extraction now runs in the worker (see
+                // try_media_download), so this arm is only reached
+                // for queueing failures; the Google Drive fallback
+                // lives in the worker's planning step
+                // (plan_media_download_or_drive_fallback).
                 let id = generate_download_id();
                 let rec = DownloadRecord {
                     id: id.clone(),
@@ -633,8 +604,20 @@ impl App {
         }
     }
 
-    /// Plan a media download and queue it. Err means extraction failed
-    /// (the caller decides what Failed row to record).
+    /// Queue a media download WITHOUT planning it first: the record
+    /// is inserted immediately (stream_kind "pending") and the
+    /// worker plans it (see [`Self::plan_pending_download`]).
+    /// Planning used to run here, synchronously in the add request,
+    /// and a slow extraction (a manifest fetch on a streaming CDN
+    /// took 16 s on 2026-11-22) left the extension button stuck on
+    /// "Sending…" until the response came back. The button now
+    /// confirms "Sent" in milliseconds; a planning failure surfaces
+    /// in the app list as a Failed row with the reason, exactly as
+    /// before — just asynchronously. The requested format id is
+    /// stored on the record as the planning input (the worker
+    /// overwrites it with the chosen format); the filename is the
+    /// caller's, or the provisional "download" the worker replaces
+    /// with the planned name.
     fn try_media_download(
         self: &Arc<Self>,
         clean_url: &str,
@@ -643,56 +626,33 @@ impl App {
         referer: Option<String>,
         audio_url: Option<String>,
     ) -> Result<DownloadRecord, String> {
-        let mut plan = plan_media_download(
-            &self.data_dir,
-            clean_url,
-            format_id.as_deref(),
-            filename.as_deref(),
-        )?;
-        // Paired HLS variants (extension observed a video variant
-        // AND its audio sibling, no master): the plan from the video
-        // variant alone would be a silent .ts with no merge. The
-        // worker downloads both tracks and merges them, so the plan
-        // must say so: needs_merge, and an .mp4 filename (the merge
-        // output). Only for HLS: DASH keeps its audio inside the
-        // manifest, so an audio URL with a DASH plan is ignored.
-        let paired_audio = if audio_url.is_some()
-            && plan.stream_kind == Some(fetchforge_engine::StreamKind::Hls)
-        {
-            plan.needs_merge = true;
-            if let Some((stem, _)) = plan.filename.rsplit_once('.') {
-                plan.filename = format!("{stem}.mp4");
-            }
-            audio_url
-        } else {
-            None
-        };
-        // The HTML fallback may have resolved the page to an
-        // embedded stream/file URL: the record and the worker both
-        // use the resolved URL, not the page URL.
-        let record_url = plan
-            .effective_url
-            .clone()
-            .unwrap_or_else(|| clean_url.to_string());
+        let provisional = filename
+            .as_deref()
+            .map(sanitize_filename)
+            .unwrap_or_else(|| "download".to_string());
         // Idempotent add (see Store::find_duplicate): an
         // already-active or already-completed download for the same
-        // URL + filename is returned, never queued twice.
+        // URL + filename is returned, never queued twice. The
+        // worker re-checks after planning, when the resolved URL
+        // and planned filename are known.
         {
             let mut store = self.store.lock().unwrap();
-            if let Some(existing) =
-                store.find_duplicate(&record_url, &plan.filename, &self.settings.download_dir)
-            {
+            if let Some(existing) = store.find_duplicate(
+                clean_url,
+                &provisional,
+                &self.settings.download_dir,
+            ) {
                 return Ok(existing);
             }
             let id = generate_download_id();
             let rec = DownloadRecord {
                 id: id.clone(),
-                url: record_url,
-                filename: plan.filename.clone(),
+                url: clean_url.to_string(),
+                filename: provisional,
                 destination: self.settings.download_dir.clone(),
-                category: category_for_filename(&plan.filename).to_string(),
+                category: "Other".to_string(),
                 status: Status::Queued,
-                total_bytes: plan.total_bytes,
+                total_bytes: None,
                 downloaded_bytes: 0,
                 // yt-dlp resumes from its own .part files, so a media
                 // download interrupted by app close can be resumed.
@@ -700,18 +660,153 @@ impl App {
                 error: None,
                 created_unix: now_unix(),
                 updated_unix: now_unix(),
-                format_id: Some(plan.format_id),
-                needs_merge: plan.needs_merge,
-                format_selector: Some(plan.selector),
-                stream_kind: plan.stream_kind.map(|k| k.as_str().to_string()),
+                format_id,
+                needs_merge: false,
+                format_selector: None,
+                stream_kind: Some("pending".to_string()),
                 referer,
-                audio_url: paired_audio,
+                audio_url,
             };
             store.upsert(rec.clone());
             let _ = store.save();
             drop(store);
             self.spawn_worker(id);
             Ok(rec)
+        }
+    }
+
+    /// Plan a "pending" record in the worker: run the plan (or the
+    /// Google Drive direct-download fallback), apply the paired
+    /// HLS override, re-check duplicates against the resolved URL,
+    /// and update the record in place. Returns the updated record
+    /// to dispatch on; Ok(None) means a duplicate was found after
+    /// planning and this record was removed (the existing download
+    /// covers it); Err means planning failed and the record was
+    /// marked Failed with the reason. A record stuck in "pending"
+    /// (app closed mid-plan) is planned the same way by any worker
+    /// that picks it up, including a resume.
+    fn plan_pending_download(
+        &self,
+        rec: &DownloadRecord,
+        job: &Job,
+    ) -> Result<Option<DownloadRecord>, String> {
+        let id = rec.id.clone();
+        // The provisional filename ("download") means no name was
+        // requested: let the plan derive it from the title. Any
+        // other stored filename was the caller's and is kept as
+        // the plan's stem.
+        let filename_arg = if rec.filename == "download" {
+            None
+        } else {
+            Some(rec.filename.as_str())
+        };
+        let outcome = plan_media_download_or_drive_fallback(
+            &self.data_dir,
+            &rec.url,
+            rec.format_id.as_deref(),
+            filename_arg,
+            &rec.referer,
+        );
+        if job.cancelled.load(Ordering::Relaxed) {
+            self.set_status(&id, Status::Cancelled, None);
+            return Err("download cancelled".to_string());
+        }
+        match outcome {
+            Ok(PlanOutcome::Media(mut plan)) => {
+                // Paired HLS variants (extension observed a video
+                // variant AND its audio sibling, no master): the
+                // plan from the video variant alone would be a
+                // silent .ts with no merge. The worker downloads
+                // both tracks and merges them, so the plan must say
+                // so: needs_merge, and an .mp4 filename (the merge
+                // output). Only for HLS: DASH keeps its audio
+                // inside the manifest, so an audio URL with a DASH
+                // plan is ignored.
+                let paired_audio = if rec.audio_url.is_some()
+                    && plan.stream_kind == Some(fetchforge_engine::StreamKind::Hls)
+                {
+                    plan.needs_merge = true;
+                    if let Some((stem, _)) = plan.filename.rsplit_once('.') {
+                        plan.filename = format!("{stem}.mp4");
+                    }
+                    rec.audio_url.clone()
+                } else {
+                    None
+                };
+                // The HTML fallback may have resolved the page to
+                // an embedded stream/file URL: the record and the
+                // worker both use the resolved URL, not the page
+                // URL.
+                let record_url = plan
+                    .effective_url
+                    .clone()
+                    .unwrap_or_else(|| rec.url.clone());
+                let mut store = self.store.lock().unwrap();
+                if store
+                    .find_duplicate_except(
+                        &record_url,
+                        &plan.filename,
+                        &self.settings.download_dir,
+                        &id,
+                    )
+                    .is_some()
+                {
+                    store.remove(&id);
+                    let _ = store.save();
+                    return Ok(None);
+                }
+                let mut updated = match store.get(&id) {
+                    Some(r) => r.clone(),
+                    None => return Err("download removed".to_string()),
+                };
+                updated.url = record_url;
+                updated.filename = plan.filename.clone();
+                updated.category = category_for_filename(&plan.filename).to_string();
+                updated.total_bytes = plan.total_bytes;
+                updated.format_id = Some(plan.format_id);
+                updated.needs_merge = plan.needs_merge;
+                updated.format_selector = Some(plan.selector);
+                updated.stream_kind = plan.stream_kind.map(|k| k.as_str().to_string());
+                updated.audio_url = paired_audio;
+                updated.updated_unix = now_unix();
+                store.upsert(updated.clone());
+                let _ = store.save();
+                Ok(Some(updated))
+            }
+            Ok(PlanOutcome::Direct {
+                url,
+                filename,
+                total_bytes,
+                resumable,
+            }) => {
+                // Google Drive fallback: extraction failed, but the
+                // file itself is directly downloadable. Convert the
+                // record to a direct download and let it dispatch
+                // down the direct path.
+                let mut store = self.store.lock().unwrap();
+                let mut updated = match store.get(&id) {
+                    Some(r) => r.clone(),
+                    None => return Err("download removed".to_string()),
+                };
+                updated.url = url;
+                updated.filename = filename.clone();
+                updated.category = category_for_filename(&filename).to_string();
+                updated.total_bytes = total_bytes;
+                updated.resumable = resumable;
+                updated.format_id = None;
+                updated.needs_merge = false;
+                updated.format_selector = None;
+                updated.stream_kind = None;
+                updated.audio_url = None;
+                updated.updated_unix = now_unix();
+                store.upsert(updated.clone());
+                let _ = store.save();
+                Ok(Some(updated))
+            }
+            Err(e) => {
+                self.set_status(&id, Status::Failed, Some(e));
+                Err("download failed".to_string())
+            }
         }
     }
 
@@ -805,10 +900,22 @@ impl App {
     }
 
     fn run_one(&self, id: &str, job: &Job) -> Result<(), String> {
-        let rec = match self.store.lock().unwrap().get(id) {
+        let mut rec = match self.store.lock().unwrap().get(id) {
             Some(r) => r.clone(),
             None => return Err("unknown download".to_string()),
         };
+        // Deferred planning (see try_media_download): a "pending"
+        // record has not been extracted yet. Plan it here, in the
+        // worker, then dispatch on the planned record. A duplicate
+        // found after planning removes this record (Ok(None)); a
+        // planning failure already marked it Failed.
+        if rec.stream_kind.as_deref() == Some("pending") {
+            match self.plan_pending_download(&rec, job) {
+                Ok(Some(planned)) => rec = planned,
+                Ok(None) => return Ok(()),
+                Err(_) => return Err("download failed".to_string()),
+            }
+        }
         // Stream downloads (HLS/DASH) run through media.rs; yt-dlp
         // media downloads (a format was chosen) run through yt-dlp;
         // everything else takes the direct path, exactly as before.
@@ -1398,6 +1505,7 @@ fn http_response(status: u16, body: &str) -> String {
     let reason = match status {
         200 => "OK",
         201 => "Created",
+        202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -1620,8 +1728,11 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
         match req {
             Ok(r) => match app.add_download(&r.url, r.filename, r.format_id, r.referer, r.audio_url) {
                 Ok(rec) => {
+                    // 202: the download is queued; extraction and
+                    // the download itself run asynchronously in the
+                    // worker, so the response is immediate.
                     let b = serde_json::to_string(&rec).unwrap();
-                    let _ = stream.write_all(http_response(201, &b).as_bytes());
+                    let _ = stream.write_all(http_response(202, &b).as_bytes());
                 }
                 Err(e) => {
                     let b = serde_json::json!({"error": e}).to_string();
@@ -1827,7 +1938,10 @@ fn forward_add_to_bridge(
     }
     let body = serde_json::json!({"url": url, "filename": filename, "referer": referer, "audio_url": audio_url}).to_string();
     let (status, resp) = loopback_http(port, "POST", "/downloads", Some(token), Some(&body))?;
-    if status != 201 {
+    // POST /downloads answers 202 (queued; extraction runs in the
+    // worker). 201 is still accepted so a newer CLI keeps working
+    // against an older bridge during an upgrade.
+    if status != 201 && status != 202 {
         let detail: String = resp.chars().take(200).collect();
         return Err(format!("Bridge returned HTTP {status}: {detail}"));
     }
@@ -2097,7 +2211,7 @@ mod tests {
     fn forward_add_posts_token_and_url_to_bridge() {
         let dir = test_data_dir("fetchforge-test-forward");
         let response = format!(
-            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             record_json().len(),
             record_json()
         );

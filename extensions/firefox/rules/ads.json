@@ -974,5 +974,28 @@
         "other"
       ]
     }
+  },
+  {
+    "id": 52,
+    "priority": 1,
+    "action": {
+      "type": "block"
+    },
+    "condition": {
+      "urlFilter": "||1xlite-368592.top^",
+      "resourceTypes": [
+        "main_frame",
+        "sub_frame",
+        "script",
+        "xmlhttprequest",
+        "image",
+        "stylesheet",
+        "font",
+        "object",
+        "websocket",
+        "ping",
+        "other"
+      ]
+    }
   }
 ]

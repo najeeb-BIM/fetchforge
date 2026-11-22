@@ -26,8 +26,9 @@ pub use category::category_for_filename;
 pub use download::{download, probe, stop_reason, DownloadOptions, Probe, Progress, StopReason};
 pub use extract::{
     download_media, drive_direct_url, drive_file_id, ensure_ytdlp, find_ytdlp, format_selector,
-    list_formats, list_formats_with, parse_media_info, plan_media_download, FormatKind,
-    MediaDownloadOptions, MediaFormat, MediaInfo, MediaPlan,
+    list_formats, list_formats_with, parse_media_info, plan_media_download,
+    plan_media_download_or_drive_fallback, FormatKind, MediaDownloadOptions, MediaFormat,
+    MediaInfo, MediaPlan, PlanOutcome,
 };
 pub use ffmpeg::{ensure_ffmpeg, find_ffmpeg, merge_av};
 pub use image::{

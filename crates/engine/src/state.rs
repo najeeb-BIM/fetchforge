@@ -404,11 +404,25 @@ impl Store {
         filename: &str,
         download_dir: &str,
     ) -> Option<DownloadRecord> {
+        self.find_duplicate_except(url, filename, download_dir, "")
+    }
+
+    /// Same duplicate rule as [`find_duplicate`], but ignoring one
+    /// record id: the worker's post-planning re-check must not
+    /// match the record being planned (its own URL + filename).
+    pub fn find_duplicate_except(
+        &self,
+        url: &str,
+        filename: &str,
+        download_dir: &str,
+        except_id: &str,
+    ) -> Option<DownloadRecord> {
         let want = crate::validate::normalize_url_for_dedupe(url);
         self.records
             .values()
             .find(|r| {
-                crate::validate::normalize_url_for_dedupe(&r.url) == want
+                r.id != except_id
+                    && crate::validate::normalize_url_for_dedupe(&r.url) == want
                     && r.filename == filename
                     && matches!(
                         r.status,
@@ -943,5 +957,46 @@ mod tests {
                 "/home/user/OtherDownloads",
             )
             .is_none());
+    }
+
+    #[test]
+    fn find_duplicate_except_ignores_the_named_record() {
+        let dir = std::env::temp_dir().join("fetchforge-test-store-dup-except");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let mut s = Store::load(dir.join("downloads.json"));
+        s.upsert(rec("self"));
+        // The record itself is a duplicate for the plain lookup…
+        assert!(s
+            .find_duplicate(
+                "https://example.com/x.zip",
+                "x.zip",
+                "/tmp",
+            )
+            .is_some());
+        // …but not when it is the excluded id (the worker's
+        // post-planning re-check must not match the record being
+        // planned).
+        assert!(s
+            .find_duplicate_except(
+                "https://example.com/x.zip",
+                "x.zip",
+                "/tmp",
+                "self",
+            )
+            .is_none());
+        // …while another record for the same file still matches.
+        s.upsert(rec("other"));
+        assert_eq!(
+            s.find_duplicate_except(
+                "https://example.com/x.zip",
+                "x.zip",
+                "/tmp",
+                "self",
+            )
+            .unwrap()
+            .id,
+            "other"
+        );
     }
 }

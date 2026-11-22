@@ -20,8 +20,11 @@
 // button sends the PAGE URL and the desktop app extracts the media
 // server-side — unless the resource-timing log reveals the real stream
 // URL the player fetched (see findStreamUrlFromResources), in which
-// case that URL is sent instead. data: URLs are skipped entirely. No
-// DRM, auth, paywall, or encryption bypass is attempted anywhere.
+// case that URL is sent instead. When the log shows a playlist, the
+// playlist wins over any direct file in the DOM: a direct .mp4 is
+// often a preview/ad clip, not the movie that is playing (novahd
+// 2026-11-22). data: URLs are skipped entirely. No DRM, auth,
+// paywall, or encryption bypass is attempted anywhere.
 //
 // Stacked videos (a preview/ad <video> on top of the main player,
 // common on streaming sites) share one on-screen box: only one
@@ -33,6 +36,13 @@
   // Avoid double-injection if the script is ever loaded twice.
   if (window.__fetchforgeContentLoaded) return;
   window.__fetchforgeContentLoaded = true;
+
+  // The default resource-timing buffer holds 150 entries: on a
+  // streaming page the flood of segment fetches evicts the manifest
+  // long before the user clicks. Grow it now — this script runs at
+  // document_start, before the player loads — so the playlist is
+  // still in the log when the stream picker looks for it.
+  try { performance.setResourceTimingBufferSize(5000); } catch (_) {}
 
   const api = typeof browser !== "undefined" ? browser : chrome;
   const isFirefox = typeof browser !== "undefined";
@@ -99,6 +109,13 @@
   // blob: URL (the page URL must be sent instead so the desktop app
   // can extract the media). viaStream is set when the URL came from
   // the resource-timing log rather than the DOM (see below).
+  //
+  // Playlist-first: a playlist observed in the resource-timing log
+  // beats ANY direct file in the DOM. The direct file is often a
+  // preview/ad clip while the movie plays through MSE (novahd
+  // 2026-11-22: a 15-second /assets/p/*.mp4 clip was sent while a
+  // 2:52 HLS movie was playing). The stream that is playing is the
+  // playlist, never the clip.
   function mediaSource(el) {
     const candidates = [];
     if (el.currentSrc) candidates.push(el.currentSrc);
@@ -110,18 +127,31 @@
       if (u) candidates.push(u);
     }
     let sawBlob = false;
+    let directFile = null;
     for (const raw of candidates) {
       const u = resolveUrl(raw);
       if (!u || u.startsWith("data:")) continue; // data: URLs are skipped
       if (u.startsWith("blob:")) { sawBlob = true; continue; }
-      if (/^https?:\/\//i.test(u)) return { url: u, viaPage: false };
+      if (/^https?:\/\//i.test(u)) {
+        // A playlist URL in the DOM is the stream itself, not a
+        // file: it wins immediately.
+        if (STREAM_EXT_RE.test(u)) return { url: u, viaPage: false };
+        if (!directFile) directFile = u;
+      }
     }
+    // A playlist in the resource-timing log beats the direct file:
+    // see the playlist-first note above.
+    const playlist = findPlaylistFromResources();
+    if (playlist) return { url: playlist.url, viaPage: false, viaStream: true, audioUrl: playlist.audioUrl };
+    if (directFile) return { url: directFile, viaPage: false };
     if (sawBlob) {
       // The player loads its stream through Media Source Extensions:
       // the real URL is not in the DOM, but the browser's
       // resource-timing log lists every URL this document fetched,
       // including the manifest the player loaded. Send that instead
-      // of the bare page URL when it is found.
+      // of the bare page URL when it is found. (A playlist would
+      // already have been returned above; this only ever yields a
+      // direct file the player fetched.)
       const stream = findStreamUrlFromResources();
       if (stream) return { url: stream.url, viaPage: false, viaStream: true, audioUrl: stream.audioUrl };
       return { url: null, viaPage: true };
@@ -162,14 +192,17 @@
     if (AUDIO_STEM_RE.test(stem)) return "audio";
     return "video";
   }
-  // Returns { url, audioUrl? } or null: url is the manifest/file
-  // to send; audioUrl is set only when url is a video variant and
-  // a sibling audio variant was observed alongside it.
-  function findStreamUrlFromResources() {
+  // One scan of the resource-timing log, shared by the playlist
+  // and stream pickers below. Returns { master, video, audio,
+  // file }: the best observed URL of each kind (or null). Best =
+  // player-initiated fetch first, then most recent (see the
+  // ranking comment on findStreamUrlFromResources).
+  function scanResourceStreams() {
+    const empty = { master: null, video: null, audio: null, file: null };
     let entries = [];
     try {
       entries = performance.getEntriesByType("resource") || [];
-    } catch (_) { return null; }
+    } catch (_) { return empty; }
     const rankOf = function (e) {
       const it = e.initiatorType || "";
       return (it === "video" || it === "audio" || it === "fetch" || it === "xmlhttprequest") ? 1 : 0;
@@ -177,10 +210,7 @@
     const better = function (a, b) {
       return !b || a.rank > b.rank || (a.rank === b.rank && a.startTime >= b.startTime);
     };
-    let bestMaster = null;
-    let bestVideo = null;
-    let bestAudio = null;
-    let bestFile = null;
+    const out = { master: null, video: null, audio: null, file: null };
     for (const e of entries) {
       const name = e && e.name;
       if (!name || !/^https?:\/\//i.test(name)) continue;
@@ -188,29 +218,45 @@
       if (STREAM_EXT_RE.test(name)) {
         const kind = manifestKind(name);
         if (kind === "master") {
-          if (better(cand, bestMaster)) bestMaster = cand;
+          if (better(cand, out.master)) out.master = cand;
         } else if (kind === "audio") {
-          if (better(cand, bestAudio)) bestAudio = cand;
+          if (better(cand, out.audio)) out.audio = cand;
         } else {
-          if (better(cand, bestVideo)) bestVideo = cand;
+          if (better(cand, out.video)) out.video = cand;
         }
       } else if (MEDIA_FILE_EXT_RE.test(name)) {
-        if (better(cand, bestFile)) bestFile = cand;
+        if (better(cand, out.file)) out.file = cand;
       }
     }
-    // A master playlist is the whole stream: send it alone.
-    if (bestMaster) return { url: bestMaster.url };
-    // No master: pair the video variant with its audio sibling.
-    if (bestVideo) {
-      const out = { url: bestVideo.url };
-      if (bestAudio) out.audioUrl = bestAudio.url;
+    return out;
+  }
+  // Pick the playlist from a scan: a master is the whole stream
+  // (send it alone); otherwise pair the video variant with its
+  // audio sibling; an audio-only variant goes alone. Returns
+  // { url, audioUrl? } or null.
+  function pickPlaylist(s) {
+    if (s.master) return { url: s.master.url };
+    if (s.video) {
+      const out = { url: s.video.url };
+      if (s.audio) out.audioUrl = s.audio.url;
       return out;
     }
-    // An audio-only variant with no video observed: send it alone
-    // (better than the page URL, which would fail extraction).
-    if (bestAudio) return { url: bestAudio.url };
-    if (bestFile) return { url: bestFile.url };
+    if (s.audio) return { url: s.audio.url };
     return null;
+  }
+  // Best playlist (master or variant) observed in the log, or
+  // null. Direct files are deliberately NOT returned here: a
+  // playlist is the stream that is playing; a file may be a
+  // preview/ad clip (see the playlist-first note on mediaSource).
+  function findPlaylistFromResources() {
+    return pickPlaylist(scanResourceStreams());
+  }
+  // Returns { url, audioUrl? } or null: url is the manifest/file
+  // to send; audioUrl is set only when url is a video variant and
+  // a sibling audio variant was observed alongside it.
+  function findStreamUrlFromResources() {
+    const s = scanResourceStreams();
+    return pickPlaylist(s) || (s.file ? { url: s.file.url } : null);
   }
 
   // Filename for a resolved media source: none for a page URL (the
@@ -494,9 +540,55 @@
     });
   }
 
+  // Show/hide an overlay host. A popover host is shown with
+  // showPopover() (top layer) and hidden with hidePopover();
+  // a plain host uses display. NEVER set display:none on a
+  // popover host: an inline display beats the UA :popover-open
+  // rule, so showPopover() would never display it.
+  // showPopover() on an already-shown popover throws; the
+  // try/catch makes show/hide idempotent.
+  function showOverlayHost(o) {
+    if (o.popover) {
+      try { o.host.showPopover(); } catch (_) {}
+    } else {
+      o.host.style.display = "block";
+    }
+  }
+  function hideOverlayHost(o) {
+    if (o.popover) {
+      try { o.host.hidePopover(); } catch (_) {}
+    } else {
+      o.host.style.display = "none";
+    }
+  }
+  // Removing a host: hide the popover first (a shown popover
+  // must be hidden before its element is removed), then remove.
+  function destroyOverlay(o) {
+    hideOverlayHost(o);
+    o.host.remove();
+  }
+
   function createOverlay(video) {
     const host = document.createElement("div");
-    host.style.cssText = "position:fixed;left:0;top:0;display:none;z-index:2147483647;pointer-events:none;";
+    // Top layer (popover API): z-index alone loses to a page
+    // overlay in another stacking context — on nime.pro the
+    // site's overlay sat above our button and stole the click,
+    // opening a clickunder pop-up instead. A manual popover
+    // renders in the browser's top layer, above ALL page content,
+    // so no page overlay can cover it. Falls back to the plain
+    // fixed host (z-index max) where popover is unsupported.
+    // The inline styles override the UA popover rules (which set
+    // inset:0 and margin:auto): inset:auto keeps the host at its
+    // left/top instead of stretching it, and the transparent
+    // background/border keep it invisible.
+    let isPopover = false;
+    try {
+      host.setAttribute("popover", "manual");
+      isPopover = typeof host.showPopover === "function";
+    } catch (_) { isPopover = false; }
+    if (!isPopover) host.removeAttribute("popover");
+    host.style.cssText = "position:fixed;inset:auto;left:0;top:0;z-index:2147483647;pointer-events:none;"
+      + "background:transparent;border:0;padding:0;margin:0;";
     const shadow = host.attachShadow({ mode: "open" });
     const btn = document.createElement("button");
     btn.textContent = "↓ FetchForge";
@@ -515,31 +607,31 @@
     });
     shadow.appendChild(btn);
     (document.body || document.documentElement).appendChild(host);
-    return { host: host, button: btn };
+    return { host: host, button: btn, popover: isPopover };
   }
 
   function positionOverlays() {
     for (const entry of overlays) {
       const video = entry[0];
       const o = entry[1];
-      if (!video.isConnected) { o.host.remove(); overlays.delete(video); continue; }
+      if (!video.isConnected) { destroyOverlay(o); overlays.delete(video); continue; }
       const rect = video.getBoundingClientRect();
       const offscreen = rect.bottom < 0 || rect.top > window.innerHeight
         || rect.right < 0 || rect.left > window.innerWidth;
       if (offscreen || !isVisible(video) || rect.width < MIN_OVERLAY_W || rect.height < MIN_OVERLAY_H) {
-        o.host.style.display = "none";
+        hideOverlayHost(o);
         continue;
       }
       // Cross-frame election verdict (see below): undefined means
       // no verdict has arrived yet, so the button shows; null means
       // another frame won, so every button in this frame hides.
       if (electedKey !== undefined && overlayKeyFor(video) !== electedKey) {
-        o.host.style.display = "none";
+        hideOverlayHost(o);
         continue;
       }
-      o.host.style.display = "block";
       o.host.style.left = Math.round(rect.right - 8) + "px";
       o.host.style.top = Math.round(rect.top + 8) + "px";
+      showOverlayHost(o);
     }
   }
 
@@ -650,7 +742,7 @@
       // took over from the preview).
       for (const el of Array.from(overlays.keys())) {
         if (candidates.indexOf(el) !== -1 && !reps.has(el)) {
-          overlays.get(el).host.remove();
+          destroyOverlay(overlays.get(el));
           overlays.delete(el);
         }
       }

@@ -77,8 +77,11 @@ const EXTRACT_TIMEOUT: Duration = Duration::from_secs(90);
 /// prints its own lines. Five silent minutes means yt-dlp is stuck
 /// retrying a dead fragment or a dead server — seen 2026-11-22 as
 /// a download sitting at 0% with no error. The watchdog turns that
-/// into a clear failure instead of an endless hang.
-const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// into a clear failure instead of an endless hang. Shared with
+/// the segment downloader (media.rs), whose HLS/DASH paths need
+/// the same bound: a paired HLS download sat at 0% for 5+ minutes
+/// with no error because no watchdog covered it.
+pub(crate) const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn ytdlp_exe_name() -> &'static str {
     if cfg!(windows) {
@@ -1198,6 +1201,71 @@ fn plan_stream_download(
     plan.stream_kind = Some(info.kind);
     plan.selector = String::new();
     Ok(plan)
+}
+
+/// Outcome of planning a media download in the worker: either a
+/// normal media plan, or a Google Drive direct-download fallback
+/// (see [`plan_media_download_or_drive_fallback`]).
+#[derive(Debug)]
+pub enum PlanOutcome {
+    Media(MediaPlan),
+    Direct {
+        url: String,
+        filename: String,
+        total_bytes: Option<u64>,
+        resumable: bool,
+    },
+}
+
+/// Plan a media download, with the Google Drive direct-download
+/// fallback: yt-dlp's Drive extractor can break while the file
+/// itself is still publicly downloadable. When extraction fails
+/// on a Drive link, rewrite to the direct uc URL and probe it;
+/// only a NON-HTML probe result is a real file (large files get
+/// Google's virus-scan warning page instead, which must never be
+/// saved as a download). Any other failure returns the extraction
+/// error unchanged. The worker calls this (planning runs in the
+/// worker, not in the add request, so a slow extraction never
+/// blocks the button's confirmation).
+pub fn plan_media_download_or_drive_fallback(
+    data_dir: &Path,
+    url: &str,
+    format_id: Option<&str>,
+    filename: Option<&str>,
+    referer: &Option<String>,
+) -> Result<PlanOutcome, String> {
+    match plan_media_download(data_dir, url, format_id, filename) {
+        Ok(plan) => Ok(PlanOutcome::Media(plan)),
+        Err(e) => {
+            if let Some(file_id) = drive_file_id(url) {
+                let direct = drive_direct_url(&file_id);
+                let probe_opts = crate::download::DownloadOptions {
+                    url: direct.clone(),
+                    referer: referer.clone(),
+                    ..Default::default()
+                };
+                if let Ok(p) = crate::download::probe(&probe_opts) {
+                    if !p
+                        .content_type
+                        .as_deref()
+                        .is_some_and(|ct| ct.starts_with("text/html"))
+                    {
+                        let fname = filename
+                            .map(crate::filename::sanitize_filename)
+                            .or(p.filename.as_deref().map(crate::filename::sanitize_filename))
+                            .unwrap_or_else(|| "download".to_string());
+                        return Ok(PlanOutcome::Direct {
+                            url: direct,
+                            filename: fname,
+                            total_bytes: p.content_length,
+                            resumable: p.accept_ranges,
+                        });
+                    }
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 fn plan_from_info(
@@ -2734,6 +2802,41 @@ exit 0
         assert_eq!(plan.format_id, format!("http://127.0.0.1:{port}/low.m3u8"));
         // Unknown format id is a clear error.
         assert!(plan_media_download(&dir, &url, Some("nope"), None).is_err());
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn plan_or_drive_fallback_returns_media_plan_and_passthrough_errors() {
+        // The worker's planning entry point: a manifest URL plans
+        // normally (Media outcome); a non-Drive failure returns the
+        // extraction error unchanged (no fallback attempted).
+        let mut files = std::collections::HashMap::new();
+        files.insert("/master.m3u8".to_string(), TEST_MASTER.as_bytes().to_vec());
+        files.insert("/low.m3u8".to_string(), TEST_MEDIA.as_bytes().to_vec());
+        files.insert("/mid.m3u8".to_string(), TEST_MEDIA.as_bytes().to_vec());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_files(files, stop.clone());
+        let dir = std::env::temp_dir().join("fetchforge-test-plan-fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("http://127.0.0.1:{port}/master.m3u8");
+        match plan_media_download_or_drive_fallback(&dir, &url, None, None, &None).unwrap() {
+            PlanOutcome::Media(plan) => {
+                assert_eq!(plan.stream_kind, Some(crate::media::StreamKind::Hls));
+                assert_eq!(plan.format_id, format!("http://127.0.0.1:{port}/mid.m3u8"));
+            }
+            PlanOutcome::Direct { .. } => panic!("a manifest URL must plan as Media"),
+        }
+        // Missing manifest on a non-Drive host: the error passes
+        // through (the Drive fallback only applies to Drive links).
+        let missing = format!("http://127.0.0.1:{port}/missing.m3u8");
+        let err = plan_media_download_or_drive_fallback(&dir, &missing, None, None, &None)
+            .unwrap_err();
+        assert!(
+            err.contains("404") || err.contains("Manifest"),
+            "error: {err}"
+        );
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
     }

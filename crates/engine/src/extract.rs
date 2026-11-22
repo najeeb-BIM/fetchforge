@@ -360,9 +360,27 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
                 (true, true) => FormatKind::Combined,
                 (true, false) => FormatKind::VideoOnly,
                 (false, true) => FormatKind::AudioOnly,
-                // Neither codec reported: the original file (Drive
-                // "source"). Treat as combined; it needs no merge.
-                (false, false) => FormatKind::Combined,
+                // Neither codec usable. Two cases, and they must not
+                // be conflated:
+                // - Both fields ABSENT (e.g. Google Drive's `source`,
+                //   the original file): treat as combined; it needs
+                //   no merge.
+                // - Video EXPLICITLY "none" with no acodec field
+                //   (YouTube's HLS audio-only entries 233/234 report
+                //   exactly this, with protocol m3u8_native and
+                //   resolution "audio only"): there is no video
+                //   stream, so this is audio-only. Treating it as
+                //   combined made the picker offer an audio-only
+                //   file as the recommended video: on 2026-11-22 the
+                //   Windows e2e downloaded format 234 and got an
+                //   AAC audio file in an .mp4, marked completed.
+                (false, false) => {
+                    if vcodec_raw == Some("none") {
+                        FormatKind::AudioOnly
+                    } else {
+                        FormatKind::Combined
+                    }
+                }
             };
             let height = f.get("height").and_then(|v| v.as_u64()).map(|h| h as u32);
             let width = f.get("width").and_then(|v| v.as_u64()).map(|w| w as u32);
@@ -1396,7 +1414,16 @@ mod tests {
                 {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2",
                  "abr": 128.0, "filesize": 10000000},
                 {"format_id": "251", "ext": "webm", "vcodec": "none", "acodec": "opus",
-                 "abr": 160.0, "filesize": 12000000}
+                 "abr": 160.0, "filesize": 12000000},
+                // YouTube HLS audio-only entries: vcodec explicitly
+                // "none", NO acodec field at all (real yt-dlp output
+                // for Big Buck Bunny, verified 2026-11-22). Must parse
+                // as audio-only, never as combined (regression: they
+                // used to be the recommended "video" default).
+                {"format_id": "233", "ext": "mp4", "vcodec": "none",
+                 "protocol": "m3u8_native", "format_note": "Default, low"},
+                {"format_id": "234", "ext": "mp4", "vcodec": "none",
+                 "protocol": "m3u8_native", "format_note": "Default, high"}
             ]
         })
     }
@@ -1426,7 +1453,7 @@ mod tests {
         let ids: Vec<&str> = info.formats.iter().map(|f| f.format_id.as_str()).collect();
         assert!(!ids.contains(&"sb0"), "storyboard must be dropped");
         assert!(!ids.contains(&"drm1"), "DRM format must be dropped");
-        assert_eq!(ids.len(), 6);
+        assert_eq!(ids.len(), 8);
         // Combined first, best resolution first.
         assert_eq!(ids[0], "22");
         assert_eq!(ids[1], "18");
@@ -1435,7 +1462,17 @@ mod tests {
         assert!(info.formats[2].needs_merge);
         // Audio-only last.
         assert_eq!(info.formats[5].kind, FormatKind::AudioOnly);
-        // Default: best combined at or below 1080p = 22 (720p).
+        // Regression (2026-11-22 e2e): YouTube's HLS audio-only
+        // entries 233/234 (vcodec "none", no acodec field) must
+        // parse as audio-only, never as combined video.
+        for hls in ["233", "234"] {
+            let f = info.formats.iter().find(|f| f.format_id == hls).unwrap();
+            assert_eq!(f.kind, FormatKind::AudioOnly, "format {hls} kind");
+            assert!(!f.needs_merge, "format {hls} must not need a merge");
+            assert!(f.label.contains("Audio only"), "label: {}", f.label);
+        }
+        // Default: best combined at or below 1080p = 22 (720p),
+        // never the HLS audio entry 234.
         assert_eq!(info.default_format_id.as_deref(), Some("22"));
         // Labels carry resolution + kind + size.
         let f22 = info.formats.iter().find(|f| f.format_id == "22").unwrap();
@@ -1755,7 +1792,7 @@ mod tests {
             ),
         );
         let info = list_formats_with(&stub, "https://www.youtube.com/watch?v=aqz-KE-bpKQ").unwrap();
-        assert_eq!(info.formats.len(), 6);
+        assert_eq!(info.formats.len(), 8);
         assert_eq!(info.default_format_id.as_deref(), Some("22"));
     }
 

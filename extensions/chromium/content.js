@@ -1,8 +1,9 @@
 // FetchForge content script (MV3, shared by the Chromium and Firefox builds).
-// Phase 4 (MediaDetectionEngine): detects media on http(s) pages, shows an
-// IDM-style download button over videos, answers the popup's getMedia
-// request, and reports the detected set to the background script (which
-// forwards it to the desktop app via POST /media/detected).
+// Phase 4 (MediaDetectionEngine): detects media on http(s) pages, shows a
+// floating download button fixed to the viewport's bottom-right corner,
+// answers the popup's getMedia request, and reports the detected set to
+// the background script (which forwards it to the desktop app via POST
+// /media/detected).
 //
 // Runs in the page's isolated world: it can read the DOM but never sees
 // page JS variables, cookies, or the bridge token (the token lives only
@@ -28,8 +29,13 @@
 //
 // Stacked videos (a preview/ad <video> on top of the main player,
 // common on streaming sites) share one on-screen box: only one
-// overlay button is shown for the whole stack, attached to the
-// playing (or largest) element — see pickOverlayRepresentatives.
+// button is shown per tab, downloading the playing (or largest)
+// element — see pickOverlayRepresentatives and the cross-frame
+// election below. The button is NOT positioned on the video: it is
+// a viewport-anchored floating button (round 4), because the
+// on-video button broke when its host became a popover (the UA
+// overflow:auto rule clipped the translated button entirely — see
+// the floating-button section header).
 (function () {
   "use strict";
   if (window.location.protocol !== "http:" && window.location.protocol !== "https:") return;
@@ -54,10 +60,6 @@
     return new Promise((resolve) => api.runtime.sendMessage(msg, resolve));
   }
 
-  // A video smaller than this gets no overlay button (too small to be a
-  // real player, e.g. a tracking pixel or preview thumbnail).
-  const MIN_OVERLAY_W = 120;
-  const MIN_OVERLAY_H = 68;
   // Anything smaller than this area is treated as hidden for detection.
   const MIN_VISIBLE_AREA = 400; // px^2
 
@@ -454,17 +456,16 @@
   // capture-phase interceptor is registered on window FIRST (this
   // script runs at document_start, before page scripts), and it
   // swallows the event before the page ever sees it. It only
-  // touches events whose target path includes one of our own
-  // overlay buttons; every other click passes through untouched.
+  // touches events whose target path includes our own floating
+  // button; every other click passes through untouched.
   // The button's own click listener stays as a fallback (it never
   // double-fires: the interceptor stops propagation, and a disabled
   // button does not fire click events at all).
   function overlayButtonFromEvent(e) {
+    if (!floatOverlay || !floatTarget) return null;
     const path = typeof e.composedPath === "function" ? e.composedPath() : [];
-    for (const t of path) {
-      for (const entry of overlays) {
-        if (entry[1].button === t) return { button: t, video: entry[0] };
-      }
+    if (path.indexOf(floatOverlay.button) !== -1) {
+      return { button: floatOverlay.button, video: floatTarget };
     }
     return null;
   }
@@ -484,10 +485,55 @@
   window.addEventListener("mouseup", onOverlayEventCapture, true);
   window.addEventListener("pointerup", onOverlayEventCapture, true);
 
-  // ---- IDM-style overlay button on videos ----
+  // ---- Floating download button (viewport-anchored, Top Layer) ----
+  //
+  // Round 4 redesign. The button used to sit ON the video: its
+  // host was positioned at the video's top-right corner and the
+  // button was shifted left by its own width with
+  // translateX(-100%), so the button painted entirely OUTSIDE the
+  // host's box. That broke when the host became a popover in round
+  // 3: Chrome's UA stylesheet sets overflow:auto on [popover], and
+  // the round-3 inline styles never overrode it, so the host
+  // became a scroll container that clips everything outside its
+  // padding box — the translated button was clipped away entirely.
+  // Verified 2026-11-22 in headless Chromium against the exact
+  // 0.2.2 code: the button's rect looked correct and the popover
+  // was open, but 0/50 hit-test points landed on it (elementFromPoint
+  // hit the video instead); with overflow:visible added, or with
+  // the plain pre-popover host, 50/50. The live symptom was a
+  // 1-2px green sliver at the video's right edge (the button's edge
+  // bleeding through at the clip boundary) or nothing at all.
+  //
+  // The button is therefore no longer positioned on the video at
+  // all. It is a single floating button fixed to the bottom-right
+  // corner of the VIEWPORT (right/bottom anchoring, no transform,
+  // no video rect, no scroll tracking), still in the Top Layer via
+  // a manual popover so no page overlay can cover it, with
+  // overflow:visible so nothing about the host can clip it. It
+  // stays visible and clickable regardless of player state, scroll,
+  // or overlays; in fullscreen it is embedded inside the fullscreen
+  // element (see the fullscreen section below), because a popover
+  // over a fullscreen element is not reliably clickable.
+  // Exactly one button per tab: the cross-frame election (round 2)
+  // still decides which frame shows it, and within a frame the
+  // button downloads the best representative (playing, then
+  // largest). The click target is resolved at click time, so the
+  // button always downloads the stream that is currently playing.
 
-  // media element -> { host, button }
-  const overlays = new Map();
+  // The single floating button in this frame, created lazily on
+  // first show: { host, button, popover }. Null until created.
+  let floatOverlay = null;
+  // The video element the button currently downloads (this frame's
+  // best representative), resolved fresh on every scan.
+  let floatTarget = null;
+  // This frame's best representative (or null); the election
+  // verdict is evaluated against it.
+  let currentBestRep = null;
+  // True while the button host is embedded inside the fullscreen
+  // element (see the fullscreen section below): in that state the
+  // host is a plain element, not a popover, so show/hide use
+  // display instead of showPopover/hidePopover.
+  let embeddedInFullscreen = false;
 
   // Short button-sized reason from the engine's friendly error
   // string (the full reason goes in the button's tooltip).
@@ -507,6 +553,8 @@
 
   function onOverlayClick(video, btn) {
     // Re-resolve at click time: the source may have changed since scan.
+    // A detached target (removed between scan and click) is refused.
+    if (!video || !video.isConnected) return;
     const src = mediaSource(video);
     if (!src) return;
     const url = src.viaPage ? window.location.href : src.url;
@@ -540,62 +588,64 @@
     });
   }
 
-  // Show/hide an overlay host. A popover host is shown with
-  // showPopover() (top layer) and hidden with hidePopover();
-  // a plain host uses display. NEVER set display:none on a
-  // popover host: an inline display beats the UA :popover-open
-  // rule, so showPopover() would never display it.
+  // Show/hide the floating button's host. A popover host is shown
+  // with showPopover() (top layer) and hidden with hidePopover();
+  // a plain host — and an embedded host, which is plain while it
+  // lives inside the fullscreen element — uses display. NEVER set
+  // display:none on a popover host: an inline display beats the UA
+  // :popover-open rule, so showPopover() would never display it.
   // showPopover() on an already-shown popover throws; the
   // try/catch makes show/hide idempotent.
   function showOverlayHost(o) {
-    if (o.popover) {
+    if (o.popover && !embeddedInFullscreen) {
       try { o.host.showPopover(); } catch (_) {}
     } else {
       o.host.style.display = "block";
     }
   }
   function hideOverlayHost(o) {
-    if (o.popover) {
+    if (o.popover && !embeddedInFullscreen) {
       try { o.host.hidePopover(); } catch (_) {}
     } else {
       o.host.style.display = "none";
     }
   }
-  // Removing a host: hide the popover first (a shown popover
-  // must be hidden before its element is removed), then remove.
-  function destroyOverlay(o) {
-    hideOverlayHost(o);
-    o.host.remove();
-  }
 
-  function createOverlay(video) {
+  function createFloatingButton() {
     const host = document.createElement("div");
     // Top layer (popover API): z-index alone loses to a page
-    // overlay in another stacking context — on nime.pro the
-    // site's overlay sat above our button and stole the click,
-    // opening a clickunder pop-up instead. A manual popover
-    // renders in the browser's top layer, above ALL page content,
-    // so no page overlay can cover it. Falls back to the plain
-    // fixed host (z-index max) where popover is unsupported.
+    // overlay in another stacking context, and to the fullscreen
+    // element. A manual popover renders in the browser's top
+    // layer, above ALL page content, so no page overlay can cover
+    // the button. Falls back to the plain fixed host (z-index max)
+    // where popover is unsupported.
     // The inline styles override the UA popover rules (which set
-    // inset:0 and margin:auto): inset:auto keeps the host at its
-    // left/top instead of stretching it, and the transparent
-    // background/border keep it invisible.
+    // inset:0, margin:auto and overflow:auto): inset:auto plus
+    // explicit right/bottom anchors the host to the viewport's
+    // bottom-right corner; overflow:visible is REQUIRED — the UA
+    // overflow:auto turns the host into a scroll container that
+    // clips anything painted outside its box (that clipped the
+    // 0.2.2 button entirely, see the section header); the
+    // transparent background/border keep the host itself invisible.
     let isPopover = false;
     try {
       host.setAttribute("popover", "manual");
       isPopover = typeof host.showPopover === "function";
     } catch (_) { isPopover = false; }
     if (!isPopover) host.removeAttribute("popover");
-    host.style.cssText = "position:fixed;inset:auto;left:0;top:0;z-index:2147483647;pointer-events:none;"
-      + "background:transparent;border:0;padding:0;margin:0;";
+    host.style.cssText = "position:fixed;inset:auto;right:16px;bottom:16px;z-index:2147483647;"
+      + "pointer-events:none;overflow:visible;background:transparent;border:0;padding:0;margin:0;";
     const shadow = host.attachShadow({ mode: "open" });
     const btn = document.createElement("button");
     btn.textContent = "↓ FetchForge";
-    // Shadow DOM isolates the button from page CSS. translateX(-100%)
-    // anchors its right edge to the host's left position (top-right
-    // corner of the video) without measuring the button width.
-    btn.style.cssText = "pointer-events:auto;transform:translateX(-100%);background:#22c55e;color:#fff;"
+    // Shadow DOM isolates the button from page CSS. The button
+    // paints at its layout position INSIDE the host's box: no
+    // transform, so nothing about the host can clip it, and the
+    // host (fit-content per the UA popover rules) hugs it. The
+    // host is right/bottom anchored, so when the label grows
+    // ("Sending…", "Sent to FetchForge") the button grows
+    // leftward/upward and stays in the corner.
+    btn.style.cssText = "pointer-events:auto;background:#22c55e;color:#fff;"
       + "border:0;border-radius:6px;padding:6px 10px;font:600 12px system-ui,sans-serif;"
       + "cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.4);opacity:.92;white-space:nowrap;";
     btn.addEventListener("mouseenter", function () { btn.style.opacity = "1"; });
@@ -603,37 +653,120 @@
     btn.addEventListener("click", function (e) {
       e.stopPropagation();
       e.preventDefault();
-      onOverlayClick(video, btn);
+      onOverlayClick(floatTarget, btn);
     });
     shadow.appendChild(btn);
     (document.body || document.documentElement).appendChild(host);
     return { host: host, button: btn, popover: isPopover };
   }
 
-  function positionOverlays() {
-    for (const entry of overlays) {
-      const video = entry[0];
-      const o = entry[1];
-      if (!video.isConnected) { destroyOverlay(o); overlays.delete(video); continue; }
-      const rect = video.getBoundingClientRect();
-      const offscreen = rect.bottom < 0 || rect.top > window.innerHeight
-        || rect.right < 0 || rect.left > window.innerWidth;
-      if (offscreen || !isVisible(video) || rect.width < MIN_OVERLAY_W || rect.height < MIN_OVERLAY_H) {
-        hideOverlayHost(o);
-        continue;
+  // Best representative of a set: the playing one, else the
+  // largest (the same ranking the background election uses, so the
+  // elected winner in this frame is always this frame's best).
+  function bestRepresentative(reps) {
+    let best = null;
+    for (const el of reps) {
+      if (!best) { best = el; continue; }
+      const elPlaying = isPlaying(el);
+      const bestPlaying = isPlaying(best);
+      if (elPlaying && !bestPlaying) { best = el; continue; }
+      if (elPlaying === bestPlaying) {
+        const r = el.getBoundingClientRect();
+        const br = best.getBoundingClientRect();
+        if (r.width * r.height > br.width * br.height) best = el;
       }
-      // Cross-frame election verdict (see below): undefined means
-      // no verdict has arrived yet, so the button shows; null means
-      // another frame won, so every button in this frame hides.
-      if (electedKey !== undefined && overlayKeyFor(video) !== electedKey) {
-        hideOverlayHost(o);
-        continue;
+    }
+    return best;
+  }
+
+  // Show or hide the floating button from the current state:
+  // shown only when this frame has a downloadable video AND this
+  // frame holds the elected winner (or no verdict has arrived yet).
+  // The button is created lazily on first show and never removed
+  // (it is hidden, not destroyed, when there is nothing to
+  // download). Player state, scroll position, and video size do
+  // not hide it: the button is viewport-anchored, not on-video.
+  function refreshFloatingButton() {
+    // Cross-frame election verdict: undefined means no verdict has
+    // arrived yet, so the button shows; null (or another key) means
+    // another frame won, so this frame's button hides.
+    const elected = electedKey === undefined
+      || (currentBestRep && overlayKeyFor(currentBestRep) === electedKey);
+    if (!currentBestRep || !elected) {
+      floatTarget = null;
+      if (floatOverlay) hideOverlayHost(floatOverlay);
+      return;
+    }
+    floatTarget = currentBestRep;
+    if (!floatOverlay) floatOverlay = createFloatingButton();
+    showOverlayHost(floatOverlay);
+    // If a fullscreen element is active, the button must live
+    // inside it (see the fullscreen section below).
+    updateFullscreenEmbedding();
+  }
+
+  // ---- Fullscreen: embed the button inside the fullscreen element ----
+  //
+  // A popover shown after an element enters fullscreen PAINTS above
+  // it (verified by screenshot in headless Chromium: the popover
+  // covers the fullscreen video and the player's control bar), but
+  // hit-testing a popover over a fullscreen element is unreliable:
+  // in headless Chromium the fullscreen subtree wins every click
+  // even after the popover is re-shown (elementFromPoint and real
+  // mouse clicks both land on the fullscreen element's controls).
+  // The top-layer spec says the popover should win, but rather than
+  // bet the button on it, the button is EMBEDDED while fullscreen
+  // lasts: the host is moved inside the fullscreen element as a
+  // plain positioned element (no popover), where normal DOM
+  // hit-testing inside the fullscreen subtree applies and z-index
+  // max puts it above the player's own controls. On exit it moves
+  // back to <body> and becomes a popover again. The one exception
+  // is a fullscreen <video> (or <audio>) element: its children are
+  // fallback content and are not rendered while it plays, so
+  // embedding is impossible there and the popover (re-shown, so it
+  // re-enters the top layer above the fullscreen element) is the
+  // fallback — visible, and clickable per the top-layer spec.
+  // Moving the host preserves its shadow tree and listeners.
+  function embedButtonIn(fsEl) {
+    // Hide in its current form first (while embeddedInFullscreen
+    // is still false the popover branch runs), then drop the
+    // popover attribute and move inside the fullscreen element.
+    hideOverlayHost(floatOverlay);
+    if (floatOverlay.popover) floatOverlay.host.removeAttribute("popover");
+    fsEl.appendChild(floatOverlay.host);
+    embeddedInFullscreen = true;
+    floatOverlay.host.style.display = "block";
+  }
+  function unembedButton() {
+    (document.body || document.documentElement).appendChild(floatOverlay.host);
+    // Clear the inline display: an inline display:block would beat
+    // the UA :popover-open rule and break the popover once the
+    // attribute is restored.
+    floatOverlay.host.style.display = "";
+    if (floatOverlay.popover) floatOverlay.host.setAttribute("popover", "manual");
+    embeddedInFullscreen = false;
+  }
+  // Reconcile the button's fullscreen state with the document's:
+  // embed when an element is fullscreen (and embeddable), unembed
+  // when fullscreen ends or moves to another element.
+  function updateFullscreenEmbedding() {
+    if (!floatOverlay || !floatTarget) return;
+    const fsEl = document.fullscreenElement;
+    if (embeddedInFullscreen && (!fsEl || floatOverlay.host.parentNode !== fsEl)) {
+      unembedButton();
+      showOverlayHost(floatOverlay);
+    }
+    if (fsEl && !embeddedInFullscreen) {
+      if (fsEl.tagName === "VIDEO" || fsEl.tagName === "AUDIO") {
+        // Cannot embed in a media element: re-show the popover so
+        // it re-enters the top layer above the fullscreen element.
+        if (floatOverlay.popover) { hideOverlayHost(floatOverlay); showOverlayHost(floatOverlay); }
+        return;
       }
-      o.host.style.left = Math.round(rect.right - 8) + "px";
-      o.host.style.top = Math.round(rect.top + 8) + "px";
-      showOverlayHost(o);
+      embedButtonIn(fsEl);
     }
   }
+  document.addEventListener("fullscreenchange", updateFullscreenEmbedding);
 
   // ---- One button per tab: cross-frame overlay election ----
   //
@@ -737,21 +870,12 @@
       // Cross-frame election: report this frame's representatives
       // so the background can elect one winner per tab.
       reportOverlayCandidates(reps);
-      // Prune overlays for elements that are no longer their group's
-      // representative (e.g. the main player started playing and
-      // took over from the preview).
-      for (const el of Array.from(overlays.keys())) {
-        if (candidates.indexOf(el) !== -1 && !reps.has(el)) {
-          destroyOverlay(overlays.get(el));
-          overlays.delete(el);
-        }
-      }
-      for (const el of reps) {
-        if (overlays.has(el)) continue;
-        overlays.set(el, createOverlay(el));
-      }
+      // The floating button downloads this frame's best
+      // representative (playing, then largest); the election
+      // verdict decides whether this frame shows it at all.
+      currentBestRep = bestRepresentative(reps);
     }
-    positionOverlays();
+    refreshFloatingButton();
     reportMedia(collectMedia());
   }
 
@@ -764,14 +888,10 @@
 
   const observer = new MutationObserver(scheduleScan);
 
-  let rafPending = false;
-  function scheduleReposition() {
-    if (rafPending) return;
-    rafPending = true;
-    window.requestAnimationFrame(function () { rafPending = false; positionOverlays(); });
-  }
-  window.addEventListener("scroll", scheduleReposition, true);
-  window.addEventListener("resize", scheduleReposition);
+  // Fullscreen: the button is embedded inside the fullscreen
+  // element while fullscreen lasts (see updateFullscreenEmbedding
+  // above); no scroll/resize tracking is needed, because the
+  // button is viewport-anchored, not video-anchored.
 
   // Popup asks for the media on this tab; background sends the
   // overlay-election verdict for this frame.
@@ -780,7 +900,7 @@
       sendResponse({ items: collectMedia() });
     } else if (msg && msg.type === "overlayVerdict") {
       electedKey = msg.winnerKey === undefined ? undefined : msg.winnerKey;
-      positionOverlays();
+      refreshFloatingButton();
     }
   });
 

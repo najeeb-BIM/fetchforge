@@ -35,7 +35,9 @@
 // a viewport-anchored floating button (round 4), because the
 // on-video button broke when its host became a popover (the UA
 // overflow:auto rule clipped the translated button entirely — see
-// the floating-button section header).
+// the floating-button section header). It lives only in the top
+// frame's document (round 5): the top layer is per-document, so a
+// button in a player iframe sits under the parent page's overlays.
 (function () {
   "use strict";
   if (window.location.protocol !== "http:" && window.location.protocol !== "https:") return;
@@ -450,7 +452,7 @@
   //
   // Some streaming pages register capture-phase click/mousedown
   // handlers on window/document that open a popunder tab on ANY
-  // click — including a click on our overlay button. The button's
+  // click — including a click on our floating button. The button's
   // own bubble-phase listener runs too late: the popunder has
   // already fired by the time it stops propagation. So a
   // capture-phase interceptor is registered on window FIRST (this
@@ -461,11 +463,14 @@
   // The button's own click listener stays as a fallback (it never
   // double-fires: the interceptor stops propagation, and a disabled
   // button does not fire click events at all).
+  // Only the top frame has a button (see below), so in subframes
+  // the shield is inert — but it is registered everywhere, because
+  // the top frame is the one that needs it.
   function overlayButtonFromEvent(e) {
-    if (!floatOverlay || !floatTarget) return null;
+    if (!floatOverlay) return null;
     const path = typeof e.composedPath === "function" ? e.composedPath() : [];
     if (path.indexOf(floatOverlay.button) !== -1) {
-      return { button: floatOverlay.button, video: floatTarget };
+      return { button: floatOverlay.button };
     }
     return null;
   }
@@ -473,7 +478,7 @@
     const hit = overlayButtonFromEvent(e);
     if (!hit) return; // not our button: leave the page alone
     if (e.type === "click" && !hit.button.disabled) {
-      onOverlayClick(hit.video, hit.button);
+      onOverlayClick(hit.button);
     }
     e.stopImmediatePropagation();
     e.stopPropagation();
@@ -514,21 +519,32 @@
   // or overlays; in fullscreen it is embedded inside the fullscreen
   // element (see the fullscreen section below), because a popover
   // over a fullscreen element is not reliably clickable.
-  // Exactly one button per tab: the cross-frame election (round 2)
-  // still decides which frame shows it, and within a frame the
-  // button downloads the best representative (playing, then
-  // largest). The click target is resolved at click time, so the
-  // button always downloads the stream that is currently playing.
+  //
+  // Round 5: the button lives ONLY in the top frame's document.
+  // The top layer is per-document, so a button in a player iframe
+  // sits UNDER the parent page's overlays, which cover the iframe
+  // area — on nime the site's overlay stole every click even
+  // though the button was visible. The top frame's top layer sits
+  // above everything on the page, including those overlays. The
+  // button downloads the stream the background elected (see the
+  // election section): the URL comes from whichever frame holds
+  // the video, passed via the background in the verdict. Subframes
+  // never create a button; they only report candidates.
+  // Exactly one button per tab, always in the top frame.
+
+  // True only in the top frame: only it ever shows the button.
+  const isTopFrame = window === window.top;
 
   // The single floating button in this frame, created lazily on
   // first show: { host, button, popover }. Null until created.
+  // Only ever created in the top frame.
   let floatOverlay = null;
-  // The video element the button currently downloads (this frame's
-  // best representative), resolved fresh on every scan.
-  let floatTarget = null;
-  // This frame's best representative (or null); the election
-  // verdict is evaluated against it.
-  let currentBestRep = null;
+  // The download the button currently sends, from the latest
+  // election verdict: { url, filename?, audioUrl?, referer? }, or
+  // null when no frame has a downloadable stream. Set only by the
+  // verdict handler; refreshed as frames re-report (every scan
+  // change, and every 10 s).
+  let currentDownload = null;
   // True while the button host is embedded inside the fullscreen
   // element (see the fullscreen section below): in that state the
   // host is a plain element, not a popover, so show/hide use
@@ -551,19 +567,24 @@
     return "see app";
   }
 
-  function onOverlayClick(video, btn) {
-    // Re-resolve at click time: the source may have changed since scan.
-    // A detached target (removed between scan and click) is refused.
-    if (!video || !video.isConnected) return;
-    const src = mediaSource(video);
-    if (!src) return;
-    const url = src.viaPage ? window.location.href : src.url;
-    const filename = filenameForSource(src);
+  function onOverlayClick(btn) {
+    // The download source comes from the election verdict (the
+    // stream may live in a subframe this document cannot see).
+    // No verdict yet, or no stream anywhere: nothing to send.
+    if (!currentDownload || !currentDownload.url) return;
+    const dl = currentDownload;
     btn.disabled = true;
     btn.textContent = "Sending…";
     btn.title = "";
-    sendRuntimeMessage({ type: "downloadMedia", url: url, filename: filename, audioUrl: src.audioUrl }).then(function (resp) {
-      if (resp && resp.ok) {
+    sendRuntimeMessage({ type: "downloadMedia", url: dl.url, filename: dl.filename, audioUrl: dl.audioUrl, referer: dl.referer }).then(function (resp) {
+      if (resp && resp.duplicate) {
+        // Nothing new was queued: the file is already in the
+        // app's downloads. Say so honestly — "Sent" would be a
+        // lie (novahd 2026-11-22: a re-sent clip showed success
+        // while no download was created at all).
+        btn.textContent = "Already downloaded";
+        btn.title = "This file is already in your downloads.";
+      } else if (resp && resp.ok) {
         btn.textContent = "Sent to FetchForge";
       } else {
         // Show WHY it failed on the button (and the full reason as
@@ -653,51 +674,28 @@
     btn.addEventListener("click", function (e) {
       e.stopPropagation();
       e.preventDefault();
-      onOverlayClick(floatTarget, btn);
+      onOverlayClick(btn);
     });
     shadow.appendChild(btn);
     (document.body || document.documentElement).appendChild(host);
     return { host: host, button: btn, popover: isPopover };
   }
 
-  // Best representative of a set: the playing one, else the
-  // largest (the same ranking the background election uses, so the
-  // elected winner in this frame is always this frame's best).
-  function bestRepresentative(reps) {
-    let best = null;
-    for (const el of reps) {
-      if (!best) { best = el; continue; }
-      const elPlaying = isPlaying(el);
-      const bestPlaying = isPlaying(best);
-      if (elPlaying && !bestPlaying) { best = el; continue; }
-      if (elPlaying === bestPlaying) {
-        const r = el.getBoundingClientRect();
-        const br = best.getBoundingClientRect();
-        if (r.width * r.height > br.width * br.height) best = el;
-      }
-    }
-    return best;
-  }
-
-  // Show or hide the floating button from the current state:
-  // shown only when this frame has a downloadable video AND this
-  // frame holds the elected winner (or no verdict has arrived yet).
-  // The button is created lazily on first show and never removed
-  // (it is hidden, not destroyed, when there is nothing to
-  // download). Player state, scroll position, and video size do
-  // not hide it: the button is viewport-anchored, not on-video.
+  // Show or hide the floating button from the current state.
+  // Only the top frame ever shows it (see the section header);
+  // it is shown only when the latest election verdict carries a
+  // download source — i.e. some frame in this tab has a
+  // downloadable stream. The button is created lazily on first
+  // show and never removed (it is hidden, not destroyed, when
+  // there is nothing to download). Player state, scroll position,
+  // and video size do not hide it: the button is viewport-anchored,
+  // not on-video.
   function refreshFloatingButton() {
-    // Cross-frame election verdict: undefined means no verdict has
-    // arrived yet, so the button shows; null (or another key) means
-    // another frame won, so this frame's button hides.
-    const elected = electedKey === undefined
-      || (currentBestRep && overlayKeyFor(currentBestRep) === electedKey);
-    if (!currentBestRep || !elected) {
-      floatTarget = null;
+    if (!isTopFrame) return;
+    if (!currentDownload) {
       if (floatOverlay) hideOverlayHost(floatOverlay);
       return;
     }
-    floatTarget = currentBestRep;
     if (!floatOverlay) floatOverlay = createFloatingButton();
     showOverlayHost(floatOverlay);
     // If a fullscreen element is active, the button must live
@@ -750,16 +748,20 @@
   // embed when an element is fullscreen (and embeddable), unembed
   // when fullscreen ends or moves to another element.
   function updateFullscreenEmbedding() {
-    if (!floatOverlay || !floatTarget) return;
+    if (!floatOverlay || !currentDownload) return;
     const fsEl = document.fullscreenElement;
     if (embeddedInFullscreen && (!fsEl || floatOverlay.host.parentNode !== fsEl)) {
       unembedButton();
       showOverlayHost(floatOverlay);
     }
     if (fsEl && !embeddedInFullscreen) {
-      if (fsEl.tagName === "VIDEO" || fsEl.tagName === "AUDIO") {
-        // Cannot embed in a media element: re-show the popover so
-        // it re-enters the top layer above the fullscreen element.
+      if (fsEl.tagName === "VIDEO" || fsEl.tagName === "AUDIO" || fsEl.tagName === "IFRAME") {
+        // Cannot embed in a media element or an iframe: their
+        // children are fallback content and are not rendered
+        // while they play (an iframe is the fullscreen element in
+        // the top document when its inner player goes fullscreen).
+        // Re-show the popover so it re-enters the top layer above
+        // the fullscreen element.
         if (floatOverlay.popover) { hideOverlayHost(floatOverlay); showOverlayHost(floatOverlay); }
         return;
       }
@@ -777,8 +779,17 @@
   // (novahd). Frames therefore report their representative
   // candidates to the background script, which elects exactly ONE
   // winner per tab (playing first, then largest area) and tells
-  // each frame whether it holds the winner. Buttons show until the
-  // first verdict arrives, so election never delays the button.
+  // the top frame which stream to download.
+  //
+  // Each candidate carries its frame's RESOLVED stream source
+  // (the mediaSource result for that video): resource timing is
+  // per-document, so only the frame that fetched the manifest can
+  // see the playlist. The background picks the best stream across
+  // ALL frames — a playlist anywhere beats a direct file anywhere
+  // (novahd 2026-11-22: the top frame's clip won the election
+  // while the movie's playlist sat in the player iframe's timing
+  // log, and the click sent the clip). The button itself lives
+  // only in the top frame (see the floating-button section).
   const overlayKeys = new WeakMap();
   let overlayKeyCounter = 0;
   function overlayKeyFor(el) {
@@ -786,18 +797,34 @@
     if (!k) { k = "v" + (++overlayKeyCounter); overlayKeys.set(el, k); }
     return k;
   }
-  let electedKey = undefined;
   let lastCandidatesKey = "";
   function reportOverlayCandidates(reps) {
     const cands = [];
     for (const el of reps) {
       const r = el.getBoundingClientRect();
-      cands.push({
+      const cand = {
         key: overlayKeyFor(el),
         playing: isPlaying(el),
         area: Math.round(r.width * r.height),
-      });
+      };
+      // The stream this video would download, resolved in THIS
+      // frame (only this frame's timing log can see its playlist).
+      // A viaPage source has no URL yet: the background fills in
+      // this frame's page URL as the extraction target.
+      const src = mediaSource(el);
+      if (src) {
+        cand.source = {
+          url: src.viaPage ? null : src.url,
+          viaPage: !!src.viaPage,
+          filename: filenameForSource(src),
+          audioUrl: src.audioUrl,
+        };
+      }
+      cands.push(cand);
     }
+    // The source is part of the key, so a stream appearing in the
+    // timing log (the player starts, the manifest arrives)
+    // re-reports even when the candidate set itself is unchanged.
     const key = JSON.stringify(cands);
     if (key === lastCandidatesKey) return;
     lastCandidatesKey = key;
@@ -868,12 +895,10 @@
       }
       const reps = pickOverlayRepresentatives(candidates);
       // Cross-frame election: report this frame's representatives
-      // so the background can elect one winner per tab.
+      // (with their resolved stream sources) so the background
+      // can elect one winner per tab and tell the top frame which
+      // stream its button downloads.
       reportOverlayCandidates(reps);
-      // The floating button downloads this frame's best
-      // representative (playing, then largest); the election
-      // verdict decides whether this frame shows it at all.
-      currentBestRep = bestRepresentative(reps);
     }
     refreshFloatingButton();
     reportMedia(collectMedia());
@@ -894,12 +919,13 @@
   // button is viewport-anchored, not video-anchored.
 
   // Popup asks for the media on this tab; background sends the
-  // overlay-election verdict for this frame.
+  // overlay-election verdict for this tab (which stream the top
+  // frame's button downloads, or null when no frame has one).
   api.runtime.onMessage.addListener(function (msg, _sender, sendResponse) {
     if (msg && msg.type === "getMedia") {
       sendResponse({ items: collectMedia() });
     } else if (msg && msg.type === "overlayVerdict") {
-      electedKey = msg.winnerKey === undefined ? undefined : msg.winnerKey;
+      currentDownload = (msg.download && msg.download.url) ? msg.download : null;
       refreshFloatingButton();
     }
   });

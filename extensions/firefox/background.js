@@ -82,6 +82,11 @@ async function sendViaBridge(url, filename, referer, audioUrl) {
   // rather than claimed as success.
   const rec = await r.json().catch(() => null);
   if (rec && rec.status === "failed") return { ok: false, error: rec.error || "Download failed" };
+  // A duplicate add queues nothing: the file is already in the
+  // app's downloads. Report it honestly instead of claiming a
+  // fresh download was sent (the bridge flags it; see
+  // DownloadRecord.duplicate).
+  if (rec && rec.duplicate) return { ok: true, duplicate: true };
   return { ok: true };
 }
 async function sendViaNative(url, filename, referer, audioUrl) {
@@ -92,9 +97,13 @@ async function sendViaNative(url, filename, referer, audioUrl) {
   );
   if (resp && resp.type === "error") throw new Error(resp.error);
   // Same as the bridge path: the native host forwards the bridge's
-  // record, which may already say the download failed.
+  // record, which may already say the download failed — or that
+  // it is a duplicate (nothing new was queued).
   if (resp && resp.download && resp.download.status === "failed") {
     return { ok: false, error: resp.download.error || "Download failed" };
+  }
+  if (resp && resp.download && resp.download.duplicate) {
+    return { ok: true, duplicate: true };
   }
   return { ok: true };
 }
@@ -113,8 +122,11 @@ async function sendDownload(url, filename, referer, audioUrl) {
     // A real failure reason from the app (not a transport miss):
     // the native host already asked the bridge, so retrying the
     // bridge directly would only fail the same way again.
+    // Otherwise return the result as-is: it may carry
+    // `duplicate` (nothing new was queued), which the caller
+    // reports honestly instead of claiming a fresh send.
     if (r && r.ok === false) return r;
-    return { ok: true };
+    return r;
   } catch (_) { /* host not installed */ }
   try { return await sendViaBridge(url, filename, referer, audioUrl); } catch (_) { /* bridge not running / no token */ }
   // Documented fallback: let the browser handle it normally, and
@@ -228,21 +240,84 @@ if (api.tabs && api.tabs.onActivated) {
   });
 }
 // ---- One button per tab: cross-frame overlay election ----
-// Content scripts report their overlay representatives per frame;
-// the background elects exactly ONE winner per tab (playing first,
+// Content scripts report their overlay representatives per frame
+// (each with its frame's resolved stream source — only the frame
+// that fetched a manifest can see it in its timing log); the
+// background elects exactly ONE winner per tab (playing first,
 // then largest area, then the lowest frameId, then the lowest key)
-// and tells each frame whether it holds the winner. Frames
-// re-report every 10 s, so a service-worker restart rebuilds the
-// state from the next report; frames that stopped reporting are
-// pruned after 12 s. Election state is in memory only — losing it
-// just means buttons show until the next verdict.
-const tabOverlayCandidates = new Map(); // tabId -> Map(frameId -> { candidates, at })
+// and tells the top frame which stream its button downloads.
+// Frames re-report every 10 s, so a service-worker restart
+// rebuilds the state from the next report; frames that stopped
+// reporting are pruned after 12 s. Election state is in memory
+// only — losing it just means buttons show until the next verdict.
+const tabOverlayCandidates = new Map(); // tabId -> Map(frameId -> { candidates, frameUrl, at })
 const OVERLAY_CANDIDATE_TTL_MS = 12000;
 function sendToFrame(tabId, frameId, msg) {
   try {
     const p = api.tabs.sendMessage(tabId, msg, { frameId: frameId });
     if (p && typeof p.catch === "function") p.catch(function () { /* frame gone */ });
   } catch (_) { /* tabs API unavailable */ }
+}
+// Stream ranking, mirroring content.js: a playlist is the stream
+// that is playing; a master playlist is the whole stream (video
+// AND audio), a video variant is one track, an audio variant is
+// audio only.
+const BG_STREAM_EXT_RE = /\.(m3u8|mpd)([?#]|$)/i;
+const BG_MASTER_STEM_RE = /^(master|index|playlist|manifest)$/i;
+const BG_AUDIO_STEM_RE = /audio/i;
+function bgManifestKind(url) {
+  const name = url.split(/[?#]/)[0].split("/").pop() || "";
+  const stem = name.replace(/\.(m3u8|mpd)$/i, "");
+  if (BG_MASTER_STEM_RE.test(stem)) return "master";
+  if (BG_AUDIO_STEM_RE.test(stem)) return "audio";
+  return "video";
+}
+// The stream the top frame's button downloads, picked from ALL
+// frames' reported sources. A playlist anywhere beats a direct
+// file anywhere: the playlist is the stream that is playing,
+// while a direct file is often a preview/ad clip (novahd
+// 2026-11-22: the top frame's clip won the election while the
+// movie's playlist sat in the player iframe's timing log, and the
+// click sent the clip). Within playlists — and when no playlist
+// was observed anywhere — the election winner decides, then a
+// playing candidate, then master > video > audio, then the
+// largest area. Returns { url, filename?, audioUrl?, referer? }
+// (referer is the frame the stream came from, sent as the Referer
+// header on segment requests) or null when no frame has a source.
+function bestDownloadSource(tabId, winner) {
+  const frames = tabOverlayCandidates.get(tabId);
+  if (!frames) return null;
+  const all = [];
+  for (const [fid, entry] of frames.entries()) {
+    for (const c of entry.candidates) {
+      if (!c.source || !c.source.url) continue;
+      all.push({ frameId: fid, frameUrl: entry.frameUrl, cand: c });
+    }
+  }
+  if (!all.length) return null;
+  const isWinner = function (e) {
+    return !!winner && e.frameId === winner.frameId && e.cand.key === winner.key;
+  };
+  const isPlaylist = function (e) { return BG_STREAM_EXT_RE.test(e.cand.source.url); };
+  const playlistRank = function (e) {
+    if (!isPlaylist(e)) return 0;
+    const k = bgManifestKind(e.cand.source.url);
+    return k === "master" ? 2 : k === "video" ? 1 : 0;
+  };
+  const playlists = all.filter(isPlaylist);
+  const pool = playlists.length ? playlists : all;
+  pool.sort(function (a, b) {
+    const aw = isWinner(a) ? 1 : 0, bw = isWinner(b) ? 1 : 0;
+    if (aw !== bw) return bw - aw;
+    const ap = a.cand.playing ? 1 : 0, bp = b.cand.playing ? 1 : 0;
+    if (ap !== bp) return bp - ap;
+    const ak = playlistRank(a), bk = playlistRank(b);
+    if (ak !== bk) return bk - ak;
+    return (b.cand.area || 0) - (a.cand.area || 0);
+  });
+  const best = pool[0];
+  const s = best.cand.source;
+  return { url: s.url, filename: s.filename, audioUrl: s.audioUrl, referer: best.frameUrl };
 }
 function electOverlay(tabId) {
   const frames = tabOverlayCandidates.get(tabId);
@@ -262,9 +337,14 @@ function electOverlay(tabId) {
       if (cand.key < winner.key) winner = cand;
     }
   }
+  // The download source is picked across ALL frames (see
+  // bestDownloadSource): only the top frame shows the button, and
+  // it downloads this stream. Every frame gets the verdict; only
+  // the top frame acts on `download`.
+  const download = bestDownloadSource(tabId, winner);
   for (const fid of frames.keys()) {
     const winnerKey = winner && winner.frameId === fid ? winner.key : null;
-    sendToFrame(tabId, fid, { type: "overlayVerdict", winnerKey: winnerKey });
+    sendToFrame(tabId, fid, { type: "overlayVerdict", winnerKey: winnerKey, download: download });
   }
 }
 
@@ -285,17 +365,20 @@ api.contextMenus.onClicked.addListener((info) => {
 // Popup asks the background to send a pasted URL (keeps token handling here).
 api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.type === "sendUrl") {
-    sendDownload(msg.url, msg.filename).then((r) => sendResponse({ ok: r.ok, error: r.error }));
+    sendDownload(msg.url, msg.filename).then((r) => sendResponse({ ok: r.ok, error: r.error, duplicate: r.duplicate }));
     return true;
   }
   if (msg && msg.type === "downloadMedia") {
     // Content-script overlay click: same sendDownload path as the popup
     // and context menu. Only accept from a real tab's content script.
-    // The referer is the sending frame's URL (the page the media came
-    // from); the audio URL is a sibling audio variant to merge.
+    // The referer is the frame the media came from (the button lives
+    // in the top frame, but the stream may come from a subframe, so
+    // the verdict carries the source frame's URL); fall back to the
+    // sending frame's URL when no referer was given. The audio URL
+    // is a sibling audio variant to merge.
     if (!_sender || !_sender.tab) { sendResponse({ ok: false, error: "No tab" }); return false; }
-    const referer = (_sender && _sender.url) || (_sender.tab && _sender.tab.url) || undefined;
-    sendDownload(msg.url, msg.filename, referer, msg.audioUrl).then((r) => sendResponse({ ok: r.ok, error: r.error }));
+    const referer = msg.referer || (_sender && _sender.url) || (_sender.tab && _sender.tab.url) || undefined;
+    sendDownload(msg.url, msg.filename, referer, msg.audioUrl).then((r) => sendResponse({ ok: r.ok, error: r.error, duplicate: r.duplicate }));
     return true;
   }
   if (msg && msg.type === "overlayCandidates") {
@@ -303,9 +386,18 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (_sender && _sender.tab && typeof _sender.tab.id === "number") {
       const tabId = _sender.tab.id;
       const frameId = _sender.frameId || 0;
+      const frameUrl = _sender.url || "";
+      const candidates = Array.isArray(msg.candidates) ? msg.candidates : [];
+      // A viaPage source has no URL of its own: the frame's page
+      // URL is the extraction target (and the Referer for the
+      // stream's requests).
+      for (const c of candidates) {
+        if (c.source && c.source.viaPage && !c.source.url) c.source.url = frameUrl;
+      }
       if (!tabOverlayCandidates.has(tabId)) tabOverlayCandidates.set(tabId, new Map());
       tabOverlayCandidates.get(tabId).set(frameId, {
-        candidates: Array.isArray(msg.candidates) ? msg.candidates : [],
+        candidates: candidates,
+        frameUrl: frameUrl,
         at: Date.now(),
       });
       electOverlay(tabId);

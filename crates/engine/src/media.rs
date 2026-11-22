@@ -165,6 +165,32 @@ fn title_from_manifest_url(url: &str) -> String {
     }
 }
 
+/// Format a reqwest error WITH its underlying cause. reqwest's
+/// Display for a body-read failure is just "error decoding
+/// response body": `Response::bytes()` maps EVERY body error to
+/// Kind::Decode — a timeout mid-body, a connection reset, a
+/// truncated chunked body — and this build has no decoder
+/// features at all (Cargo.toml: blocking + rustls-tls +
+/// system-proxy only), so decompression is never even attempted.
+/// The bare message hid the real cause twice on 2026-11-22 (an
+/// Atlantic segment failed 3 times with it) and, worse, it hides
+/// timeouts from `looks_like_timeout`, so the 0-byte fail-fast
+/// never fired and the download sat silent for 3 x 120 s. Walk
+/// the source chain so the recorded error says what actually
+/// happened ("error decoding response body: operation timed
+/// out"), which the retry rule can then recognise.
+fn reqwest_error(e: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        src = s.source();
+    }
+    out
+}
+
 fn fetch_text(url: &str, referer: &Option<String>) -> Result<String, String> {
     let c = reqwest::blocking::Client::builder()
         .user_agent("FetchForge/0.2")
@@ -176,11 +202,15 @@ fn fetch_text(url: &str, referer: &Option<String>) -> Result<String, String> {
     if let Some(r) = referer {
         req = req.header("Referer", r.clone());
     }
-    let resp = req.send().map_err(|e| e.to_string())?;
+    // Manifests are plain text; ask for identity encoding so no
+    // proxy or CDN in the middle can hand back a compressed body
+    // this client never asked for (see reqwest_error).
+    req = req.header("Accept-Encoding", "identity");
+    let resp = req.send().map_err(|e| reqwest_error(&e))?;
     if !resp.status().is_success() {
         return Err(format!("Manifest request failed: HTTP {}", resp.status()));
     }
-    resp.text().map_err(|e| e.to_string())
+    resp.text().map_err(|e| reqwest_error(&e))
 }
 
 /// Fetch bytes, optionally a single inclusive byte range
@@ -201,15 +231,19 @@ fn fetch_bytes_range(
     if let Some(r) = referer {
         req = req.header("Referer", r.clone());
     }
+    // Segments are already-compressed media: compression gains
+    // nothing and a compressed body only adds failure modes, so
+    // ask for identity encoding outright (see reqwest_error).
+    req = req.header("Accept-Encoding", "identity");
     if let Some((start, end)) = range {
         req = req.header("Range", format!("bytes={start}-{end}"));
     }
-    let resp = req.send().map_err(|e| e.to_string())?;
+    let resp = req.send().map_err(|e| reqwest_error(&e))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(format!("Segment request failed: HTTP {status}"));
     }
-    let bytes = resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())?;
+    let bytes = resp.bytes().map(|b| b.to_vec()).map_err(|e| reqwest_error(&e))?;
     match range {
         None => Ok(bytes),
         Some((start, end)) => {
@@ -2935,6 +2969,148 @@ mod tests {
         );
         assert_eq!(hits.lock().unwrap().len(), 3, "hits: {:?}", hits.lock().unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One-shot stub: sends response headers promising `len` body
+    /// bytes, then stalls `stall` before closing, so a client with
+    /// a shorter timeout fails while reading the body. Records the
+    /// raw request (for the Accept-Encoding assertion).
+    fn serve_stalled_body(
+        len: usize,
+        stall: Duration,
+        seen: std::sync::Arc<Mutex<Vec<String>>>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                seen.lock().unwrap().push(
+                    String::from_utf8_lossy(&buf[..n]).to_string(),
+                );
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.flush();
+                std::thread::sleep(stall);
+            }
+        });
+        (port, handle)
+    }
+
+    /// One-shot stub: sends headers promising `len` body bytes,
+    /// then `sent` bytes, then closes — a truncated body, the
+    /// shape a CDN reset produces. Records the raw request.
+    fn serve_truncated_body(
+        len: usize,
+        sent: &[u8],
+        seen: std::sync::Arc<Mutex<Vec<String>>>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sent = sent.to_vec();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                seen.lock().unwrap().push(
+                    String::from_utf8_lossy(&buf[..n]).to_string(),
+                );
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.write_all(&sent);
+                let _ = stream.flush();
+                // Drop the socket: the body is short, hyper reports
+                // an incomplete message.
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn segment_body_timeout_reports_timed_out_and_fails_fast() {
+        // Atlantic 2026-11-22: segment 1 failed 3 times over ~6
+        // minutes with "error decoding response body". reqwest
+        // maps EVERY body-read error (including a timeout
+        // mid-body) to Kind::Decode, whose Display never says
+        // "timed out" — so the 0-byte fail-fast never fired and
+        // all 3 attempts burned their full 120 s. The formatted
+        // error must carry the underlying cause, and the retry
+        // rule must recognise it as a timeout.
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (port, server) = serve_stalled_body(1_000_000, Duration::from_secs(1), seen);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let err = client
+            .get(format!("http://127.0.0.1:{port}/seg0.ts"))
+            .send()
+            .and_then(|r| r.bytes())
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(err.is_timeout(), "expected a timeout error: {err:?}");
+        let msg = reqwest_error(&err);
+        assert!(
+            msg.to_lowercase().contains("timed out") || msg.to_lowercase().contains("timeout"),
+            "formatted error must name the timeout: {msg}"
+        );
+        assert!(
+            looks_like_timeout(&msg),
+            "retry rule must recognise it: {msg}"
+        );
+        assert!(
+            !should_retry_segment(0, 0, &msg),
+            "a 0-byte timeout must fail fast, not retry: {msg}"
+        );
+    }
+
+    #[test]
+    fn segment_body_failure_reports_underlying_cause_and_identity_encoding() {
+        // A truncated body (CDN reset) must not collapse to the
+        // bare "error decoding response body": the recorded error
+        // must say what actually happened. The request must also
+        // ask for identity encoding (segments are already
+        // compressed; a compressed body only adds failure modes).
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (port, server) =
+            serve_truncated_body(100, b"0123456789", seen.clone());
+        let err = fetch_bytes_range(
+            &format!("http://127.0.0.1:{port}/seg0.ts"),
+            None,
+            &None,
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert_ne!(
+            err, "error decoding response body",
+            "the bare kind message hides the cause"
+        );
+        assert!(
+            err.starts_with("error decoding response body: "),
+            "the cause must be appended: {err}"
+        );
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "one request expected: {reqs:?}");
+        assert!(
+            reqs[0].to_ascii_lowercase().contains("accept-encoding: identity"),
+            "segment fetch must request identity encoding: {:?}",
+            reqs[0]
+        );
     }
 
     #[test]

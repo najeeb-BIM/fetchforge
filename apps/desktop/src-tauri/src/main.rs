@@ -337,6 +337,7 @@ fn failed_record(
         stream_kind: None,
         referer: None,
         audio_url: None,
+        duplicate: false,
     };
     state.store.lock().unwrap().upsert(rec.clone());
     let _ = state.store.lock().unwrap().save();
@@ -407,9 +408,14 @@ fn try_gltf_download(
     // queued twice.
     {
         let store = state.store.lock().unwrap();
-        if let Some(existing) =
+        if let Some(mut existing) =
             store.find_duplicate(clean_url, &record_filename, &state.download_dir.to_string_lossy())
         {
+            // The caller must know nothing new was queued: flag
+            // the returned clone (never the stored record) so the
+            // extension reports "Already downloaded" instead of
+            // claiming a fresh download was sent.
+            existing.duplicate = true;
             return Ok(existing);
         }
     }
@@ -435,6 +441,7 @@ fn try_gltf_download(
         stream_kind: Some("gltf".to_string()),
         referer: None,
         audio_url: None,
+        duplicate: false,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -475,9 +482,14 @@ fn try_media_download(
     // known.
     {
         let store = state.store.lock().unwrap();
-        if let Some(existing) =
+        if let Some(mut existing) =
             store.find_duplicate(clean_url, &provisional, &state.download_dir.to_string_lossy())
         {
+            // The caller must know nothing new was queued: flag
+            // the returned clone (never the stored record) so the
+            // extension reports "Already downloaded" instead of
+            // claiming a fresh download was sent.
+            existing.duplicate = true;
             return Ok(existing);
         }
     }
@@ -502,6 +514,7 @@ fn try_media_download(
         stream_kind: Some("pending".to_string()),
         referer,
         audio_url,
+        duplicate: false,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -664,9 +677,14 @@ fn queue_direct_download(
     // is never used after a move (E0382 fix).
     {
         let store = state.store.lock().unwrap();
-        if let Some(existing) =
+        if let Some(mut existing) =
             store.find_duplicate(&clean, &filename, &state.download_dir.to_string_lossy())
         {
+            // The caller must know nothing new was queued: flag
+            // the returned clone (never the stored record) so the
+            // extension reports "Already downloaded" instead of
+            // claiming a fresh download was sent.
+            existing.duplicate = true;
             return Ok(existing);
         }
     }
@@ -690,6 +708,7 @@ fn queue_direct_download(
         stream_kind: None,
         referer,
         audio_url: None,
+        duplicate: false,
     };
     {
         let mut store = state.store.lock().unwrap();

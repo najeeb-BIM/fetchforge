@@ -460,6 +460,7 @@ impl App {
                     stream_kind: None,
                     referer: None,
                     audio_url: None,
+                    duplicate: false,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -509,6 +510,7 @@ impl App {
                     stream_kind: None,
                     referer: None,
                     audio_url: None,
+                    duplicate: false,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -537,11 +539,17 @@ impl App {
                 // Same idempotent-add rule as the other paths.
                 {
                     let mut store = self.store.lock().unwrap();
-                    if let Some(existing) = store.find_duplicate(
+                    if let Some(mut existing) = store.find_duplicate(
                         clean_url,
                         &record_filename,
                         &self.settings.download_dir,
                     ) {
+                        // The caller must know nothing new was
+                        // queued: flag the returned clone (never
+                        // the stored record) so the extension
+                        // reports "Already downloaded" instead of
+                        // claiming a fresh download was sent.
+                        existing.duplicate = true;
                         return Ok(existing);
                     }
                     let id = generate_download_id();
@@ -567,6 +575,7 @@ impl App {
                         stream_kind: Some("gltf".to_string()),
                         referer: None,
                         audio_url: None,
+                        duplicate: false,
                     };
                     store.upsert(rec.clone());
                     let _ = store.save();
@@ -596,6 +605,7 @@ impl App {
                     stream_kind: None,
                     referer: None,
                     audio_url: None,
+                    duplicate: false,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -637,11 +647,17 @@ impl App {
         // and planned filename are known.
         {
             let mut store = self.store.lock().unwrap();
-            if let Some(existing) = store.find_duplicate(
+            if let Some(mut existing) = store.find_duplicate(
                 clean_url,
                 &provisional,
                 &self.settings.download_dir,
             ) {
+                // The caller must know nothing new was queued:
+                // flag the returned clone (never the stored
+                // record) so the extension reports "Already
+                // downloaded" instead of claiming a fresh
+                // download was sent.
+                existing.duplicate = true;
                 return Ok(existing);
             }
             let id = generate_download_id();
@@ -666,6 +682,7 @@ impl App {
                 stream_kind: Some("pending".to_string()),
                 referer,
                 audio_url,
+                duplicate: false,
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -832,9 +849,15 @@ impl App {
         // simultaneous POSTs cannot both slip through.
         {
             let mut store = self.store.lock().unwrap();
-            if let Some(existing) =
+            if let Some(mut existing) =
                 store.find_duplicate(clean_url, &filename, &self.settings.download_dir)
             {
+                // The caller must know nothing new was queued:
+                // flag the returned clone (never the stored
+                // record) so the extension reports "Already
+                // downloaded" instead of claiming a fresh
+                // download was sent.
+                existing.duplicate = true;
                 return Ok(existing);
             }
             let id = generate_download_id();
@@ -857,6 +880,7 @@ impl App {
                 stream_kind: None,
                 referer,
                 audio_url: None,
+                duplicate: false,
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -2362,5 +2386,76 @@ mod tests {
         std::fs::write(dir.join("detected.json"), "{not json").unwrap();
         let app = App::new(dir);
         assert!(app.detected.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn duplicate_add_returns_existing_record_flagged_duplicate() {
+        // A re-sent URL (2026-11-22: a clip the user clicked twice)
+        // must not queue a second download — and the caller must be
+        // TOLD nothing new was queued, or the extension claims
+        // "Sent to FetchForge" for a download that never existed.
+        // The manifest stub answers slowly (2 s) so the worker's
+        // planning cannot finish (and rename the record) before
+        // the second add runs.
+        use std::io::Write;
+        use std::sync::atomic::AtomicBool;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\nseg0.ts\n#EXT-X-ENDLIST\n";
+            loop {
+                if stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf);
+                        std::thread::sleep(Duration::from_secs(2));
+                        let _ = stream.write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                playlist.len(),
+                                playlist
+                            )
+                            .as_bytes(),
+                        );
+                        let _ = stream.flush();
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+        let dir = test_data_dir("fetchforge-test-duplicate-flag");
+        let app = App::new(dir);
+        let url = format!("http://127.0.0.1:{port}/v.m3u8");
+        let first = app
+            .try_media_download(&url, Some("clip.mp4".to_string()), None, None, None)
+            .unwrap();
+        assert!(!first.duplicate, "first add queues a new download");
+        let second = app
+            .try_media_download(&url, Some("clip.mp4".to_string()), None, None, None)
+            .unwrap();
+        assert!(second.duplicate, "second add must be flagged duplicate");
+        assert_eq!(second.id, first.id, "same record returned");
+        // The stored record is untouched: the flag lives only on
+        // the returned clone, never in downloads.json.
+        let stored = app.store.lock().unwrap().get(&first.id).unwrap().clone();
+        assert!(!stored.duplicate, "stored record must not carry the flag");
+        let json = serde_json::to_string(&stored).unwrap();
+        assert!(!json.contains("duplicate"), "flag must not persist: {json}");
+        // ...but the flagged clone serializes it, so the extension
+        // sees it in the add response.
+        let json = serde_json::to_string(&second).unwrap();
+        assert!(
+            json.contains("\"duplicate\":true"),
+            "flag must serialize on the duplicate return: {json}"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
     }
 }

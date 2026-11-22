@@ -70,7 +70,7 @@ async function refreshMedia() {
       btn.onclick = async () => {
         btn.disabled = true;
         const res = await sendMessage({ type: "sendUrl", url: item.url, filename: item.filename });
-        status.textContent = res && res.ok ? "Sent (or fell back to browser download)." : "Could not send: " + (res && res.error ? res.error : "unknown error");
+        status.textContent = res && res.duplicate ? "Already downloaded." : res && res.ok ? "Sent (or fell back to browser download)." : "Could not send: " + (res && res.error ? res.error : "unknown error");
         btn.disabled = false;
       };
       row.appendChild(check);
@@ -141,7 +141,7 @@ document.getElementById("send").onclick = async () => {
   const url = document.getElementById("url").value.trim();
   const filename = document.getElementById("filename").value.trim() || undefined;
   const r = await sendMessage({ type: "sendUrl", url, filename });
-  status.textContent = r && r.ok ? "Sent (or fell back to browser download)." : "Could not send: " + (r && r.error ? r.error : "is the link http/https?");
+  status.textContent = r && r.duplicate ? "Already downloaded." : r && r.ok ? "Sent (or fell back to browser download)." : "Could not send: " + (r && r.error ? r.error : "is the link http/https?");
 };
 // Ad blocker toggle: the static ruleset (rules/ads.json) is enabled
 // by default in the manifest; this checkbox persists the choice in

@@ -84,6 +84,24 @@ pub struct DownloadRecord {
     /// `#[serde(default)]` so older history files still load.
     #[serde(default)]
     pub audio_url: Option<String>,
+    /// Transient: true when this record was returned because an
+    /// identical download already exists (idempotent add), NOT
+    /// because a new download was queued. Set only on the clone
+    /// returned to the caller by the add functions — never on the
+    /// stored record, so it is never persisted to downloads.json.
+    /// `skip_serializing_if` keeps it out of the JSON unless set,
+    /// so old files, old clients, and the app list are unaffected;
+    /// the extension reads it from the add response and reports
+    /// "Already downloaded" instead of claiming a new download was
+    /// sent (2026-11-22: a re-sent clip showed "Sent to
+    /// FetchForge" while nothing was queued at all).
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub duplicate: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 pub struct Store {
@@ -539,6 +557,7 @@ mod tests {
             stream_kind: None,
             referer: None,
             audio_url: None,
+            duplicate: false,
         });
         s.save().unwrap();
         let mut s2 = Store::load(path);
@@ -570,6 +589,7 @@ mod tests {
             stream_kind: None,
             referer: None,
             audio_url: None,
+            duplicate: false,
         }
     }
 

@@ -1020,5 +1020,28 @@
         "other"
       ]
     }
+  },
+  {
+    "id": 54,
+    "priority": 1,
+    "action": {
+      "type": "block"
+    },
+    "condition": {
+      "urlFilter": "||refpa3665.com^",
+      "resourceTypes": [
+        "main_frame",
+        "sub_frame",
+        "script",
+        "xmlhttprequest",
+        "image",
+        "stylesheet",
+        "font",
+        "object",
+        "websocket",
+        "ping",
+        "other"
+      ]
+    }
   }
 ]

@@ -195,7 +195,15 @@ fn list_downloads(state: tauri::State<Arc<State>>) -> Vec<DownloadRecord> {
 // `format_id` is the quality the user picked in the format picker;
 // None means the recorded default (the paste-link box also accepts a
 // video page directly, without opening the picker first).
-#[tauri::command]
+// rename_all = "snake_case" is LOAD-BEARING, not style: Tauri's
+// #[tauri::command] macro camelCases argument names by default, so
+// `format_id` would be looked up as `formatId` in the invoke payload
+// — but the frontend sends `format_id` (snake_case, shared with the
+// bridge HTTP API). Without this attribute the picker selection was
+// silently dropped and every download used the default format
+// (found 2026-11-22: direct invoke with format_id "278" recorded
+// the default 234; filename, a single word, was unaffected).
+#[tauri::command(rename_all = "snake_case")]
 async fn add_download(
     state: tauri::State<'_, Arc<State>>,
     url: String,

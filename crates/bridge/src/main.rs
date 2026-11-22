@@ -1569,6 +1569,28 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
         let _ = stream.write_all(http_response(200, &b).as_bytes());
         return;
     }
+    // Clear finished downloads from the list (token required): removes
+    // Completed/Failed/Cancelled records only. Downloaded files are
+    // never touched, and active downloads are never removed. Must sit
+    // before the /downloads/<id>/... catch-all below, or the catch-all
+    // swallows it (its segments would be ["downloads",
+    // "clear-finished"], which falls through to 404).
+    if method == "POST" && path == "/downloads/clear-finished" {
+        let removed = {
+            let mut store = app.store.lock().unwrap();
+            store.reload_from_disk();
+            let n = store.remove_finished();
+            if let Err(e) = store.save() {
+                let b = serde_json::json!({"error": e}).to_string();
+                let _ = stream.write_all(http_response(500, &b).as_bytes());
+                return;
+            }
+            n
+        };
+        let b = serde_json::json!({"removed": removed}).to_string();
+        let _ = stream.write_all(http_response(200, &b).as_bytes());
+        return;
+    }
     // /downloads/<id>/pause | resume | cancel
     if method == "POST" && path.starts_with("/downloads/") {
         let segs: Vec<&str> = path.trim_matches('/').split('/').collect();

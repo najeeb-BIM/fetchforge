@@ -1029,6 +1029,21 @@ fn cancel_download(state: tauri::State<Arc<State>>, id: String) {
     }
 }
 
+/// Clear finished downloads from the list: removes Completed/Failed/
+/// Cancelled records only. Downloaded files are never touched, and
+/// active downloads are never removed. Returns how many records were
+/// removed.
+#[tauri::command]
+fn clear_finished_downloads(state: tauri::State<Arc<State>>) -> usize {
+    let mut store = state.store.lock().unwrap();
+    store.reload_from_disk();
+    let removed = store.remove_finished();
+    if let Err(e) = store.save() {
+        eprintln!("FetchForge WARNING: could not save after clearing finished downloads: {e}");
+    }
+    removed
+}
+
 /// Feat 1 (NOT VERIFIED on Windows): talk to the local bridge over
 /// loopback with plain TcpStream, so no new dependency is needed.
 /// The token is read from the app's own data dir, never shown in the
@@ -1135,6 +1150,7 @@ fn main() {
             pause_download,
             resume_download,
             cancel_download,
+            clear_finished_downloads,
             bridge_status,
             pair_browser,
             unpair_all_browsers

@@ -17,6 +17,15 @@ pub enum Status {
     Cancelled,
 }
 
+impl Status {
+    /// Terminal statuses: the download will never run again, so the
+    /// record is history only and safe to remove from the list.
+    /// Removing a record never deletes the downloaded file.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Status::Completed | Status::Failed | Status::Cancelled)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadRecord {
     pub id: String,
@@ -69,10 +78,11 @@ pub struct Store {
     /// It is never part of the saved JSON.
     pub load_warning: Option<String>,
     /// F03: IDs removed in this process, with deletion time. `save`
-    /// must not resurrect them from disk. `remove` is currently unused
-    /// in product code (history removal is banned), so this set is
-    /// in-memory only; if removal is reintroduced, tombstones must
-    /// persist, otherwise a restart could resurrect a deleted record.
+    /// must not resurrect them from disk. In-memory only: a restart
+    /// drops the tombstones, but the records stay deleted because the
+    /// save already removed them from the file, and the other process
+    /// prunes them from its own memory on reload (see
+    /// `reload_from_disk`).
     deleted: BTreeMap<String, u64>,
 }
 
@@ -96,6 +106,20 @@ fn now_secs() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+/// Maximum records the list keeps: when a new download pushes past
+/// this, the oldest finished records are dropped (list only, files
+/// are never touched). Active downloads are never dropped, so the
+/// list can briefly exceed this while many downloads run.
+pub const MAX_LIST_RECORDS: usize = 20;
+
+/// Grace period for cross-process record removal. A record this
+/// process holds in memory but that is absent from disk is only
+/// pruned once it is older than this, so a record the other process
+/// just created (and has not saved yet) is never dropped by mistake:
+/// a just-created record is always young, while a record the other
+/// process deleted is at least as old as its last update.
+const REMOVAL_GRACE_SECS: u64 = 60;
 
 fn acquire_lock(path: &std::path::Path) -> Option<LockGuard> {
     let lock_path = path.with_extension("json.lock");
@@ -226,8 +250,16 @@ impl Store {
         // they are as new or newer than disk (by updated_unix). A stale
         // in-memory record must not overwrite a newer disk record.
         let mut merged = disk_records;
+        let now = now_secs();
         for (id, rec) in &self.records {
             match merged.get(id) {
+                // Absent from disk: either this process just created
+                // it (young, keep it) or the other process deleted
+                // it and saved (old, do not resurrect it). The grace
+                // period tells them apart. When no disk file existed
+                // yet, every in-memory record is new by definition,
+                // so nothing is skipped.
+                None if had_disk && now.saturating_sub(rec.updated_unix) > REMOVAL_GRACE_SECS => {}
                 None => {
                     merged.insert(id.clone(), rec.clone());
                 }
@@ -263,6 +295,9 @@ impl Store {
     /// the app was running). Same rule as `save`: a record wins only if
     /// it is newer than the one already held. A missing or corrupt file
     /// is ignored here; `save` still refuses to overwrite corrupt state.
+    /// Records the other process removed (Clear finished / auto-trim)
+    /// are also pruned from memory, so this process's next save does
+    /// not resurrect them from stale memory.
     pub fn reload_from_disk(&mut self) {
         let Ok(text) = fs::read_to_string(&self.path) else {
             return;
@@ -272,6 +307,9 @@ impl Store {
         else {
             return;
         };
+        // Snapshot the disk ids first: the merge loop below consumes
+        // the map, and the prune step needs to know what is on disk.
+        let disk_ids: std::collections::BTreeSet<String> = disk_records.keys().cloned().collect();
         for (id, disk_rec) in disk_records {
             match self.records.get(&id) {
                 None => {
@@ -283,9 +321,34 @@ impl Store {
                 Some(_) => {}
             }
         }
+        // Prune records the other process removed: a record this
+        // process holds that is absent from disk was deleted by the
+        // other process and saved. The grace period protects a
+        // record this process just created but has not saved yet.
+        let now = now_secs();
+        let stale: Vec<String> = self
+            .records
+            .values()
+            .filter(|r| {
+                !disk_ids.contains(&r.id) && now.saturating_sub(r.updated_unix) > REMOVAL_GRACE_SECS
+            })
+            .map(|r| r.id.clone())
+            .collect();
+        for id in stale {
+            self.records.remove(&id);
+        }
     }
     pub fn upsert(&mut self, rec: DownloadRecord) {
+        let is_new = !self.records.contains_key(&rec.id);
         self.records.insert(rec.id.clone(), rec);
+        // Auto-trim on every new download, so the list stays at the
+        // newest MAX_LIST_RECORDS instead of growing without bound
+        // (a long browsing session can add hundreds of detections).
+        // Progress updates (existing ids) never trim, and trimming
+        // only ever removes finished records, never active downloads.
+        if is_new {
+            self.trim_finished(MAX_LIST_RECORDS);
+        }
     }
     pub fn get(&self, id: &str) -> Option<&DownloadRecord> {
         self.records.get(id)
@@ -300,6 +363,50 @@ impl Store {
         } else {
             false
         }
+    }
+    /// Remove every finished record (Completed/Failed/Cancelled)
+    /// from the list. Returns how many were removed. Records only:
+    /// downloaded files are never touched, and active downloads
+    /// (Queued/Downloading/Paused) are never removed. Removals go
+    /// through `remove`, so the tombstone map keeps them deleted
+    /// across this process's later saves.
+    pub fn remove_finished(&mut self) -> usize {
+        let ids: Vec<String> = self
+            .records
+            .values()
+            .filter(|r| r.status.is_terminal())
+            .map(|r| r.id.clone())
+            .collect();
+        let n = ids.len();
+        for id in ids {
+            self.remove(&id);
+        }
+        n
+    }
+    /// Keep the list short: if it holds more than `keep_newest`
+    /// records, remove the oldest finished ones until only the
+    /// newest `keep_newest` remain. Active downloads are never
+    /// removed, so the list can stay above `keep_newest` while many
+    /// downloads run. Returns how many were removed. Records only:
+    /// downloaded files are never touched.
+    pub fn trim_finished(&mut self, keep_newest: usize) -> usize {
+        if self.records.len() <= keep_newest {
+            return 0;
+        }
+        // Newest first by creation time; the tail beyond keep_newest
+        // holds the removal candidates, filtered to finished records.
+        let mut ordered: Vec<&DownloadRecord> = self.records.values().collect();
+        ordered.sort_by_key(|r| std::cmp::Reverse(r.created_unix));
+        let ids: Vec<String> = ordered[keep_newest..]
+            .iter()
+            .filter(|r| r.status.is_terminal())
+            .map(|r| r.id.clone())
+            .collect();
+        let n = ids.len();
+        for id in ids {
+            self.remove(&id);
+        }
+        n
     }
     /// On startup, anything left `Downloading` was interrupted: mark Paused
     /// if it was resumable, Failed otherwise, so the UI never shows a
@@ -330,7 +437,10 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("downloads.json");
         let mut s = Store::load(path.clone());
-        let now = 1_700_000_000;
+        // Real timestamps: a record this process just created is
+        // young, and save() only skips re-inserting records that are
+        // absent from disk AND older than the removal grace.
+        let now = now_secs();
         s.upsert(DownloadRecord {
             id: "a".into(),
             url: "https://example.com/x.zip".into(),
@@ -356,6 +466,10 @@ mod tests {
     }
 
     fn rec(id: &str) -> DownloadRecord {
+        // Real timestamps: a record this process just created is
+        // young, and save() only skips re-inserting records that are
+        // absent from disk AND older than the removal grace.
+        let now = now_secs();
         DownloadRecord {
             id: id.into(),
             url: "https://example.com/x.zip".into(),
@@ -367,13 +481,21 @@ mod tests {
             downloaded_bytes: 10,
             resumable: true,
             error: None,
-            created_unix: 1_700_000_000,
-            updated_unix: 1_700_000_000,
+            created_unix: now,
+            updated_unix: now,
             format_id: None,
             needs_merge: false,
             format_selector: None,
             stream_kind: None,
         }
+    }
+
+    fn rec_status(id: &str, status: Status, created: u64, updated: u64) -> DownloadRecord {
+        let mut r = rec(id);
+        r.status = status;
+        r.created_unix = created;
+        r.updated_unix = updated;
+        r
     }
 
     #[test]
@@ -491,6 +613,190 @@ mod tests {
                 .flatten()
                 .any(|e| e.file_name().to_string_lossy().contains(".corrupt-")),
             "corrupt file must be renamed, not deleted"
+        );
+    }
+
+    #[test]
+    fn remove_finished_keeps_active_downloads() {
+        let dir = std::env::temp_dir().join("fetchforge-test-store-remove-finished");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let mut s = Store::load(dir.join("downloads.json"));
+        let now = now_secs();
+        s.upsert(rec_status("done", Status::Completed, now, now));
+        s.upsert(rec_status("bad", Status::Failed, now, now));
+        s.upsert(rec_status("cancelled", Status::Cancelled, now, now));
+        s.upsert(rec_status("running", Status::Downloading, now, now));
+        s.upsert(rec_status("waiting", Status::Queued, now, now));
+        s.upsert(rec_status("held", Status::Paused, now, now));
+        assert_eq!(s.remove_finished(), 3);
+        assert!(s.get("done").is_none());
+        assert!(s.get("bad").is_none());
+        assert!(s.get("cancelled").is_none());
+        assert!(s.get("running").is_some(), "active downloads must survive");
+        assert!(s.get("waiting").is_some(), "queued downloads must survive");
+        assert!(s.get("held").is_some(), "paused downloads must survive");
+    }
+
+    #[test]
+    fn upsert_auto_trims_to_twenty_on_new_downloads() {
+        let dir = std::env::temp_dir().join("fetchforge-test-store-autotrim");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let mut s = Store::load(dir.join("downloads.json"));
+        let now = now_secs();
+        for i in 0..25u64 {
+            s.upsert(rec_status(
+                &format!("f-{i:02}"),
+                Status::Completed,
+                now - 100 + i,
+                now - 100 + i,
+            ));
+        }
+        assert_eq!(s.all().len(), 20, "list must stay at 20 after 25 adds");
+        assert!(s.get("f-24").is_some(), "newest must survive");
+        assert!(s.get("f-05").is_some(), "20th newest must survive");
+        assert!(s.get("f-04").is_none(), "21st newest must be auto-trimmed");
+        assert!(s.get("f-00").is_none(), "oldest must be auto-trimmed");
+        // A progress update (existing id) must not trim anything.
+        let mut r = s.get("f-24").unwrap().clone();
+        r.downloaded_bytes = 5;
+        s.upsert(r);
+        assert_eq!(s.all().len(), 20);
+    }
+
+    #[test]
+    fn trim_finished_keeps_newest_and_never_active() {
+        let dir = std::env::temp_dir().join("fetchforge-test-store-trim");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let mut s = Store::load(dir.join("downloads.json"));
+        let now = now_secs();
+        // 25 finished records; upsert already auto-trims to the
+        // newest 20 on each add, so the store holds old-05..old-24.
+        for i in 0..25u64 {
+            s.upsert(rec_status(
+                &format!("old-{i:02}"),
+                Status::Completed,
+                now - 1000 + i,
+                now - 1000 + i,
+            ));
+        }
+        // An old active download must survive every trim, even
+        // though it is the oldest record in the store.
+        s.upsert(rec_status(
+            "active-old",
+            Status::Downloading,
+            now - 2000,
+            now - 2000,
+        ));
+        assert_eq!(s.all().len(), 21, "active record must not be trimmed");
+        let removed = s.trim_finished(10);
+        assert_eq!(removed, 10, "10 oldest finished records must go");
+        assert_eq!(s.all().len(), 11, "10 newest + the old active download");
+        assert!(
+            s.get("active-old").is_some(),
+            "active downloads are never trimmed"
+        );
+        assert!(s.get("old-24").is_some(), "newest finished must survive");
+        assert!(s.get("old-15").is_some(), "10th newest must survive");
+        assert!(s.get("old-14").is_none(), "11th newest must be trimmed");
+        assert!(
+            s.get("old-05").is_none(),
+            "oldest remaining must be trimmed"
+        );
+        // Under the limit, trim is a no-op.
+        assert_eq!(s.trim_finished(20), 0);
+    }
+
+    #[test]
+    fn reload_from_disk_prunes_records_removed_by_other_process() {
+        let dir = std::env::temp_dir().join("fetchforge-test-store-prune");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("downloads.json");
+        let old = now_secs() - 3600; // last updated an hour ago: past the grace
+        let mut a = Store::load(path.clone());
+        a.upsert(rec_status("gone", Status::Completed, old, old));
+        a.upsert(rec_status("stays", Status::Completed, old, old));
+        a.save().unwrap();
+        // B loads the same file, so B holds both records.
+        let mut b = Store::load(path.clone());
+        // A clears finished records and saves: the file no longer
+        // holds either record.
+        assert_eq!(a.remove_finished(), 2);
+        a.save().unwrap();
+        // B still holds both in memory until it reloads...
+        assert!(b.get("gone").is_some());
+        // ...but reload prunes them instead of leaving them to be
+        // resurrected by B's next save.
+        b.reload_from_disk();
+        assert!(
+            b.get("gone").is_none(),
+            "removed records must be pruned on reload"
+        );
+        assert!(b.get("stays").is_none());
+        b.save().unwrap();
+        let disk: BTreeMap<String, DownloadRecord> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            disk.is_empty(),
+            "B's save must not resurrect removed records"
+        );
+    }
+
+    #[test]
+    fn save_does_not_resurrect_records_removed_by_other_process() {
+        let dir = std::env::temp_dir().join("fetchforge-test-store-save-grace");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("downloads.json");
+        let old = now_secs() - 3600;
+        let mut a = Store::load(path.clone());
+        a.upsert(rec_status("gone", Status::Completed, old, old));
+        a.save().unwrap();
+        let mut b = Store::load(path.clone());
+        // A removes the record and saves; B never reloads.
+        a.remove_finished();
+        a.save().unwrap();
+        assert!(b.get("gone").is_some(), "B still holds the stale record");
+        // B's save must not put it back on disk.
+        b.save().unwrap();
+        let disk: BTreeMap<String, DownloadRecord> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            !disk.contains_key("gone"),
+            "B's save must not resurrect a removed record"
+        );
+    }
+
+    #[test]
+    fn reload_from_disk_keeps_just_created_records() {
+        let dir = std::env::temp_dir().join("fetchforge-test-store-prune-grace");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("downloads.json");
+        let now = now_secs();
+        let mut a = Store::load(path.clone());
+        a.upsert(rec_status("saved", Status::Completed, now, now));
+        a.save().unwrap();
+        let mut b = Store::load(path.clone());
+        // B creates a record but has not saved it yet: it is absent
+        // from disk but young, so a reload must not prune it.
+        b.upsert(rec_status("fresh", Status::Downloading, now, now));
+        b.reload_from_disk();
+        assert!(
+            b.get("fresh").is_some(),
+            "a just-created record must survive reload"
+        );
+        assert!(b.get("saved").is_some());
+        // And B's save must still write it to disk.
+        b.save().unwrap();
+        let disk: BTreeMap<String, DownloadRecord> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            disk.contains_key("fresh"),
+            "a just-created record must be saved"
         );
     }
 }

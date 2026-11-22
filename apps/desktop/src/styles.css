@@ -44,6 +44,7 @@ progress{width:140px}.token-box{background:#1e293b;border:1px solid #334155;bord
 .det-list{display:flex;flex-direction:column;gap:8px}
 .det-row{display:flex;gap:10px;align-items:center;background:#1e293b;border:1px solid #334155;border-radius:8px;padding:10px 12px}
 .det-check{flex:none;accent-color:#22c55e;width:16px;height:16px}
+.det-thumb{flex:none;width:96px;height:64px;object-fit:cover;border-radius:6px}
 .det-info{flex:1;min-width:0}
 .det-title{font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .det-meta{font-size:12px;color:#94a3b8;margin-top:2px}

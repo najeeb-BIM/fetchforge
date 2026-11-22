@@ -30,10 +30,6 @@
     <button data-view="dashboard" role="tab" aria-selected="false">Dashboard</button>
     <button data-view="downloads" role="tab" aria-selected="true" class="active">Downloads</button>
     <button data-view="detector" role="tab" aria-selected="false">Media Detector</button>
-    <button data-view="video" role="tab" aria-selected="false">Video</button>
-    <button data-view="images" role="tab" aria-selected="false">Images</button>
-    <button data-view="3d" role="tab" aria-selected="false">3D</button>
-    <button data-view="queue" role="tab" aria-selected="false">Queue</button>
     <button data-view="history" role="tab" aria-selected="false">History</button>
     <button data-view="browser" role="tab" aria-selected="false">Browser Integration</button>
   </nav>
@@ -63,6 +59,7 @@
       <option value="paused">Paused</option>
     </select>
     <button id="refreshBtn">Refresh</button>
+    <button id="clearFinishedBtn" class="secondary">Clear finished</button>
     <span id="status">Starting...</span>
   </section>
   <section id="tokenBox" class="token-box" hidden>
@@ -172,6 +169,7 @@ async function api(path, method = "GET", body) {
   if (isTauri) {
     if (path === "/downloads" && method === "GET") return invokeTimed("list_downloads");
     if (path === "/downloads" && method === "POST") return invokeTimed("add_download", body, ADD_TIMEOUT_MS);
+    if (path === "/downloads/clear-finished" && method === "POST") return invokeTimed("clear_finished_downloads");
     if (path === "/media/formats" && method === "POST") return invokeTimed("media_formats", body, FORMATS_TIMEOUT_MS);
     if (path === "/media/detected" && method === "GET") return invokeTimed("list_detected_media");
     const m = path.match(/^\/downloads\/(.+)\/(pause|resume|cancel)$/);
@@ -187,30 +185,26 @@ async function api(path, method = "GET", body) {
   return r.json();
 }
 // ---- Panels (Phase 9) ----
-// Views: dashboard, downloads (the list), detector, video, images, 3d,
-// queue, history (all filtered views over the same list), browser
-// (the pairing section). Filtered views reuse the Downloads section
-// and its table; only Dashboard and Media Detector have their own.
+// Views: dashboard, downloads (the list), detector, history (a
+// filtered view over the same list), browser (the pairing section).
+// Filtered views reuse the Downloads section and its table; only
+// Dashboard and Media Detector have their own. The Video/Images/3D/
+// Queue tabs were removed: the status filter on Downloads covers
+// them (Active/Queued/Completed/Failed/Paused) without splitting
+// the list across five near-identical tabs.
 let currentView = "downloads";
 let detectedItems = [];
 let detectedError = null;
+// Detector selections survive the 2s refresh: renderDetector()
+// rebuilds every row from scratch, which would destroy checkbox
+// state, so the selected URLs live here, not in the DOM.
+const detSelected = new Set();
 const EMPTY_TEXT = {
   downloads: "No downloads yet. Paste a link above.",
-  video: "No video downloads yet.",
-  images: "No image downloads yet.",
-  "3d": "No 3D downloads yet.",
-  queue: "Queue is empty.",
   history: "No completed or failed downloads yet.",
 };
-// 3D downloads carry category "3D" (Phase 7); the extension match
-// stays as a safety net for older records and direct adds.
-const THREE_D_EXT = /\.(glb|gltf|obj|fbx|stl|usdz)$/i;
 function viewFilter(d) {
   switch (currentView) {
-    case "video": return d.category === "Video" || d.stream_kind === "hls" || d.stream_kind === "dash";
-    case "images": return d.category === "Images";
-    case "3d": return d.category === "3D" || d.category === "Models" || THREE_D_EXT.test(d.filename);
-    case "queue": return d.status === "queued" || d.status === "downloading" || d.status === "paused";
     case "history": return d.status === "completed" || d.status === "failed" || d.status === "cancelled";
     default: return true;
   }
@@ -225,10 +219,10 @@ function showView(v) {
   document.getElementById("view-dashboard").hidden = v !== "dashboard";
   document.getElementById("view-detector").hidden = v !== "detector";
   document.getElementById("view-downloads").hidden =
-    !(v === "downloads" || v === "video" || v === "images" || v === "3d" || v === "queue" || v === "history");
+    !(v === "downloads" || v === "history");
   document.getElementById("pairBox").hidden = v !== "browser";
   // A stale status filter would hide everything in a filtered view
-  // (e.g. "Failed" on the Queue tab), so filtered views start at All.
+  // (e.g. "Queued" on the History tab), so filtered views start at All.
   // The search box is a deliberate user query and is left alone.
   if (v !== "downloads") document.getElementById("filter").value = "all";
   document.getElementById("empty").textContent = EMPTY_TEXT[v] || EMPTY_TEXT.downloads;
@@ -289,6 +283,10 @@ function renderDetector() {
   if (!detectedItems.length) {
     empty.textContent = "No media detected yet. Open a page with video or audio in a paired browser and it will appear here.";
   }
+  // Drop selections for items that are no longer detected (their
+  // page closed), so the Set does not keep stale URLs forever.
+  const live = new Set(detectedItems.map((item) => item.url));
+  for (const u of detSelected) { if (!live.has(u)) detSelected.delete(u); }
   for (const item of detectedItems) {
     const row = document.createElement("div");
     row.className = "det-row";
@@ -296,6 +294,25 @@ function renderDetector() {
     cb.type = "checkbox";
     cb.className = "det-check";
     cb.dataset.url = item.url;
+    // Restore from the Set: this row is rebuilt on every refresh,
+    // so DOM-only state would be lost within 2 seconds.
+    cb.checked = detSelected.has(item.url);
+    cb.onchange = () => {
+      if (cb.checked) detSelected.add(item.url); else detSelected.delete(item.url);
+    };
+    // Image thumbnails: the row shows what the image actually is, so
+    // the user can tell posters apart instead of guessing from a URL.
+    // A failed load hides the image (remote hosts often block
+    // hotlinking); the row still works without it.
+    let thumb = null;
+    if (item.kind === "image") {
+      thumb = document.createElement("img");
+      thumb.className = "det-thumb";
+      thumb.loading = "lazy";
+      thumb.src = item.url;
+      thumb.alt = "";
+      thumb.onerror = () => { thumb.hidden = true; };
+    }
     const info = document.createElement("div");
     info.className = "det-info";
     const title = document.createElement("div");
@@ -319,26 +336,35 @@ function renderDetector() {
     btn.className = "secondary";
     btn.textContent = "Download";
     btn.onclick = () => { addUrl(item.url, undefined); };
-    row.append(cb, info, btn);
+    row.append(cb);
+    if (thumb) row.appendChild(thumb);
+    row.append(info, btn);
     list.appendChild(row);
   }
 }
 document.getElementById("detSelectAllBtn").onclick = () => {
-  const boxes = document.querySelectorAll("#detList .det-check");
-  const allChecked = boxes.length > 0 && [...boxes].every((b) => b.checked);
-  boxes.forEach((b) => { b.checked = !allChecked; });
+  // Toggle on the Set, not the DOM: the next refresh rebuilds the
+  // rows, so DOM-only state would be lost within 2 seconds.
+  const urls = detectedItems.map((item) => item.url);
+  const allSelected = urls.length > 0 && urls.every((u) => detSelected.has(u));
+  if (allSelected) urls.forEach((u) => detSelected.delete(u));
+  else urls.forEach((u) => detSelected.add(u));
+  renderDetector();
 };
 document.getElementById("detDownloadBtn").onclick = async () => {
-  const boxes = [...document.querySelectorAll("#detList .det-check:checked")];
-  if (!boxes.length) { setError("Select at least one detected item first.", "action"); return; }
+  // Read from the Set, intersected with the current items, so a
+  // stale URL from a page that closed is never downloaded.
+  const urls = detectedItems.map((item) => item.url).filter((u) => detSelected.has(u));
+  if (!urls.length) { setError("Select at least one detected item first.", "action"); return; }
   const btn = document.getElementById("detDownloadBtn");
   setBusy(btn, true, "Adding…");
   let added = 0, failed = 0, firstError = "";
-  for (const b of boxes) {
+  for (const url of urls) {
     try {
       // Direct add, no picker: the Rust side auto-picks a quality for
       // a page URL, so a batch never opens the picker once per item.
-      await api("/downloads", "POST", { url: b.dataset.url });
+      await api("/downloads", "POST", { url });
+      detSelected.delete(url);
       added += 1;
     } catch (e) { failed += 1; if (!firstError) firstError = e.message; }
   }
@@ -347,7 +373,7 @@ document.getElementById("detDownloadBtn").onclick = async () => {
   // so reporting before it would be overwritten before the user reads it.
   await refresh();
   clearError();
-  setStatus("Added " + added + " of " + boxes.length + " selected."
+  setStatus("Added " + added + " of " + urls.length + " selected."
     + (failed ? " " + failed + " failed: " + firstError : ""));
 };
 async function refresh() {
@@ -368,6 +394,10 @@ async function refresh() {
       viewFilter(d) &&
       (f === "all" || d.status === f) &&
       (d.filename.toLowerCase().includes(q) || d.url.toLowerCase().includes(q)));
+    // Newest first: a download the user just added (from the app or
+    // the browser extension) appears at the top of the list, not at
+    // a random position among older rows.
+    rows.sort((a, b) => (b.created_unix || 0) - (a.created_unix || 0));
     renderDashboard(all);
     renderDetector();
     const tbody = document.getElementById("list");
@@ -417,6 +447,24 @@ document.getElementById("refreshBtn").onclick = async () => {
   const btn = document.getElementById("refreshBtn");
   setBusy(btn, true, "Refreshing…");
   try { await refresh(); } finally { setBusy(btn, false); }
+};
+// Clear finished: removes completed/failed/cancelled rows from the
+// list only. Downloaded files stay on disk, and active downloads
+// are never removed.
+document.getElementById("clearFinishedBtn").onclick = async () => {
+  if (!window.confirm("Clear finished downloads from the list? Downloaded files stay on disk.")) return;
+  const btn = document.getElementById("clearFinishedBtn");
+  setBusy(btn, true, "Clearing…");
+  try {
+    const r = await api("/downloads/clear-finished", "POST");
+    // Tauri returns the count directly; bridge mode returns {removed}.
+    const removed = typeof r === "number" ? r : (r && r.removed) || 0;
+    await refresh();
+    clearError();
+    setStatus("Cleared " + removed + " finished downloads. Files were not deleted.");
+  } catch (e) {
+    setError("Could not clear finished downloads: " + e.message, "action");
+  } finally { setBusy(btn, false); }
 };
 document.getElementById("search").oninput = refresh;
 document.getElementById("filter").onchange = refresh;

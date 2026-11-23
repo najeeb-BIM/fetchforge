@@ -367,6 +367,89 @@ fn fetch_text(
     resp.text().map_err(|e| reqwest_error(&e))
 }
 
+/// A segment-fetch failure, with the HTTP status and any
+/// `Retry-After` the server sent. The `message` is exactly what
+/// `fetch_bytes_range` has always returned (callers match on its
+/// text); `status` and `retry_after` are the structured facts the
+/// rate-limit handling needs — a 429 must back off and slow down,
+/// not just retry (see [`RateLimiter`]).
+struct SegmentFetchError {
+    message: String,
+    status: Option<u16>,
+    retry_after: Option<Duration>,
+}
+
+/// Parse a `Retry-After` header value: delay-seconds, or an
+/// HTTP-date (IMF-fixdate). Anything unparseable is None (the
+/// caller falls back to exponential backoff). Clamped to 60 s: a
+/// server that asks for an hour gets a minute — the run stays
+/// bounded by the stall watchdog, and a further 429 re-backs-off.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs.min(60)));
+    }
+    parse_http_date(value).map(|when| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO);
+        when.saturating_sub(now).min(Duration::from_secs(60))
+    })
+}
+
+/// Parse an IMF-fixdate ("Wed, 21 Oct 2015 07:28:00 GMT") into a
+/// duration since the Unix epoch. Only the IMF-fixdate form is
+/// supported (RFC 7231's preferred form, and what CDNs send);
+/// the obsolete RFC 850 / asctime forms return None.
+fn parse_http_date(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    let (_, rest) = value.split_once(", ")?;
+    let mut parts = rest.splitn(4, ' ');
+    let day: u64 = parts.next()?.parse().ok()?;
+    let month = match parts.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: u64 = parts.next()?.parse().ok()?;
+    if year < 1970 {
+        return None;
+    }
+    let time = parts.next()?;
+    let time = time.strip_suffix(" GMT").unwrap_or(time);
+    let mut t = time.split(':');
+    let hour: u64 = t.next()?.parse().ok()?;
+    let min: u64 = t.next()?.parse().ok()?;
+    let sec: u64 = t.next()?.parse().ok()?;
+    if !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    // Days since the epoch (Howard Hinnant's civil-from-days
+    // algorithm, inverted): valid for all realistic HTTP dates.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86400 + hour * 3600 + min * 60 + sec;
+    Some(Duration::from_secs(secs))
+}
+
 /// Fetch bytes, optionally a single inclusive byte range
 /// (DASH SegmentList `@mediaRange`). A 206 response is used as-is;
 /// a 200 response (server ignored the Range header) is sliced to
@@ -374,22 +457,50 @@ fn fetch_text(
 /// passes the download's shared client (see [`hls_client`]); a
 /// fresh client per segment is exactly the anti-pattern that
 /// starved Atlantic's CDN of warm connections.
-fn fetch_bytes_range(
+///
+/// On an HTTP error the returned [`SegmentFetchError`] carries
+/// the status and any `Retry-After` header (429s only in
+/// practice); the message is the same text `fetch_bytes_range`
+/// has always produced.
+fn fetch_segment(
     client: &reqwest::blocking::Client,
     url: &str,
     range: Option<(u64, u64)>,
     referer: &Option<String>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, SegmentFetchError> {
     let mut req = browser_headers(client.get(url), referer);
     if let Some((start, end)) = range {
         req = req.header("Range", format!("bytes={start}-{end}"));
     }
-    let resp = req.send().map_err(|e| reqwest_error(&e))?;
+    let resp = req.send().map_err(|e| SegmentFetchError {
+        message: reqwest_error(&e),
+        status: None,
+        retry_after: None,
+    })?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!("Segment request failed: HTTP {status}"));
+        let retry_after = if status.as_u16() == 429 {
+            resp.headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_retry_after)
+        } else {
+            None
+        };
+        return Err(SegmentFetchError {
+            message: format!("Segment request failed: HTTP {status}"),
+            status: Some(status.as_u16()),
+            retry_after,
+        });
     }
-    let bytes = resp.bytes().map(|b| b.to_vec()).map_err(|e| reqwest_error(&e))?;
+    let bytes = resp
+        .bytes()
+        .map(|b| b.to_vec())
+        .map_err(|e| SegmentFetchError {
+            message: reqwest_error(&e),
+            status: Some(status.as_u16()),
+            retry_after: None,
+        })?;
     match range {
         None => Ok(bytes),
         Some((start, end)) => {
@@ -400,15 +511,29 @@ fn fetch_bytes_range(
                 let start = start as usize;
                 let end = end as usize;
                 if bytes.len() <= end {
-                    return Err(
-                        "Segment range request returned a short body; the server may not support Range requests."
+                    return Err(SegmentFetchError {
+                        message: "Segment range request returned a short body; the server may not support Range requests."
                             .to_string(),
-                    );
+                        status: Some(status.as_u16()),
+                        retry_after: None,
+                    });
                 }
                 Ok(bytes[start..=end].to_vec())
             }
         }
     }
+}
+
+/// [`fetch_segment`] with the error reduced to its message, for
+/// callers that do not handle rate limits (the legacy sequential
+/// path, the mp4 probe). The message text is unchanged.
+fn fetch_bytes_range(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    range: Option<(u64, u64)>,
+    referer: &Option<String>,
+) -> Result<Vec<u8>, String> {
+    fetch_segment(client, url, range, referer).map_err(|e| e.message)
 }
 
 fn resolve(base: &str, rel: &str) -> String {
@@ -807,6 +932,204 @@ fn should_retry_segment(attempt: usize, downloaded_so_far: u64, err: &str) -> bo
     attempt < 2
 }
 
+/// Is this segment-fetch failure an HTTP 429 (rate limit)? The
+/// server is telling us to slow down, not that the segment is
+/// gone — it gets backoff + throttling, never the fail-fast or
+/// the plain retry.
+fn is_rate_limit_fetch(err: &SegmentFetchError) -> bool {
+    err.status == Some(429)
+}
+
+/// Is this download error a 429 segment failure (the form
+/// `download_segments` returns)? The fallback gate in
+/// [`download_segments`]: a 429 gets the throttled rescue pass,
+/// a timeout gets the plain sequential pass, anything else fails
+/// at once.
+fn is_rate_limit_error(err: &str, paused: &AtomicBool, cancelled: &AtomicBool) -> bool {
+    if paused.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
+        return false;
+    }
+    if err == "__PAUSED__" || err == "__CANCELLED__" {
+        return false;
+    }
+    err.starts_with("Segment ") && err.contains("HTTP 429")
+}
+
+/// Backoff before retrying a 429'd segment (`attempt` is 0-based,
+/// per segment — a shared backoff step would let one burst of 4
+/// simultaneous 429s escalate the wait 4×): the server's
+/// `Retry-After` when it sent one, else exponential 5s → 10s →
+/// 20s → 40s → 60s (capped). A 429 is a rate limit, not a dead
+/// server — the wait is what makes the retry succeed.
+fn rate_limit_backoff(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    if let Some(d) = retry_after {
+        return d.min(Duration::from_secs(60));
+    }
+    Duration::from_secs(5u64.saturating_mul(2u64.saturating_pow(attempt.min(4) as u32)))
+        .min(Duration::from_secs(60))
+}
+
+/// Sleep that a pause/cancel can interrupt (checks every 100 ms):
+/// a 60 s backoff must not ignore the user's Cancel for a minute.
+/// Returns false when interrupted.
+fn sleep_interruptible(dur: Duration, paused: &AtomicBool, cancelled: &AtomicBool) -> bool {
+    let deadline = Instant::now() + dur;
+    loop {
+        if paused.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(100)));
+    }
+}
+
+/// How many consecutive 429s (no successful segment between) end
+/// a pass: the server is clamped down, not merely busy. Five is
+/// the bound the 2026-11-23 nime evidence supports — the audio
+/// phase 429'd after ~120 segments per run, so a pass that cannot
+/// land one segment in five tries is not going to recover by
+/// hammering. A resume starts a fresh budget.
+const RATE_LIMIT_MAX_CONSECUTIVE_429: u32 = 5;
+
+/// First inter-request delay in the throttled pass (250 ms ≈ 4
+/// requests/sec), and its cap (2 s ≈ 0.5 requests/sec). The delay
+/// doubles on each 429 in the throttled pass until it reaches the
+/// cap — it adapts to whatever the server's limit is, instead of
+/// assuming one magic rate.
+const RATE_LIMIT_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(2);
+
+/// Rate-limit state shared by one `download_segments` call (one
+/// phase: one HLS variant, or one DASH video/audio phase) across
+/// its parallel pass and its throttled rescue pass. The video and
+/// audio phases of a DASH download each get their own limiter —
+/// the phase that 429s throttles from its first 429, which is
+/// what the nime evidence needs (the video phase never 429'd).
+///
+/// The limiter is deliberately small: pacing (a shared
+/// next-request slot), the last `Retry-After` (the rescue pass's
+/// initial backoff), and the consecutive-429 count (the failure
+/// bound). Backoff itself is per-segment-attempt (see
+/// [`rate_limit_backoff`]) — a shared backoff step would let one
+/// burst of 4 simultaneous 429s escalate the wait 4×.
+struct RateLimiter {
+    state: Mutex<RateLimiterState>,
+}
+
+struct RateLimiterState {
+    /// Pacing on? Only in the throttled rescue pass; the parallel
+    /// pass runs unpaced (a single 429 blip must not slow a whole
+    /// download — the in-loop backoff handles blips).
+    pacing: bool,
+    /// Current inter-request delay (zero while unpaced).
+    delay: Duration,
+    /// Earliest start of the next request (pacing slot).
+    next_allowed: Instant,
+    /// Last `Retry-After` any 429 carried (the rescue pass's
+    /// initial backoff); None means the 5 s default.
+    last_retry_after: Option<Duration>,
+    /// 429s since the last successful segment.
+    consecutive_429s: u32,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        RateLimiter {
+            state: Mutex::new(RateLimiterState {
+                pacing: false,
+                delay: Duration::ZERO,
+                next_allowed: Instant::now(),
+                last_retry_after: None,
+                consecutive_429s: 0,
+            }),
+        }
+    }
+
+    /// Is this limiter in the throttled rescue pass?
+    fn is_throttled(&self) -> bool {
+        self.state.lock().unwrap().pacing
+    }
+
+    /// Record a 429: remember its `Retry-After` and count it.
+    /// Returns the new consecutive count (the caller fails the
+    /// pass at [`RATE_LIMIT_MAX_CONSECUTIVE_429`]).
+    fn note_429(&self, retry_after: Option<Duration>) -> u32 {
+        let mut s = self.state.lock().unwrap();
+        if retry_after.is_some() {
+            s.last_retry_after = retry_after;
+        }
+        s.consecutive_429s += 1;
+        s.consecutive_429s
+    }
+
+    /// Record a successful segment: the 429 streak is over.
+    /// (The delay is NOT reset — once throttled, a download stays
+    /// throttled for the rest of the pass.)
+    fn note_success(&self) {
+        self.state.lock().unwrap().consecutive_429s = 0;
+    }
+
+    /// How long the rescue pass waits before its first request:
+    /// the last `Retry-After` the parallel pass saw, else 5 s.
+    fn initial_backoff(&self) -> Duration {
+        self.state
+            .lock()
+            .unwrap()
+            .last_retry_after
+            .unwrap_or(Duration::from_secs(5))
+            .min(Duration::from_secs(60))
+    }
+
+    /// Switch to the throttled rescue pass: pacing on at the
+    /// initial delay, with a FRESH 429 budget — the mode switch
+    /// (1 worker + pacing + initial backoff) is itself the
+    /// response to the parallel pass's 429s, so they must not
+    /// count against the rescue.
+    fn begin_throttled_pass(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.pacing = true;
+        s.delay = RATE_LIMIT_INITIAL_DELAY;
+        s.next_allowed = Instant::now();
+        s.consecutive_429s = 0;
+    }
+
+    /// In the throttled pass, a 429 proves the current delay is
+    /// still too short: double it (capped). No-op while unpaced.
+    fn escalate_delay(&self) {
+        let mut s = self.state.lock().unwrap();
+        if s.pacing {
+            s.delay = (s.delay * 2).min(RATE_LIMIT_MAX_DELAY);
+        }
+    }
+
+    /// Pacing: wait until this request's slot, then book the next
+    /// slot one delay later. With 1 worker this is just "one
+    /// request per delay"; the shared slot is what would serialize
+    /// several workers. No-op while unpaced. Returns false when
+    /// pause/cancel interrupted the wait.
+    fn wait_before_request(&self, paused: &AtomicBool, cancelled: &AtomicBool) -> bool {
+        let slot = {
+            let mut s = self.state.lock().unwrap();
+            if !s.pacing || s.delay.is_zero() {
+                return true;
+            }
+            let now = Instant::now();
+            let slot = s.next_allowed.max(now);
+            s.next_allowed = slot + s.delay;
+            slot
+        };
+        let now = Instant::now();
+        if slot > now {
+            sleep_interruptible(slot - now, paused, cancelled)
+        } else {
+            true
+        }
+    }
+}
+
 /// Stall watchdog for segment downloads: no completed segment for
 /// `timeout` means the stream is dead — seen 2026-11-22 as a
 /// paired HLS download sitting at 0% for 5+ minutes with no
@@ -903,7 +1226,8 @@ fn write_seg_meta(seg_dir: &Path, segments: &[Segment]) {
 /// Parallelism (study §A5): `workers` workers pull
 /// segment indices from a shared counter, each fetching its
 /// segment with the same 3-attempt retry rule as the old
-/// sequential engine, writing it to its own file in the segment
+/// sequential engine (5 attempts for HTTP 429, with backoff —
+/// see [`RateLimiter`]), writing it to its own file in the segment
 /// dir (`<part>.seg/NNNNNN.seg`, via a `.tmp` + atomic rename, so
 /// a file's existence means the segment is complete). When every
 /// segment is on disk the files are concatenated in playlist
@@ -912,7 +1236,8 @@ fn write_seg_meta(seg_dir: &Path, segments: &[Segment]) {
 /// carry the segment counts and the running size estimate (see
 /// [`estimate_total_bytes`]). With `workers == 1` this is the
 /// round-7 sequential fallback: same code, same segment dir, one
-/// connection at a time.
+/// connection at a time; the 429 rescue pass additionally paces
+/// its requests through the limiter (see [`download_segments`]).
 ///
 /// Resume: a segment dir whose meta still matches the manifest
 /// (same count, same first segment) keeps its completed pieces;
@@ -938,6 +1263,16 @@ fn write_seg_meta(seg_dir: &Path, segments: &[Segment]) {
 /// sentinels the workers understand; cancel deletes the part
 /// file, the segment dir and the sidecar, pause keeps everything
 /// for resume.
+///
+/// Two rescue passes: a parallel run that fails a segment on a
+/// TIMEOUT gets one plain sequential retry (Fix 8 — a CDN
+/// throttling concurrency); a run that fails on HTTP 429 gets one
+/// THROTTLED sequential retry (1 worker, paced requests, adaptive
+/// delay — see [`RateLimiter`]). A 429 is a rate limit, not a
+/// concurrency limit: sequential alone, at ~20 requests/sec on
+/// tiny segments, would 429 again. Both rescues reuse the same
+/// segment dir, so landed pieces are never re-fetched, and if a
+/// rescue also fails the ORIGINAL error stands.
 #[allow(clippy::too_many_arguments)]
 fn download_segments(
     client: &reqwest::blocking::Client,
@@ -974,6 +1309,7 @@ fn download_segments(
             stall_timeout,
         );
     }
+    let limiter = RateLimiter::new();
     match download_segments_parallel(
         client,
         segments,
@@ -985,6 +1321,7 @@ fn download_segments(
         cancelled,
         stall_timeout,
         HLS_SEGMENT_WORKERS,
+        &limiter,
     ) {
         Ok(n) => Ok(n),
         Err(e) if should_fallback_sequential(&e, paused, cancelled) => {
@@ -1013,6 +1350,39 @@ fn download_segments(
                 cancelled,
                 stall_timeout,
                 1,
+                &limiter,
+            ) {
+                Ok(n) => Ok(n),
+                Err(_) => Err(e),
+            }
+        }
+        Err(e) if is_rate_limit_error(&e, paused, cancelled) => {
+            // Round 7 follow-up: the parallel pass failed on HTTP
+            // 429 — the server is rate-limiting REQUESTS, not
+            // connections (nime DASH audio, 2026-11-23: 2,116 tiny
+            // audio segments at 4 parallel workers made ~40-80
+            // requests/sec and 429'd after ~120, while the video
+            // phase's big segments never did). One more worker
+            // would not help; slowing down does. The rescue pass
+            // runs 1 worker, paced (250 ms between requests,
+            // doubling on each further 429 to a 2 s cap), after an
+            // initial backoff from the last Retry-After (or 5 s).
+            // It reuses the same segment dir, so pieces the
+            // parallel pass landed are not re-fetched. If the
+            // rescue also fails, the ORIGINAL 429 error stands.
+            limiter.begin_throttled_pass();
+            match download_segments_parallel(
+                client,
+                segments,
+                part_path,
+                referer,
+                progress_base,
+                progress,
+                paused,
+                cancelled,
+                stall_timeout,
+                1,
+                &limiter,
             ) {
                 Ok(n) => Ok(n),
                 Err(_) => Err(e),
@@ -1054,6 +1424,7 @@ fn download_segments_parallel(
     cancelled: &AtomicBool,
     stall_timeout: Duration,
     workers: usize,
+    limiter: &RateLimiter,
 ) -> Result<u64, String> {
     let total = segments.len() as u64;
     let seg_dir = seg_dir_for(part_path);
@@ -1076,6 +1447,21 @@ fn download_segments_parallel(
             resumed_done += 1;
             resumed_bytes += meta.len();
         }
+    }
+    // Throttled rescue pass (see download_segments): wait out the
+    // last Retry-After (or 5 s) before the first request — the
+    // server just told us to slow down, and the rescue's first
+    // request must not land in the same rate-limit window. Before
+    // any clock starts, so the wait never trips the stall
+    // watchdog.
+    if limiter.is_throttled() && !sleep_interruptible(limiter.initial_backoff(), paused, cancelled)
+    {
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = std::fs::remove_file(part_path);
+            let _ = std::fs::remove_dir_all(&seg_dir);
+            return Err("__CANCELLED__".to_string());
+        }
+        return Err("__PAUSED__".to_string());
     }
     let started = Instant::now();
     let next = AtomicUsize::new(0);
@@ -1160,10 +1546,13 @@ fn download_segments_parallel(
                 // Retry transient failures; a timeout at 0 bytes
                 // fails fast (see should_retry_segment) — the
                 // shared counter is what "0 bytes" means here.
+                // 429s get 5 attempts (the rate-limit budget —
+                // see RateLimiter); everything else keeps 3 (the
+                // retry gate below breaks earlier for non-429s).
                 let mut bytes = None;
                 let mut last_err = String::new();
                 let mut attempts = 0;
-                for attempt in 0..3 {
+                for attempt in 0..5 {
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
@@ -1186,24 +1575,58 @@ fn download_segments_parallel(
                         stop.store(true, Ordering::Relaxed);
                         return;
                     }
+                    // Pacing (throttled rescue pass only): one
+                    // request per delay, across all workers.
+                    if !limiter.wait_before_request(paused, cancelled) {
+                        stop.store(true, Ordering::Relaxed);
+                        return;
+                    }
                     attempts = attempt + 1;
-                    match fetch_bytes_range(&client, &seg.url, seg.range, referer) {
+                    match fetch_segment(&client, &seg.url, seg.range, referer) {
                         Ok(b) => {
+                            limiter.note_success();
                             bytes = Some(b);
                             break;
                         }
                         Err(e) => {
-                            last_err = e;
-                            if !should_retry_segment(
-                                attempt,
-                                downloaded.load(Ordering::Relaxed),
-                                &last_err,
-                            ) {
-                                break;
+                            last_err = e.message.clone();
+                            if is_rate_limit_fetch(&e) {
+                                // HTTP 429: back off (the server's
+                                // Retry-After, else exponential)
+                                // and — in the throttled pass —
+                                // slow the whole download down.
+                                // Five consecutive 429s with no
+                                // success between end the pass:
+                                // the server is clamped, and
+                                // hammering only extends the ban.
+                                let consecutive =
+                                    limiter.note_429(e.retry_after);
+                                limiter.escalate_delay();
+                                if consecutive >= RATE_LIMIT_MAX_CONSECUTIVE_429
+                                    || attempt >= 4
+                                {
+                                    break;
+                                }
+                                if !sleep_interruptible(
+                                    rate_limit_backoff(attempt, e.retry_after),
+                                    paused,
+                                    cancelled,
+                                ) {
+                                    stop.store(true, Ordering::Relaxed);
+                                    return;
+                                }
+                            } else {
+                                if !should_retry_segment(
+                                    attempt,
+                                    downloaded.load(Ordering::Relaxed),
+                                    &last_err,
+                                ) {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(
+                                    500 * (attempt + 1) as u64,
+                                ));
                             }
-                            std::thread::sleep(Duration::from_millis(
-                                500 * (attempt + 1) as u64,
-                            ));
                         }
                     }
                 }
@@ -4908,6 +5331,550 @@ mod tests {
             &paused,
             &cancelled
         ));
+    }
+
+    #[test]
+    fn is_rate_limit_error_gates_on_429_segment_failures() {
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        assert!(is_rate_limit_error(
+            "Segment 121 of 2117 could not be downloaded after 3 tries. (Segment request failed: HTTP 429 Too Many Requests)",
+            &paused,
+            &cancelled
+        ));
+        assert!(!is_rate_limit_error(
+            "Segment 1 of 8 could not be downloaded after 3 tries. (Segment request failed: HTTP 404 Not Found)",
+            &paused,
+            &cancelled
+        ));
+        assert!(!is_rate_limit_error(
+            "Segment 2 of 1730 could not be downloaded after 1 try. (error decoding response body: operation timed out)",
+            &paused,
+            &cancelled
+        ));
+        assert!(!is_rate_limit_error("__PAUSED__", &paused, &cancelled));
+        paused.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(!is_rate_limit_error(
+            "Segment 1 of 8 could not be downloaded after 3 tries. (HTTP 429)",
+            &paused,
+            &cancelled
+        ));
+    }
+
+    #[test]
+    fn parse_retry_after_seconds_and_dates() {
+        assert_eq!(parse_retry_after("5"), Some(Duration::from_secs(5)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
+        // Clamped: a server that asks for an hour gets a minute.
+        assert_eq!(parse_retry_after("3600"), Some(Duration::from_secs(60)));
+        assert_eq!(parse_retry_after("garbage"), None);
+        assert_eq!(parse_retry_after(""), None);
+        // HTTP-date in the past: no wait.
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(Duration::ZERO)
+        );
+        // HTTP-date far in the future: the delta, clamped to 60 s.
+        assert_eq!(
+            parse_retry_after("Wed, 18 May 2033 03:33:20 GMT"),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn parse_http_date_known_values() {
+        // 2015-10-21 07:28:00 UTC (verified with date(1)).
+        assert_eq!(
+            parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(Duration::from_secs(1_445_412_480))
+        );
+        assert_eq!(parse_http_date("not a date"), None);
+        assert_eq!(parse_http_date("Wed, 32 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(parse_http_date("Wed, 21 Foo 2015 07:28:00 GMT"), None);
+        assert_eq!(parse_http_date("Wed, 21 Oct 1969 07:28:00 GMT"), None);
+    }
+
+    #[test]
+    fn rate_limit_backoff_is_exponential_and_capped() {
+        assert_eq!(rate_limit_backoff(0, None), Duration::from_secs(5));
+        assert_eq!(rate_limit_backoff(1, None), Duration::from_secs(10));
+        assert_eq!(rate_limit_backoff(2, None), Duration::from_secs(20));
+        assert_eq!(rate_limit_backoff(3, None), Duration::from_secs(40));
+        assert_eq!(rate_limit_backoff(4, None), Duration::from_secs(60));
+        assert_eq!(rate_limit_backoff(9, None), Duration::from_secs(60));
+        assert_eq!(
+            rate_limit_backoff(0, Some(Duration::from_secs(2))),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            rate_limit_backoff(0, Some(Duration::from_secs(3600))),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn rate_limiter_delay_doubles_to_cap_and_only_when_throttled() {
+        let limiter = RateLimiter::new();
+        // Unpaced: escalations are no-ops (the parallel pass never
+        // paces, however many 429s it sees).
+        limiter.escalate_delay();
+        assert!(limiter.state.lock().unwrap().delay.is_zero());
+        limiter.begin_throttled_pass();
+        assert_eq!(
+            limiter.state.lock().unwrap().delay,
+            Duration::from_millis(250)
+        );
+        limiter.escalate_delay();
+        assert_eq!(
+            limiter.state.lock().unwrap().delay,
+            Duration::from_millis(500)
+        );
+        limiter.escalate_delay();
+        assert_eq!(limiter.state.lock().unwrap().delay, Duration::from_secs(1));
+        limiter.escalate_delay();
+        assert_eq!(limiter.state.lock().unwrap().delay, Duration::from_secs(2));
+        limiter.escalate_delay();
+        assert_eq!(
+            limiter.state.lock().unwrap().delay,
+            Duration::from_secs(2),
+            "the delay caps at 2 s"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_counts_consecutive_429s_and_resets() {
+        let limiter = RateLimiter::new();
+        assert_eq!(limiter.initial_backoff(), Duration::from_secs(5));
+        assert_eq!(limiter.note_429(None), 1);
+        assert_eq!(limiter.note_429(Some(Duration::from_secs(2))), 2);
+        assert_eq!(limiter.initial_backoff(), Duration::from_secs(2));
+        // A success resets the streak (but keeps the last
+        // Retry-After — the rescue's initial backoff still uses
+        // the freshest value the server sent).
+        limiter.note_success();
+        assert_eq!(limiter.note_429(None), 1);
+        assert_eq!(limiter.initial_backoff(), Duration::from_secs(2));
+        // The rescue pass starts with a fresh budget.
+        limiter.note_429(None);
+        limiter.begin_throttled_pass();
+        assert_eq!(limiter.note_429(None), 1);
+    }
+
+    /// Loopback server for rate-limit tests: answers 429 to the
+    /// first `n429` requests (with `retry_after` as the
+    /// `Retry-After` header value when Some), then serves `files`
+    /// (404 for unknown paths). Records (path, arrival time,
+    /// status) per request in `hits`, so tests can assert on
+    /// backoff waits and pacing gaps.
+    fn serve_429_first_n(
+        files: HashMap<String, Vec<u8>>,
+        n429: usize,
+        retry_after: Option<String>,
+        hits: std::sync::Arc<Mutex<Vec<(String, Instant, u16)>>>,
+        stop: std::sync::Arc<AtomicBool>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let files = std::sync::Arc::new(files);
+        let handle = std::thread::spawn(move || loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let files = files.clone();
+                    let hits = hits.clone();
+                    let retry_after = retry_after.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 8192];
+                        let len = stream.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..len]).to_string();
+                        let path = req
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/")
+                            .to_string();
+                        let at = Instant::now();
+                        if n < n429 {
+                            hits.lock().unwrap().push((path, at, 429));
+                            let ra = retry_after
+                                .map(|v| format!("Retry-After: {v}\r\n"))
+                                .unwrap_or_default();
+                            let _ = stream.write_all(
+                                format!(
+                                    "HTTP/1.1 429 Too Many Requests\r\n{ra}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                                )
+                                .as_bytes(),
+                            );
+                        } else if let Some(body) = files.get(&path) {
+                            hits.lock().unwrap().push((path, at, 200));
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(body);
+                        } else {
+                            hits.lock().unwrap().push((path, at, 404));
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                        let _ = stream.flush();
+                    });
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn rate_limit_429_then_serve_completes_after_backoff() {
+        // Round 7 follow-up: a 429 blip (no Retry-After) is
+        // retried after the default 5 s backoff, and the download
+        // completes — the 429 must not fail a download that the
+        // server will serve a moment later.
+        let bodies: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("SEGMENT-{i}-").repeat(2).into_bytes())
+            .collect();
+        let mut files = HashMap::new();
+        for (i, b) in bodies.iter().enumerate() {
+            files.insert(format!("/seg{i}.ts"), b.clone());
+        }
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_429_first_n(files, 4, None, hits.clone(), stop.clone());
+        let segments: Vec<Segment> = (0..8)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
+                range: None,
+            })
+            .collect();
+        let expected: Vec<u8> = bodies.concat();
+        let client = hls_client().unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let dir = unique_temp_dir("seg-429-backoff");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let start = Instant::now();
+        let n = download_segments(
+            &client,
+            &segments,
+            &part,
+            &None,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .expect("a 429 blip must not fail the download");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(n as usize, expected.len());
+        assert_eq!(std::fs::read(&part).unwrap(), expected);
+        // Bind the guard once: locking twice in one assert deadlocks.
+        let hits = hits.lock().unwrap();
+        let n429 = hits.iter().filter(|h| h.2 == 429).count();
+        let n200 = hits.iter().filter(|h| h.2 == 200).count();
+        assert_eq!(n429, 4, "hits: {hits:?}");
+        assert_eq!(n200, 8, "hits: {hits:?}");
+        // The retries waited out the 5 s default backoff: the last
+        // request lands ~5 s after the first (4.5 s floor allows
+        // scheduling jitter; a missing backoff would finish in ms).
+        let first = hits.iter().map(|h| h.1).min().unwrap();
+        let last = hits.iter().map(|h| h.1).max().unwrap();
+        assert!(
+            last - first >= Duration::from_millis(4500),
+            "no 5 s backoff visible: span {:?}",
+            last - first
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "429 recovery took {:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rate_limit_retry_after_header_is_honoured() {
+        // The server's Retry-After (1 s) replaces the default 5 s
+        // backoff: the whole download finishes in ~1 s, not ~5 s.
+        let bodies: Vec<Vec<u8>> = (0..4)
+            .map(|i| format!("SEGMENT-{i}-").repeat(2).into_bytes())
+            .collect();
+        let mut files = HashMap::new();
+        for (i, b) in bodies.iter().enumerate() {
+            files.insert(format!("/seg{i}.ts"), b.clone());
+        }
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) =
+            serve_429_first_n(files, 2, Some("1".to_string()), hits.clone(), stop.clone());
+        let segments: Vec<Segment> = (0..4)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
+                range: None,
+            })
+            .collect();
+        let expected: Vec<u8> = bodies.concat();
+        let client = hls_client().unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let dir = unique_temp_dir("seg-429-retry-after");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let n = download_segments(
+            &client,
+            &segments,
+            &part,
+            &None,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .expect("a Retry-After 429 must not fail the download");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(n as usize, expected.len());
+        assert_eq!(std::fs::read(&part).unwrap(), expected);
+        // Bind the guard once: locking twice in one assert deadlocks.
+        let hits = hits.lock().unwrap();
+        let n429 = hits.iter().filter(|h| h.2 == 429).count();
+        let n200 = hits.iter().filter(|h| h.2 == 200).count();
+        assert_eq!(n429, 2, "hits: {hits:?}");
+        assert_eq!(n200, 4, "hits: {hits:?}");
+        // The retries waited ~1 s (the Retry-After), not ~5 s (the
+        // default): the span from the first to the last request is
+        // at least 0.8 s (a wait happened) and under 4 s (the
+        // default backoff would put it at ~5 s).
+        let first = hits.iter().map(|h| h.1).min().unwrap();
+        let last = hits.iter().map(|h| h.1).max().unwrap();
+        let span = last - first;
+        assert!(
+            span >= Duration::from_millis(800) && span < Duration::from_secs(4),
+            "Retry-After: 1 was not honoured: span {span:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Loopback server for the rescue test: answers 429 to every
+    /// request until `until`, then serves `files`. The time window
+    /// (not a request count) is what makes the parallel pass fail
+    /// deterministically — a count-based stub lets a retry serve
+    /// and reset the consecutive-429 counter before the budget
+    /// trips, so the parallel pass can succeed via in-loop
+    /// retries and the rescue never runs.
+    fn serve_429_until(
+        files: HashMap<String, Vec<u8>>,
+        until: Instant,
+        hits: std::sync::Arc<Mutex<Vec<(String, Instant, u16)>>>,
+        stop: std::sync::Arc<AtomicBool>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let files = std::sync::Arc::new(files);
+        let handle = std::thread::spawn(move || loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let files = files.clone();
+                    let hits = hits.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 8192];
+                        let len = stream.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..len]).to_string();
+                        let path = req
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/")
+                            .to_string();
+                        let at = Instant::now();
+                        if at < until {
+                            hits.lock().unwrap().push((path, at, 429));
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        } else if let Some(body) = files.get(&path) {
+                            hits.lock().unwrap().push((path, at, 200));
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(body);
+                        } else {
+                            hits.lock().unwrap().push((path, at, 404));
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                        let _ = stream.flush();
+                    });
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn rate_limit_sustained_429_falls_back_to_throttled_pass() {
+        // Sustained 429s exhaust the parallel pass (the 5-streak
+        // budget), and the throttled rescue (1 worker, paced)
+        // completes the download once the server starts serving.
+        // The serves in the rescue pass must be spaced by the
+        // pacing delay (250 ms), not fired in a burst.
+        let bodies: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("SEGMENT-{i}-").repeat(2).into_bytes())
+            .collect();
+        let mut files = HashMap::new();
+        for (i, b) in bodies.iter().enumerate() {
+            files.insert(format!("/seg{i}.ts"), b.clone());
+        }
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        // 429 for the first 8 s: the parallel pass's retries (at
+        // ~5 s) still 429, so the budget trips and the pass fails
+        // deterministically. The rescue's 5 s initial backoff ends
+        // after the window, so its requests serve.
+        let until = Instant::now() + Duration::from_secs(8);
+        let (port, server) = serve_429_until(files, until, hits.clone(), stop.clone());
+        let segments: Vec<Segment> = (0..8)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
+                range: None,
+            })
+            .collect();
+        let expected: Vec<u8> = bodies.concat();
+        let client = hls_client().unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let dir = unique_temp_dir("seg-429-rescue");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let start = Instant::now();
+        let n = download_segments(
+            &client,
+            &segments,
+            &part,
+            &None,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .expect("the throttled rescue must complete the download");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(n as usize, expected.len());
+        assert_eq!(std::fs::read(&part).unwrap(), expected);
+        // Bind the guard once: locking twice in one assert deadlocks.
+        let hits = hits.lock().unwrap();
+        let n429 = hits.iter().filter(|h| h.2 == 429).count();
+        let n200 = hits.iter().filter(|h| h.2 == 200).count();
+        assert!(n429 >= 5, "the parallel pass never hit 429s: {hits:?}");
+        assert_eq!(n200, 8, "each segment served exactly once: {hits:?}");
+        // Pacing proof: the serves (all in the rescue pass — the
+        // parallel pass got only 429s) are spaced by the 250 ms
+        // delay (200 ms floor allows scheduling jitter). A burst
+        // would show sub-millisecond gaps.
+        let mut serve_times: Vec<Instant> =
+            hits.iter().filter(|h| h.2 == 200).map(|h| h.1).collect();
+        serve_times.sort();
+        for pair in serve_times.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= Duration::from_millis(200),
+                "rescue serves not paced: gaps {:?}",
+                serve_times
+                    .windows(2)
+                    .map(|p| p[1] - p[0])
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "throttled rescue took {:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rate_limit_429_forever_fails_bounded_with_429_error() {
+        // A server that 429s every request (with Retry-After: 0,
+        // so the backoffs stay short in the test) must fail the
+        // record with the real 429 error after the bounded budget
+        // — not loop forever, and not collapse into a stall error.
+        let mut files = HashMap::new();
+        files.insert("/seg0.ts".to_string(), b"SEGMENT".to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_429_first_n(
+            files,
+            usize::MAX,
+            Some("0".to_string()),
+            hits.clone(),
+            stop.clone(),
+        );
+        let segments = vec![Segment {
+            url: format!("http://127.0.0.1:{port}/seg0.ts"),
+            range: None,
+        }];
+        let client = hls_client().unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let dir = unique_temp_dir("seg-429-forever");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let start = Instant::now();
+        let err = download_segments(
+            &client,
+            &segments,
+            &part,
+            &None,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .unwrap_err();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(err.contains("HTTP 429"), "error: {err}");
+        assert!(err.contains("after 5 tries"), "error: {err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "bounded failure took {:?}",
+            start.elapsed()
+        );
+        // 5 attempts in the parallel pass + 5 in the rescue pass:
+        // the budget bounds the request count (no unbounded loop).
+        // Bind the guard once: locking twice in one assert deadlocks.
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.len(), 10, "hits: {hits:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

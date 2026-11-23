@@ -7,7 +7,9 @@ findings from the same morning's live evidence. Every fix below is
 grounded in that evidence, not guessed. Extension version 0.2.6.
 
 Baseline before round 7: `cargo test --workspace` 152 passed,
-0 failed. After round 7: 165 passed, 0 failed (see §12).
+0 failed. After round 7: 165 passed, 0 failed (see §12). A
+follow-up the same morning (§14, 429 backoff + throttling) took
+it to 175 passed, 0 failed.
 
 ## 1. Fix 1 — the native host never worked (highest priority)
 
@@ -311,10 +313,14 @@ estimate gives 93%, normal cases unchanged.
 
 ## 12. Tests
 
-- `cargo test --workspace`: 165 passed, 0 failed (baseline 152).
-  New (13): Fix 1+2 integration tests (4), Fix 3 (2), Fix 5 engine
-  (1), Fix 8 (3), Finding A (2), Finding B engine (1). Full suite
-  runs in ~31s.
+- `cargo test --workspace`: 175 passed, 0 failed (baseline 152;
+  165 after round 7, +10 in the §14 follow-up). New in round 7
+  (13): Fix 1+2 integration tests (4), Fix 3 (2), Fix 5 engine
+  (1), Fix 8 (3), Finding A (2), Finding B engine (1). New in
+  the §14 follow-up (10): 429 integration tests (4), Retry-After
+  / backoff / limiter / gate unit tests (6). Full suite still
+  runs in ~30s (the 429 tests' real-backoff sleeps overlap with
+  other tests running in parallel).
 - Test-harness bug found and fixed during this round (not a product
   bug): `assert_eq!(hits.lock().unwrap().len(), N, "hits: {:?}",
   hits.lock().unwrap())` deadlocks when the assertion fails — the
@@ -349,3 +355,78 @@ estimate gives 93%, normal cases unchanged.
   against a real multi-phase failure.
 - The atlantic hypothesis (CDN throttling concurrency) is still a
   hypothesis — the fallback is the test, not the proof.
+
+## 14. Follow-up — HTTP 429 backoff + throttling (same day)
+
+**Evidence.** After round 7 was committed, the nime DASH download
+failed a THIRD time with HTTP 429, and the parent pulled the mpd:
+the audio adaptation set has 2,116 segments (5 s each, ~80 KB),
+the video 1,767 (6 s each, ~1.3 MB). Each app run fetched ~120
+audio segments then 429'd. The video phase (1,768 requests, 4
+parallel workers) NEVER 429'd. Diagnosis: the limit is REQUEST
+RATE, not concurrency — tiny audio segments at 4-parallel workers
+make ~40-80 requests/sec; big video segments keep the rate at
+~4-8 req/sec. Fix 8's sequential fallback (1 worker, no delay)
+would still make ~20 requests/sec on tiny segments and 429 again.
+
+**Fix** (`crates/engine/src/media.rs`, segment path only — HLS
+and DASH both route through `download_segments`).
+- 429 is now a distinct failure kind. `fetch_segment` returns a
+  `SegmentFetchError` carrying the HTTP status and any
+  `Retry-After` header (seconds or HTTP-date, clamped to 60 s);
+  `fetch_bytes_range` is a thin wrapper with identical error
+  strings, so the legacy sequential path and the probe are
+  untouched.
+- In-loop: a 429'd segment gets 5 attempts (other errors keep 3),
+  sleeping the server's `Retry-After` when present, else
+  exponential backoff 5s → 10s → 20s → 40s → 60s (capped),
+  per segment attempt. Five consecutive 429s with no successful
+  segment between end the pass. Backoff sleeps are interruptible
+  by pause/cancel. A single 429 blip is handled here and the
+  download continues at full speed — the rescue below is only for
+  sustained 429s.
+- Rescue: `download_segments` catches a 429 failure and re-runs
+  once with 1 worker + pacing (`RateLimiter`): 250 ms between
+  requests, doubling on each further 429 to a 2 s cap, after an
+  initial backoff from the last `Retry-After` (or 5 s). Same
+  segment dir (landed pieces never re-fetched); if the rescue
+  also fails, the ORIGINAL 429 error stands (Fix 8's rule).
+  Fix 8's timeout → sequential behaviour is unchanged — 429 and
+  timeout are separate gates with separate responses.
+- Scoping notes: the limiter is per `download_segments` call (one
+  phase), so a DASH video phase and audio phase each get their
+  own — the phase that 429s throttles from its first 429, which
+  is what the nime evidence needs. The legacy sequential path
+  (`download_segments_sequential`, old sidecars only) does not
+  get 429 handling; it keeps today's behaviour.
+
+**Tests.** 10 new (4 integration + 6 unit), suite 165 → 175.
+- Stub 429s the first 4 requests, then serves: the download
+  completes after the 5 s default backoff (span assertion).
+- Stub 429s with `Retry-After: 1`: the download finishes in ~1 s,
+  not ~5 s (span in [0.8 s, 4 s)).
+- Stub 429s for 8 s, then serves: the parallel pass fails on the
+  5-streak budget, the throttled rescue completes the download,
+  and the rescue serves are spaced ≥200 ms (250 ms delay).
+  The time window (not a request count) is load-bearing: a
+  count-based stub lets a retry serve and reset the consecutive
+  counter before the budget trips, so the parallel pass succeeds
+  via in-loop retries and the rescue never runs — that is the
+  design working as intended (a success proves the server is
+  serving again), but it cannot test the rescue.
+- Stub 429s forever (with `Retry-After: 0` to keep backoffs
+  short): the record fails with the real 429 error after exactly
+  5 + 5 requests, in seconds.
+- Unit: `Retry-After` parsing (seconds, HTTP-date incl. known
+  epoch values, clamp, garbage), backoff sequence + cap, delay
+  doubling to the 2 s cap (and no-op while unpaced), consecutive
+  counting + reset on success + fresh budget for the rescue,
+  the 429 gate.
+
+**NOT verified (needs the parent's post-install checks).** Live
+CloudFront behaviour: the real test is resuming the nime DASH
+download after install — the audio phase (1,756 segments left at
+the time of writing) should complete in one throttled run
+instead of 429'ing every ~120 segments. The 250 ms starting
+delay is a guess at the server's limit; the doubling is what
+adapts if it is wrong.

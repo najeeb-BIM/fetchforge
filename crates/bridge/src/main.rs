@@ -18,18 +18,19 @@
 //!   fetchforge-bridge print-token [--data-dir DIR]
 
 use fetchforge_engine::{
-    category_for_filename, download, download_dash, download_gltf_bundle, download_hls_pair,
-    download_hls_variant, download_media, ensure_ffmpeg, ensure_image_extension, fetch_gltf_plan,
-    find_ytdlp, generate_download_id, generate_secure_token, is_gltf_url, is_image_content_type,
-    list_formats, plan_media_download_or_drive_fallback, probe, sanitize_filename, stop_reason,
-    CapturedManifest, DashDownloadOptions, DownloadOptions, DownloadRecord, GltfDownloadOptions,
-    MediaDownloadOptions, PlanOutcome, Status, Store, MAX_CAPTURED_MANIFEST_BYTES,
+    category_for_filename, download, download_dash, download_gltf_bundle, download_hls_audio_only,
+    download_hls_pair, download_hls_variant, download_media, ensure_ffmpeg, ensure_image_extension,
+    extract_audio, fetch_gltf_plan, find_ytdlp, generate_download_id, generate_secure_token,
+    is_gltf_url, is_image_content_type, list_formats, plan_media_download_or_drive_fallback, probe,
+    sanitize_filename, stop_reason, unique_path, CapturedManifest, DashDownloadOptions,
+    DownloadOptions, DownloadRecord, GltfDownloadOptions, MediaDownloadOptions, PlanOutcome,
+    Status, Store, MAX_CAPTURED_MANIFEST_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -360,6 +361,7 @@ impl App {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_download(
         self: &Arc<Self>,
         url: &str,
@@ -368,6 +370,7 @@ impl App {
         referer: Option<String>,
         audio_url: Option<String>,
         manifest_text: Option<String>,
+        audio_only: bool,
     ) -> Result<DownloadRecord, String> {
         let clean_url = fetchforge_engine::validate_url(url)?;
         // HLS (.m3u8) / DASH (.mpd) manifests go straight to the
@@ -382,6 +385,7 @@ impl App {
                 referer,
                 audio_url,
                 manifest_text,
+                audio_only,
             );
         }
         // glTF models (.gltf) carry dependencies (buffers, textures)
@@ -418,16 +422,33 @@ impl App {
                     .is_some_and(|ct| ct.starts_with("text/html"))
             });
         if is_page {
-            return self.add_media_download(&clean_url, filename, format_id, referer, audio_url, manifest_text);
+            return self.add_media_download(
+                &clean_url,
+                filename,
+                format_id,
+                referer,
+                audio_url,
+                manifest_text,
+                audio_only,
+            );
         }
         match probe_result {
             Ok(p) => {
                 // Extension-less manifests: the probe's content type
                 // says HLS/DASH, so this is a stream, not a file.
-                if p.content_type.as_deref().is_some_and(|ct| {
-                    fetchforge_engine::stream_kind_of_content_type(ct).is_some()
-                }) {
-                    return self.add_media_download(&clean_url, filename, format_id, referer, audio_url, manifest_text);
+                if p.content_type
+                    .as_deref()
+                    .is_some_and(|ct| fetchforge_engine::stream_kind_of_content_type(ct).is_some())
+                {
+                    return self.add_media_download(
+                        &clean_url,
+                        filename,
+                        format_id,
+                        referer,
+                        audio_url,
+                        manifest_text,
+                        audio_only,
+                    );
                 }
                 let (mut filename, total, resumable) = (
                     filename
@@ -450,7 +471,7 @@ impl App {
                 {
                     filename = ensure_image_extension(&filename, p.content_type.as_deref());
                 }
-                self.add_direct_record(&clean_url, filename, total, resumable, referer)
+                self.add_direct_record(&clean_url, filename, total, resumable, referer, audio_only)
             }
             Err(mut e) => {
                 // Probe failed. Some video pages refuse HEAD/GET probes
@@ -474,6 +495,7 @@ impl App {
                         referer.clone(),
                         audio_url.clone(),
                         manifest_text,
+                        audio_only,
                     ) {
                         Ok(rec) => return Ok(rec),
                         Err(extract_err) => e = extract_err,
@@ -504,6 +526,7 @@ impl App {
                     segments_total: None,
                     segments_done: 0,
                     estimated_total_bytes: None,
+                    audio_only: false,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -517,6 +540,7 @@ impl App {
     /// default (extension path). On extraction failure, a Google Drive
     /// link gets one direct-download fallback (see below); anything else
     /// records a Failed row with the extraction error.
+    #[allow(clippy::too_many_arguments)]
     fn add_media_download(
         self: &Arc<Self>,
         clean_url: &str,
@@ -525,6 +549,7 @@ impl App {
         referer: Option<String>,
         audio_url: Option<String>,
         manifest_text: Option<String>,
+        audio_only: bool,
     ) -> Result<DownloadRecord, String> {
         match self.try_media_download(
             clean_url,
@@ -533,6 +558,7 @@ impl App {
             referer.clone(),
             audio_url,
             manifest_text,
+            audio_only,
         ) {
             Ok(rec) => Ok(rec),
             Err(e) => {
@@ -565,6 +591,7 @@ impl App {
                     segments_total: None,
                     segments_done: 0,
                     estimated_total_bytes: None,
+                    audio_only: false,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -604,6 +631,7 @@ impl App {
                         clean_url,
                         &record_filename,
                         &self.settings.download_dir,
+                        false,
                     ) {
                         // The caller must know nothing new was
                         // queued: flag the returned clone (never
@@ -640,6 +668,7 @@ impl App {
                         segments_total: None,
                         segments_done: 0,
                         estimated_total_bytes: None,
+                        audio_only: false,
                     };
                     store.upsert(rec.clone());
                     let _ = store.save();
@@ -673,6 +702,7 @@ impl App {
                     segments_total: None,
                     segments_done: 0,
                     estimated_total_bytes: None,
+                    audio_only: false,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -695,6 +725,7 @@ impl App {
     /// overwrites it with the chosen format); the filename is the
     /// caller's, or the provisional "download" the worker replaces
     /// with the planned name.
+    #[allow(clippy::too_many_arguments)]
     fn try_media_download(
         self: &Arc<Self>,
         clean_url: &str,
@@ -703,6 +734,7 @@ impl App {
         referer: Option<String>,
         audio_url: Option<String>,
         manifest_text: Option<String>,
+        audio_only: bool,
     ) -> Result<DownloadRecord, String> {
         let provisional = filename
             .as_deref()
@@ -712,18 +744,38 @@ impl App {
         // already-active or already-completed download for the same
         // URL + filename is returned, never queued twice. The
         // worker re-checks after planning, when the resolved URL
-        // and planned filename are known.
+        // and planned filename are known. Audio-only requests are
+        // checked twice: once under the video filename (a queued
+        // audio request still carries it) and once under the audio
+        // filename (a completed audio download's record was renamed
+        // to .m4a by the post-step) — a completed VIDEO never
+        // matches either, because the flag differs.
         {
             let mut store = self.store.lock().unwrap();
             // Fresh disk state before the duplicate check (see
             // add_gltf_download): a record the other process
             // cleared must not match from stale memory.
             store.reload_from_disk();
-            if let Some(mut existing) = store.find_duplicate(
-                clean_url,
-                &provisional,
-                &self.settings.download_dir,
-            ) {
+            let audio_filename = audio_only.then(|| {
+                let stem = provisional
+                    .rsplit_once('.')
+                    .map(|(s, _)| s)
+                    .unwrap_or(&provisional);
+                format!("{stem}.m4a")
+            });
+            let existing = store
+                .find_duplicate(
+                    clean_url,
+                    &provisional,
+                    &self.settings.download_dir,
+                    audio_only,
+                )
+                .or_else(|| {
+                    audio_filename.as_ref().and_then(|f| {
+                        store.find_duplicate(clean_url, f, &self.settings.download_dir, audio_only)
+                    })
+                });
+            if let Some(mut existing) = existing {
                 // The caller must know nothing new was queued:
                 // flag the returned clone (never the stored
                 // record) so the extension reports "Already
@@ -758,6 +810,7 @@ impl App {
                 segments_total: None,
                 segments_done: 0,
                 estimated_total_bytes: None,
+                audio_only,
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -864,6 +917,7 @@ impl App {
                         &plan.filename,
                         &self.settings.download_dir,
                         &id,
+                        rec.audio_only,
                     )
                     .is_some()
                 {
@@ -944,6 +998,7 @@ impl App {
         total: Option<u64>,
         resumable: bool,
         referer: Option<String>,
+        audio_only: bool,
     ) -> Result<DownloadRecord, String> {
         // Idempotent add (safe to run twice): if the same URL +
         // filename is already Queued, Downloading, or Completed,
@@ -954,16 +1009,37 @@ impl App {
         // "got 0 bytes" while progress said complete) — and a
         // repeated click re-downloads a file that already finished.
         // The check + insert happen under one store lock so two
-        // simultaneous POSTs cannot both slip through.
+        // simultaneous POSTs cannot both slip through. Audio-only
+        // requests are checked under the video filename AND the
+        // .m4a filename (see try_media_download): a completed
+        // video must not swallow an audio request, and a completed
+        // audio download must swallow a repeat audio request.
         {
             let mut store = self.store.lock().unwrap();
             // Fresh disk state before the duplicate check (see
             // add_gltf_download): a record the other process
             // cleared must not match from stale memory.
             store.reload_from_disk();
-            if let Some(mut existing) =
-                store.find_duplicate(clean_url, &filename, &self.settings.download_dir)
-            {
+            let audio_filename = audio_only.then(|| {
+                let stem = filename
+                    .rsplit_once('.')
+                    .map(|(s, _)| s)
+                    .unwrap_or(&filename);
+                format!("{stem}.m4a")
+            });
+            let existing = store
+                .find_duplicate(
+                    clean_url,
+                    &filename,
+                    &self.settings.download_dir,
+                    audio_only,
+                )
+                .or_else(|| {
+                    audio_filename.as_ref().and_then(|f| {
+                        store.find_duplicate(clean_url, f, &self.settings.download_dir, audio_only)
+                    })
+                });
+            if let Some(mut existing) = existing {
                 // The caller must know nothing new was queued:
                 // flag the returned clone (never the stored
                 // record) so the extension reports "Already
@@ -996,6 +1072,7 @@ impl App {
                 segments_total: None,
                 segments_done: 0,
                 estimated_total_bytes: None,
+                audio_only,
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -1036,6 +1113,59 @@ impl App {
             }
             let _ = result;
         });
+    }
+
+    /// "Audio only" post-step (extension popup, round 8): turn a
+    /// downloaded video file into its audio track. Returns the path
+    /// the record should point at. A file that is already audio-only
+    /// (a DASH audio representation, an HLS audio playlist the
+    /// engine named `.m4a`) passes through unchanged — no ffmpeg
+    /// needed. Otherwise ffmpeg extracts the track (stream copy;
+    /// AAC re-encode only when the copy is impossible — see
+    /// [`extract_audio`]) to `<stem>.m4a` next to the video, and the
+    /// video file is deleted. On extraction failure the video file
+    /// is KEPT and the error is returned, so the caller can mark
+    /// the record Failed with a clear reason instead of completing
+    /// a download whose audio file does not exist. `ffmpeg` is the
+    /// worker's already-resolved binary when one exists; otherwise
+    /// it is resolved here (which may download ffmpeg on first use
+    /// — the workers resolve it upfront for audio-only downloads
+    /// so a missing ffmpeg fails fast instead of after a full
+    /// download).
+    fn audio_only_post_step(
+        &self,
+        video_path: &Path,
+        ffmpeg: Option<&Path>,
+    ) -> Result<PathBuf, String> {
+        let ext = video_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(
+            ext.as_str(),
+            "m4a" | "mp3" | "ogg" | "opus" | "wav" | "flac" | "aac"
+        ) {
+            return Ok(video_path.to_path_buf());
+        }
+        let ffmpeg_path;
+        let ffmpeg = match ffmpeg {
+            Some(f) => f,
+            None => {
+                ffmpeg_path = ensure_ffmpeg(&self.data_dir)?;
+                &ffmpeg_path
+            }
+        };
+        let stem = video_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("audio");
+        let dir = video_path.parent().unwrap_or(Path::new("."));
+        let audio_path = unique_path(dir, &format!("{stem}.m4a"));
+        extract_audio(ffmpeg, video_path, &audio_path)?;
+        // Extraction succeeded: the video file is no longer needed.
+        let _ = std::fs::remove_file(video_path);
+        Ok(audio_path)
     }
 
     fn run_one(&self, id: &str, job: &Job) -> Result<(), String> {
@@ -1088,6 +1218,20 @@ impl App {
             return self.run_media(&rec, job);
         }
         self.set_status(id, Status::Downloading, None);
+        // "Audio only": resolve ffmpeg UPFRONT, so a missing ffmpeg
+        // fails fast instead of after a full video download (same
+        // fail-fast pattern as the HLS merge path).
+        let ffmpeg = if rec.audio_only {
+            match ensure_ffmpeg(&self.data_dir) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    self.set_status(id, Status::Failed, Some(e));
+                    return Err("download failed".to_string());
+                }
+            }
+        } else {
+            None
+        };
         let opts = DownloadOptions {
             url: rec.url.clone(),
             destination_dir: PathBuf::from(&rec.destination),
@@ -1127,10 +1271,28 @@ impl App {
         };
         match download(&opts, &progress, &job.paused, &job.cancelled) {
             Ok(final_path) => {
+                // "Audio only": extract the audio track BEFORE the
+                // record is marked Completed, so the list points at
+                // the audio file. A failed extraction keeps the
+                // video file and fails the record with the reason.
+                let final_path = if rec.audio_only {
+                    match self.audio_only_post_step(&final_path, ffmpeg.as_deref()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            self.set_status(id, Status::Failed, Some(e));
+                            return Err("download failed".to_string());
+                        }
+                    }
+                } else {
+                    final_path
+                };
                 let mut store = self.store.lock().unwrap();
                 if let Some(mut r) = store.get(id).cloned() {
                     r.status = Status::Completed;
                     r.destination = final_path.to_string_lossy().to_string();
+                    if let Some(name) = final_path.file_name() {
+                        r.filename = name.to_string_lossy().to_string();
+                    }
                     r.downloaded_bytes = r.total_bytes.unwrap_or(r.downloaded_bytes);
                     r.error = None;
                     r.updated_unix = now_unix();
@@ -1267,9 +1429,10 @@ impl App {
     /// Run an HLS download (media.rs). The record's format_id is the
     /// chosen variant playlist URL (or the manifest URL itself for a
     /// plain media playlist). ffmpeg is resolved only when the
-    /// chosen variant needs a merge (separate audio track); a
-    /// resume re-runs the same variant and picks up the segment
-    /// sidecar left by the paused run.
+    /// chosen variant needs a merge (separate audio track) or the
+    /// user picked "Audio only" (the audio track is extracted after
+    /// the download); a resume re-runs the same variant and picks
+    /// up the segment sidecar left by the paused run.
     fn run_stream_hls(&self, rec: &DownloadRecord, job: &Job) -> Result<(), String> {
         let id = rec.id.clone();
         self.set_status(&id, Status::Downloading, None);
@@ -1278,7 +1441,7 @@ impl App {
             dir = dir.join(category_for_filename(&rec.filename));
         }
         let variant_uri = rec.format_id.clone().unwrap_or_else(|| rec.url.clone());
-        let ffmpeg = if rec.needs_merge {
+        let ffmpeg = if rec.needs_merge || rec.audio_only {
             match ensure_ffmpeg(&self.data_dir) {
                 Ok(p) => Some(p),
                 Err(e) => {
@@ -1323,48 +1486,94 @@ impl App {
         // whichever fetch its URL matches — the plan fetch already
         // consumed nothing, but a single-use signed link must
         // still not be re-fetched here.
+        //
+        // "Audio only" never touches the video track: a paired
+        // audio sibling downloads alone, and a master variant
+        // resolves its audio group (or falls back to the muxed
+        // variant, whose audio the post-step extracts).
         let captured = read_manifest_sidecar(&self.data_dir, &id, &rec.url);
-        let result = match &rec.audio_url {
-            Some(audio_uri) => {
-                let ffmpeg = match &ffmpeg {
-                    Some(f) => f.clone(),
-                    None => {
-                        self.set_status(
-                            &id,
-                            Status::Failed,
-                            Some("This quality keeps its audio on a separate track, which needs ffmpeg to merge.".to_string()),
-                        );
-                        return Err("download failed".to_string());
-                    }
-                };
-                download_hls_pair(
-                    &variant_uri,
+        let result = if rec.audio_only {
+            match &rec.audio_url {
+                Some(audio_uri) => download_hls_variant(
+                    audio_uri,
                     audio_uri,
                     &dir,
                     &rec.filename,
                     &rec.referer,
-                    &ffmpeg,
+                    None,
+                    &progress,
+                    &job.paused,
+                    &job.cancelled,
+                    None,
+                ),
+                None => download_hls_audio_only(
+                    &rec.url,
+                    &variant_uri,
+                    &dir,
+                    &rec.filename,
+                    &rec.referer,
                     &progress,
                     &job.paused,
                     &job.cancelled,
                     captured.as_ref(),
                 )
             }
-            None => download_hls_variant(
-                &rec.url,
-                &variant_uri,
-                &dir,
-                &rec.filename,
-                &rec.referer,
-                ffmpeg.as_deref(),
-                &progress,
-                &job.paused,
-                &job.cancelled,
-                captured.as_ref(),
-            ),
+        } else {
+            match &rec.audio_url {
+                Some(audio_uri) => {
+                    let ffmpeg = match &ffmpeg {
+                        Some(f) => f.clone(),
+                        None => {
+                            self.set_status(
+                                &id,
+                                Status::Failed,
+                                Some("This quality keeps its audio on a separate track, which needs ffmpeg to merge.".to_string()),
+                            );
+                            return Err("download failed".to_string());
+                        }
+                    };
+                    download_hls_pair(
+                        &variant_uri,
+                        audio_uri,
+                        &dir,
+                        &rec.filename,
+                        &rec.referer,
+                        &ffmpeg,
+                        &progress,
+                        &job.paused,
+                        &job.cancelled,
+                        captured.as_ref(),
+                    )
+                }
+                None => download_hls_variant(
+                    &rec.url,
+                    &variant_uri,
+                    &dir,
+                    &rec.filename,
+                    &rec.referer,
+                    ffmpeg.as_deref(),
+                    &progress,
+                    &job.paused,
+                    &job.cancelled,
+                    captured.as_ref(),
+                ),
+            }
         };
         match result {
             Ok(final_path) => {
+                // "Audio only": extract the audio track BEFORE the
+                // record is marked Completed (see run_one).
+                let final_path = if rec.audio_only {
+                    match self.audio_only_post_step(&final_path, ffmpeg.as_deref()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            self.set_status(&id, Status::Failed, Some(e));
+                            return Err("download failed".to_string());
+                        }
+                    }
+                } else {
+                    final_path
+                };
                 let mut store = self.store.lock().unwrap();
                 if let Some(mut r) = store.get(&id).cloned() {
                     r.status = Status::Completed;
@@ -1402,7 +1611,9 @@ impl App {
     /// Run a DASH download (media.rs). The record's format_id is the
     /// chosen representation id (None means the default). ffmpeg is
     /// resolved inside the engine only when the manifest keeps audio
-    /// separate from the chosen video representation.
+    /// separate from the chosen video representation — except for
+    /// "Audio only" downloads, where the worker resolves it upfront
+    /// (fail fast) for the post-step extraction.
     fn run_stream_dash(&self, rec: &DownloadRecord, job: &Job) -> Result<(), String> {
         let id = rec.id.clone();
         self.set_status(&id, Status::Downloading, None);
@@ -1410,6 +1621,20 @@ impl App {
         if self.settings.organise_by_category {
             dir = dir.join(category_for_filename(&rec.filename));
         }
+        // "Audio only": resolve ffmpeg UPFRONT, so a missing ffmpeg
+        // fails fast instead of after a full video download (same
+        // fail-fast pattern as the HLS merge path).
+        let ffmpeg = if rec.audio_only {
+            match ensure_ffmpeg(&self.data_dir) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    self.set_status(&id, Status::Failed, Some(e));
+                    return Err("download failed".to_string());
+                }
+            }
+        } else {
+            None
+        };
         let opts = DashDownloadOptions {
             manifest_url: rec.url.clone(),
             representation_id: rec.format_id.clone(),
@@ -1452,6 +1677,21 @@ impl App {
             read_manifest_sidecar(&self.data_dir, &id, &rec.url).as_ref(),
         ) {
             Ok(final_path) => {
+                // "Audio only": extract the audio track BEFORE the
+                // record is marked Completed (see run_one). A DASH
+                // audio representation already lands as .m4a and
+                // passes the post-step unchanged.
+                let final_path = if rec.audio_only {
+                    match self.audio_only_post_step(&final_path, ffmpeg.as_deref()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            self.set_status(&id, Status::Failed, Some(e));
+                            return Err("download failed".to_string());
+                        }
+                    }
+                } else {
+                    final_path
+                };
                 let mut store = self.store.lock().unwrap();
                 if let Some(mut r) = store.get(&id).cloned() {
                     r.status = Status::Completed;
@@ -1786,6 +2026,12 @@ struct AddRequest {
     /// limit it is ignored with a warning.
     #[serde(default)]
     manifest_text: Option<String>,
+    /// True when the user picked "Audio only" in the extension
+    /// popup (round 8): the worker delivers an audio file instead
+    /// of the video. Ignored for yt-dlp downloads, where the
+    /// format choice already governs.
+    #[serde(default)]
+    audio_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -2212,6 +2458,7 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
                 r.referer,
                 r.audio_url,
                 r.manifest_text,
+                r.audio_only,
             ) {
                 Ok(rec) => {
                     // 202: the download is queued; extraction and
@@ -2435,6 +2682,7 @@ fn forward_add_to_bridge(
     audio_url: Option<&str>,
     format_id: Option<&str>,
     manifest_text: Option<&str>,
+    audio_only: bool,
 ) -> Result<DownloadRecord, String> {
     let token = std::fs::read_to_string(data_dir.join("bridge-token.txt"))
         .map_err(|_| "Bridge token file not found.".to_string())?;
@@ -2442,7 +2690,7 @@ fn forward_add_to_bridge(
     if token.is_empty() {
         return Err("Bridge token file is empty.".to_string());
     }
-    let body = serde_json::json!({"url": url, "filename": filename, "referer": referer, "audio_url": audio_url, "format_id": format_id, "manifest_text": manifest_text}).to_string();
+    let body = serde_json::json!({"url": url, "filename": filename, "referer": referer, "audio_url": audio_url, "format_id": format_id, "manifest_text": manifest_text, "audio_only": audio_only}).to_string();
     let (status, resp) = loopback_http(port, "POST", "/downloads", Some(token), Some(&body))?;
     // POST /downloads answers 202 (queued; extraction runs in the
     // worker). 201 is still accepted so a newer CLI keeps working
@@ -2550,6 +2798,12 @@ fn native_host(app: &Arc<App>) {
                     .get("manifest_text")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                // The popup's "Audio only" choice (extension sends
+                // only): deliver an audio file instead of the video.
+                let audio_only = value
+                    .get("audio_only")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 // A download started from the extension must survive
                 // this host process exiting: Chrome/Firefox terminate
                 // the native host after its sendNativeMessage reply,
@@ -2586,6 +2840,7 @@ fn native_host(app: &Arc<App>) {
                     audio_url.as_deref(),
                     format_id.as_deref(),
                     manifest_text.as_deref(),
+                    audio_only,
                 ) {
                     Ok(rec) => {
                         serde_json::json!({"type": "added", "download": rec, "via": "bridge"})
@@ -2601,6 +2856,7 @@ fn native_host(app: &Arc<App>) {
                                 audio_url.as_deref(),
                                 format_id.as_deref(),
                                 manifest_text.as_deref(),
+                                audio_only,
                             )
                         }) {
                             Ok(rec) => {
@@ -2613,6 +2869,7 @@ fn native_host(app: &Arc<App>) {
                                 referer,
                                 audio_url,
                                 manifest_text,
+                                audio_only,
                             ) {
                                 Ok(rec) => {
                                     serde_json::json!({"type": "added", "download": rec, "via": "in-process", "warning": "The FetchForge bridge is not running, so this download started inside the browser connection and may stop if the browser closes it. Open the FetchForge app to keep downloads running."})
@@ -2795,6 +3052,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(rec.id, "dl-1");
@@ -2834,6 +3092,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap_err();
         assert!(err.contains("not reachable"), "error: {err}");
@@ -2859,6 +3118,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap_err();
         assert!(err.contains("401"), "error: {err}");
@@ -3011,11 +3271,27 @@ mod tests {
         let app = App::new(dir);
         let url = format!("http://127.0.0.1:{port}/v.m3u8");
         let first = app
-            .try_media_download(&url, Some("clip.mp4".to_string()), None, None, None, None)
+            .try_media_download(
+                &url,
+                Some("clip.mp4".to_string()),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
             .unwrap();
         assert!(!first.duplicate, "first add queues a new download");
         let second = app
-            .try_media_download(&url, Some("clip.mp4".to_string()), None, None, None, None)
+            .try_media_download(
+                &url,
+                Some("clip.mp4".to_string()),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
             .unwrap();
         assert!(second.duplicate, "second add must be flagged duplicate");
         assert_eq!(second.id, first.id, "same record returned");
@@ -3034,6 +3310,125 @@ mod tests {
         );
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn audio_only_post_step_skips_audio_files_and_extracts_video() {
+        // Needs a real ffmpeg; skip (do not fail) where none exists,
+        // so the suite stays green on machines without ffmpeg.
+        let dir = test_data_dir("fetchforge-test-audio-post-step");
+        let app = App::new(dir.clone());
+        let ffmpeg = match fetchforge_engine::find_ffmpeg(&dir) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        // Case 1: an already-audio file passes through unchanged —
+        // no ffmpeg call at all (even garbage bytes pass, since the
+        // extension decides, not a probe).
+        let audio = dir.join("song.m4a");
+        std::fs::write(&audio, b"fake audio bytes").unwrap();
+        let out = app.audio_only_post_step(&audio, None).unwrap();
+        assert_eq!(out, audio);
+        assert!(audio.is_file());
+        // Case 2: a real muxed mp4 extracts to .m4a and the video
+        // file is deleted.
+        let video = dir.join("clip.mp4");
+        let mk = std::process::Command::new(&ffmpeg)
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:d=1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                video.to_str().unwrap(),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(mk, "fixture build failed");
+        let out = app.audio_only_post_step(&video, Some(&ffmpeg)).unwrap();
+        assert_eq!(out.file_name().unwrap(), "clip.m4a");
+        assert!(out.is_file());
+        assert!(
+            !video.exists(),
+            "the video file must be deleted after extraction"
+        );
+        // Case 3: garbage in fails, and the video file is KEPT
+        // (the caller marks the record Failed; the user still has
+        // the download).
+        let bad = dir.join("bad.mp4");
+        std::fs::write(&bad, b"not a video").unwrap();
+        assert!(app.audio_only_post_step(&bad, Some(&ffmpeg)).is_err());
+        assert!(
+            bad.is_file(),
+            "a failed extraction must keep the video file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audio_only_add_does_not_match_completed_video() {
+        // Round 8: "Audio only" for a URL whose video already
+        // downloaded must queue a new download, not report
+        // "Already downloaded" — while a video re-add still does.
+        // (The spawned workers fail in the background — no network
+        // for example.com here — which is harmless: the assertions
+        // are on the returned records.)
+        let dir = test_data_dir("fetchforge-test-audio-dedupe");
+        let app = App::new(dir.clone());
+        let download_dir = app.settings.download_dir.clone();
+        let mut video = test_record("video-1", "clip.mp4", Status::Completed);
+        video.url = "https://example.com/clip.mp4".to_string();
+        video.destination = download_dir.clone();
+        {
+            let mut store = app.store.lock().unwrap();
+            store.upsert(video);
+            let _ = store.save();
+        }
+        let audio = app
+            .try_media_download(
+                "https://example.com/clip.mp4",
+                Some("clip.mp4".to_string()),
+                None,
+                None,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+        assert!(!audio.duplicate, "audio must not match the completed video");
+        assert!(audio.audio_only, "the flag must be stored on the record");
+        assert_ne!(audio.id, "video-1", "audio must queue a new record");
+        let again = app
+            .try_media_download(
+                "https://example.com/clip.mp4",
+                Some("clip.mp4".to_string()),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(
+            again.duplicate,
+            "a video re-add must still match the completed video"
+        );
+        assert_eq!(again.id, "video-1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3082,6 +3477,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert!(
@@ -3294,6 +3690,7 @@ mod tests {
             segments_total: None,
             segments_done: 0,
             estimated_total_bytes: None,
+            audio_only: false,
         }
     }
 

@@ -1,11 +1,14 @@
 // Round 7 background-script harness: Fix 4 (viaBrowser reply
 // passthrough, end to end through sendDownload) and Fix 6
 // (pageVideoDuration in the election verdict).
+// Round 8: audioOnly passthrough (downloadMedia -> native/bridge)
+// and getFormats unreachable classification.
 // The Fix 4 test evaluates the WHOLE background.js with a stubbed
 // chrome API; the Fix 6 test extracts bestDownloadSource (+ its
 // helpers) from the shipped file — see extract.js.
 "use strict";
 const vm = require("vm");
+const nodeCrypto = require("crypto");
 const { readSource, extractMany, extractConst, makeContext, runIn, test, assert, assertEq, run } = require("./extract");
 
 const bgSrc = readSource("extensions/chromium/background.js");
@@ -19,6 +22,13 @@ function makeChromeStub() {
       onInstalled: { addListener() {} },
       onMessage: { addListener(fn) { chrome.__onMessage = fn; } },
       sendNativeMessage: (host, msg, cb) => {
+        chrome.__nativeCalls.push({ host: host, msg: msg });
+        if (chrome.__nativeShouldSucceed) {
+          // A working native host: the bridge accepted the add.
+          chrome.runtime.lastError = undefined;
+          cb({ type: "added", download: { status: "queued" } });
+          return;
+        }
         // No native host installed: Chrome sets lastError and
         // calls back with undefined, so callApi rejects.
         chrome.runtime.lastError = { message: "Specified native messaging host not found." };
@@ -59,6 +69,8 @@ function makeChromeStub() {
     action: { setBadgeText: () => {}, setBadgeBackgroundColor: () => {} },
     __downloads: [],
     __downloadsShouldFail: false,
+    __nativeCalls: [],
+    __nativeShouldSucceed: false,
     __onMessage: null,
   };
   return chrome;
@@ -108,6 +120,30 @@ test("Fix 4: total failure still reports an honest error", async () => {
   });
   assertEq(reply.ok, false);
   assert(reply.error && reply.error.indexOf("Could not reach") !== -1, "error: " + reply.error);
+});
+
+test("Round 8: downloadMedia audioOnly reaches the native host end to end", async () => {
+  const { chrome } = loadBackground();
+  chrome.__nativeShouldSucceed = true;
+  const reply = await sendMessage(chrome, {
+    type: "downloadMedia",
+    url: "https://example.com/v.mp4",
+    filename: "v.mp4",
+    audioOnly: true,
+  });
+  assertEq(reply.ok, true);
+  assertEq(chrome.__nativeCalls.length, 1, "the native path must take the send");
+  assertEq(chrome.__nativeCalls[0].msg.audio_only, true, "the flag must reach the native host");
+  assertEq(chrome.__downloads.length, 0, "no browser fallback when the app takes it");
+  // A video send carries the flag as false (never undefined).
+  const reply2 = await sendMessage(chrome, {
+    type: "downloadMedia",
+    url: "https://example.com/v2.mp4",
+    filename: "v2.mp4",
+    audioOnly: false,
+  });
+  assertEq(reply2.ok, true);
+  assertEq(chrome.__nativeCalls[1].msg.audio_only, false);
 });
 
 // ---------- bestDownloadSource (Fix 6) ----------
@@ -171,6 +207,101 @@ test("Fix 6: playlist verdict still wins and still carries the duration", () => 
 test("Fix 6: no candidates means no verdict", () => {
   const v = setFrames([]);
   assertEq(v, null);
+});
+
+// ---------- sendViaBridge + getFormats (Round 8) ----------
+let token8 = "test-token-123";
+let fetchBehaviour8 = "ok"; // ok | formats-500 | formats-throw | challenge-bad | challenge-throw
+const fetchCalls8 = [];
+const ctx8 = makeContext(
+  {
+    chrome: {
+      runtime: { lastError: undefined },
+      storage: {
+        local: {
+          get: (key, cb) => { cb(token8 ? { token: token8 } : {}); },
+          set: (items, cb) => { if (cb) cb(); },
+        },
+      },
+    },
+    crypto: nodeCrypto.webcrypto,
+    fetch: async (url, opts) => {
+      fetchCalls8.push({ url: url, body: opts && opts.body });
+      if (url.endsWith("/challenge")) {
+        if (fetchBehaviour8 === "challenge-throw") throw new TypeError("Failed to fetch");
+        const nonce = JSON.parse(opts.body).nonce;
+        const hmac = fetchBehaviour8 === "challenge-bad"
+          ? "00".repeat(32)
+          : nodeCrypto.createHmac("sha256", token8).update(nonce).digest("hex");
+        return { ok: true, json: async () => ({ hmac: hmac }) };
+      }
+      if (url.endsWith("/media/formats")) {
+        if (fetchBehaviour8 === "formats-throw") throw new TypeError("Failed to fetch");
+        if (fetchBehaviour8 === "formats-500") return { ok: false, status: 500, json: async () => ({}) };
+        return { ok: true, json: async () => ({ formats: [{ format_id: "v1" }], default_format_id: "v1" }) };
+      }
+      if (url.endsWith("/downloads")) {
+        return { ok: true, json: async () => ({ status: "queued" }) };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    },
+  },
+  [
+    extractConst(bgSrc, "api", 0) + "\n"
+    + extractConst(bgSrc, "isFirefox", 0) + "\n"
+    + extractConst(bgSrc, "BRIDGE", 0) + "\n"
+    + extractConst(bgSrc, "HOST", 0) + "\n",
+    extractMany(bgSrc, ["callApi", "getToken", "verifyServer", "sendViaBridge", "getFormats"], 0),
+  ]
+);
+function reset8(behaviour) {
+  token8 = "test-token-123";
+  fetchBehaviour8 = behaviour || "ok";
+  fetchCalls8.length = 0;
+}
+
+test("Round 8: sendViaBridge carries audio_only in the POST body", async () => {
+  reset8();
+  const r = await runIn(ctx8, "sendViaBridge('https://example.com/v.mp4', 'v.mp4', undefined, undefined, undefined, undefined, true)");
+  assertEq(r.ok, true);
+  const post = fetchCalls8.find((c) => c.url.endsWith("/downloads"));
+  assert(post, "the bridge POST must have happened");
+  assertEq(JSON.parse(post.body).audio_only, true);
+  reset8();
+  await runIn(ctx8, "sendViaBridge('https://example.com/v.mp4', 'v.mp4', undefined, undefined, undefined, undefined, false)");
+  const post2 = fetchCalls8.find((c) => c.url.endsWith("/downloads"));
+  assertEq(JSON.parse(post2.body).audio_only, false);
+});
+
+test("Round 8: getFormats succeeds when the bridge answers", async () => {
+  reset8();
+  const j = await runIn(ctx8, "getFormats('https://example.com/watch')");
+  assertEq(j.formats.length, 1);
+});
+
+test("Round 8: getFormats marks no-token, challenge and network failures unreachable", async () => {
+  reset8();
+  token8 = "";
+  let err = await runIn(ctx8, "getFormats('https://example.com/watch').then(() => null, (e) => e)");
+  assertEq(err.message, "no-token");
+  assertEq(err.unreachable, true);
+  reset8("challenge-bad");
+  err = await runIn(ctx8, "getFormats('https://example.com/watch').then(() => null, (e) => e)");
+  assertEq(err.message, "challenge-failed");
+  assertEq(err.unreachable, true);
+  reset8("challenge-throw");
+  err = await runIn(ctx8, "getFormats('https://example.com/watch').then(() => null, (e) => e)");
+  assertEq(err.unreachable, true, "a dead bridge on the challenge is unreachable");
+  reset8("formats-throw");
+  err = await runIn(ctx8, "getFormats('https://example.com/watch').then(() => null, (e) => e)");
+  assertEq(err.unreachable, true, "a fetch TypeError is unreachable");
+});
+
+test("Round 8: getFormats bridge-500 is reachable (listing failed, not the bridge)", async () => {
+  reset8("formats-500");
+  const err = await runIn(ctx8, "getFormats('https://example.com/watch').then(() => null, (e) => e)");
+  assertEq(err.message, "bridge-500");
+  assertEq(err.unreachable, undefined, "a server-side failure must NOT be flagged unreachable");
 });
 
 run("background.test.js");

@@ -120,6 +120,15 @@ pub struct DownloadRecord {
     /// `#[serde(default)]` so older history files still load.
     #[serde(default)]
     pub estimated_total_bytes: Option<u64>,
+    /// True when the user picked "Audio only" in the extension
+    /// popup. Direct/HLS/DASH workers then deliver an audio file
+    /// instead of the video (extract the audio track with ffmpeg
+    /// after the download, or fetch the audio playlist alone for
+    /// HLS). For yt-dlp downloads the format choice already
+    /// governs, so the flag is ignored there.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub audio_only: bool,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -458,13 +467,19 @@ impl Store {
     /// subfolder). A record whose file lives under a DIFFERENT
     /// folder (the user moved the download folder since) is not a
     /// duplicate.
+    /// A download is a duplicate of another only when the URL,
+    /// filename, download root AND the audio-only flag all match:
+    /// a video and its audio track are different downloads of the
+    /// same URL, so "Audio only" after the video must queue, not
+    /// report "Already downloaded" (round 8).
     pub fn find_duplicate(
         &self,
         url: &str,
         filename: &str,
         download_dir: &str,
+        audio_only: bool,
     ) -> Option<DownloadRecord> {
-        self.find_duplicate_except(url, filename, download_dir, "")
+        self.find_duplicate_except(url, filename, download_dir, "", audio_only)
     }
 
     /// Same duplicate rule as [`find_duplicate`], but ignoring one
@@ -476,6 +491,7 @@ impl Store {
         filename: &str,
         download_dir: &str,
         except_id: &str,
+        audio_only: bool,
     ) -> Option<DownloadRecord> {
         let want = crate::validate::normalize_url_for_dedupe(url);
         self.records
@@ -484,6 +500,7 @@ impl Store {
                 r.id != except_id
                     && crate::validate::normalize_url_for_dedupe(&r.url) == want
                     && r.filename == filename
+                    && r.audio_only == audio_only
                     && matches!(
                         r.status,
                         Status::Queued | Status::Downloading | Status::Completed
@@ -603,6 +620,7 @@ mod tests {
             segments_total: None,
             segments_done: 0,
             estimated_total_bytes: None,
+            audio_only: false,
         });
         s.save().unwrap();
         let mut s2 = Store::load(path);
@@ -638,6 +656,7 @@ mod tests {
             segments_total: None,
             segments_done: 0,
             estimated_total_bytes: None,
+            audio_only: false,
         }
     }
 
@@ -1067,6 +1086,7 @@ mod tests {
             "  https://cdn.example.com/v/clip.mp4/ ",
             "clip.mp4",
             "/home/user/Downloads",
+            false,
         );
         assert_eq!(dup.as_ref().map(|r| r.id.as_str()), Some("done"));
         // Queued: duplicate too.
@@ -1074,6 +1094,7 @@ mod tests {
             "https://www.youtube.com/watch?v=abc",
             "Video.mp4",
             "/home/user/Downloads",
+            false,
         );
         assert_eq!(dup.as_ref().map(|r| r.id.as_str()), Some("queued"));
         // Failed: NOT a duplicate (retry must work).
@@ -1082,6 +1103,7 @@ mod tests {
                 "https://example.com/dead.mp4",
                 "dead.mp4",
                 "/home/user/Downloads",
+                false,
             )
             .is_none());
         // Different filename: not a duplicate.
@@ -1090,6 +1112,7 @@ mod tests {
                 "https://cdn.example.com/v/clip.mp4",
                 "other.mp4",
                 "/home/user/Downloads",
+                false,
             )
             .is_none());
         // Different query string: a different file, not a duplicate.
@@ -1098,6 +1121,7 @@ mod tests {
                 "https://cdn.example.com/v/clip.mp4?token=zzz",
                 "clip.mp4",
                 "/home/user/Downloads",
+                false,
             )
             .is_none());
         // Same file under a different download folder: not a duplicate.
@@ -1106,8 +1130,69 @@ mod tests {
                 "https://cdn.example.com/v/clip.mp4",
                 "clip.mp4",
                 "/home/user/OtherDownloads",
+                false,
             )
             .is_none());
+    }
+
+    #[test]
+    fn find_duplicate_treats_audio_only_as_a_different_download() {
+        // Round 8: a video and its audio track are different
+        // downloads of the same URL — "Audio only" after the video
+        // must queue, not report "Already downloaded"; and a second
+        // audio-only request must match the first audio download.
+        let dir = std::env::temp_dir().join("fetchforge-test-store-dedupe-audio");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let mut s = Store::load(dir.join("downloads.json"));
+        let now = now_secs();
+        let mut video = rec_status("video", Status::Completed, now, now);
+        video.url = "https://cdn.example.com/v/clip.mp4".to_string();
+        video.filename = "clip.mp4".to_string();
+        video.destination = "/home/user/Downloads/Video/clip.mp4".to_string();
+        s.upsert(video);
+        // Audio-only for the same URL + filename: NOT a duplicate
+        // of the completed video.
+        assert!(s
+            .find_duplicate(
+                "https://cdn.example.com/v/clip.mp4",
+                "clip.mp4",
+                "/home/user/Downloads",
+                true,
+            )
+            .is_none());
+        // …but a video request still matches the video.
+        assert_eq!(
+            s.find_duplicate(
+                "https://cdn.example.com/v/clip.mp4",
+                "clip.mp4",
+                "/home/user/Downloads",
+                false,
+            )
+            .unwrap()
+            .id,
+            "video"
+        );
+        // Once the audio download exists, a second audio-only
+        // request matches IT (by its .m4a filename, which the
+        // post-step wrote on the record at completion).
+        let mut audio = rec_status("audio", Status::Completed, now, now);
+        audio.url = "https://cdn.example.com/v/clip.mp4".to_string();
+        audio.filename = "clip.m4a".to_string();
+        audio.destination = "/home/user/Downloads/Video/clip.m4a".to_string();
+        audio.audio_only = true;
+        s.upsert(audio);
+        assert_eq!(
+            s.find_duplicate(
+                "https://cdn.example.com/v/clip.mp4",
+                "clip.m4a",
+                "/home/user/Downloads",
+                true,
+            )
+            .unwrap()
+            .id,
+            "audio"
+        );
     }
 
     #[test]
@@ -1119,34 +1204,20 @@ mod tests {
         s.upsert(rec("self"));
         // The record itself is a duplicate for the plain lookup…
         assert!(s
-            .find_duplicate(
-                "https://example.com/x.zip",
-                "x.zip",
-                "/tmp",
-            )
+            .find_duplicate("https://example.com/x.zip", "x.zip", "/tmp", false,)
             .is_some());
         // …but not when it is the excluded id (the worker's
         // post-planning re-check must not match the record being
         // planned).
         assert!(s
-            .find_duplicate_except(
-                "https://example.com/x.zip",
-                "x.zip",
-                "/tmp",
-                "self",
-            )
+            .find_duplicate_except("https://example.com/x.zip", "x.zip", "/tmp", "self", false,)
             .is_none());
         // …while another record for the same file still matches.
         s.upsert(rec("other"));
         assert_eq!(
-            s.find_duplicate_except(
-                "https://example.com/x.zip",
-                "x.zip",
-                "/tmp",
-                "self",
-            )
-            .unwrap()
-            .id,
+            s.find_duplicate_except("https://example.com/x.zip", "x.zip", "/tmp", "self", false,)
+                .unwrap()
+                .id,
             "other"
         );
     }

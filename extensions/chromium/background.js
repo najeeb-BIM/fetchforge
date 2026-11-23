@@ -65,14 +65,14 @@ async function verifyServer(token) {
   for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ j.hmac.charCodeAt(i);
   return diff === 0;
 }
-async function sendViaBridge(url, filename, referer, audioUrl, formatId, manifestText) {
+async function sendViaBridge(url, filename, referer, audioUrl, formatId, manifestText, audioOnly) {
   const token = await getToken();
   if (!token) throw new Error("no-token");
   if (!(await verifyServer(token))) throw new Error("challenge-failed");
   const r = await fetch(BRIDGE + "/downloads", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-FetchForge-Token": token },
-    body: JSON.stringify({ url, filename, referer, audio_url: audioUrl, format_id: formatId, manifest_text: manifestText }),
+    body: JSON.stringify({ url, filename, referer, audio_url: audioUrl, format_id: formatId, manifest_text: manifestText, audio_only: audioOnly }),
   });
   if (!r.ok) throw new Error("bridge-" + r.status);
   // The bridge answers 202 once the download is queued;
@@ -89,11 +89,11 @@ async function sendViaBridge(url, filename, referer, audioUrl, formatId, manifes
   if (rec && rec.duplicate) return { ok: true, duplicate: true };
   return { ok: true };
 }
-async function sendViaNative(url, filename, referer, audioUrl, formatId, manifestText) {
+async function sendViaNative(url, filename, referer, audioUrl, formatId, manifestText, audioOnly) {
   const resp = await callApi(
     (...a) => api.runtime.sendNativeMessage(...a),
     HOST,
-    { type: "addDownload", url, filename, referer, audio_url: audioUrl, format_id: formatId, manifest_text: manifestText }
+    { type: "addDownload", url, filename, referer, audio_url: audioUrl, format_id: formatId, manifest_text: manifestText, audio_only: audioOnly }
   );
   if (resp && resp.type === "error") throw new Error(resp.error);
   // Same as the bridge path: the native host forwards the bridge's
@@ -122,11 +122,13 @@ async function sendViaNative(url, filename, referer, audioUrl, formatId, manifes
 // possibly single-use signed playlist link. Over the 256 KB cap
 // it is dropped here (defence in depth — the content script
 // already caps at capture) and the engine fetches normally.
-async function sendDownload(url, filename, referer, audioUrl, formatId, manifestText) {
+// audioOnly is the popup's "Audio only" choice (round 8): the app
+// delivers an audio file instead of the video.
+async function sendDownload(url, filename, referer, audioUrl, formatId, manifestText, audioOnly) {
   if (!/^https?:\/\//i.test(url)) return { ok: false, error: "Not a web link" };
   if (typeof manifestText === "string" && manifestText.length > 262144) manifestText = undefined;
   try {
-    const r = await sendViaNative(url, filename, referer, audioUrl, formatId, manifestText);
+    const r = await sendViaNative(url, filename, referer, audioUrl, formatId, manifestText, audioOnly);
     // A real failure reason from the app (not a transport miss):
     // the native host already asked the bridge, so retrying the
     // bridge directly would only fail the same way again.
@@ -136,7 +138,7 @@ async function sendDownload(url, filename, referer, audioUrl, formatId, manifest
     if (r && r.ok === false) return r;
     return r;
   } catch (_) { /* host not installed */ }
-  try { return await sendViaBridge(url, filename, referer, audioUrl, formatId, manifestText); } catch (_) { /* bridge not running / no token */ }
+  try { return await sendViaBridge(url, filename, referer, audioUrl, formatId, manifestText, audioOnly); } catch (_) { /* bridge not running / no token */ }
   // Documented fallback: let the browser handle it normally, and
   // record it so the popup can say so (not a silent fallback).
   try { await callApi((...a) => api.downloads.download(...a), { url, saveAs: false }); try { await callApi((...a) => api.storage.local.set(...a), { lastFallback: Date.now() }); } catch (_) {} return { ok: true, viaBrowser: true }; }
@@ -149,16 +151,33 @@ async function sendDownload(url, filename, referer, audioUrl, formatId, manifest
 // duration_secs, formats: [{ format_id, label, ext, kind, height,
 // width, abr, vbr, fps, filesize, filesize_approx, needs_merge }],
 // default_format_id, resolved_url? }. Only the page URL is sent —
-// no cookies, no credentials, no page content.
+// no cookies, no credentials, no page content. Failures are
+// classified for the popup (round 8): a throw with
+// `unreachable: true` means the bridge could not be reached at
+// all (no token, challenge failed, network failure) and the popup
+// shows an error state; a plain throw (bridge-<status>) means the
+// bridge answered but the listing failed, and the popup shows its
+// degraded single-quality rows instead.
 async function getFormats(url) {
   const token = await getToken();
-  if (!token) throw new Error("no-token");
-  if (!(await verifyServer(token))) throw new Error("challenge-failed");
-  const r = await fetch(BRIDGE + "/media/formats", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-FetchForge-Token": token },
-    body: JSON.stringify({ url }),
-  });
+  if (!token) { const e = new Error("no-token"); e.unreachable = true; throw e; }
+  let verified;
+  try {
+    verified = await verifyServer(token);
+  } catch (_) {
+    const e = new Error("bridge unreachable"); e.unreachable = true; throw e;
+  }
+  if (!verified) { const e = new Error("challenge-failed"); e.unreachable = true; throw e; }
+  let r;
+  try {
+    r = await fetch(BRIDGE + "/media/formats", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-FetchForge-Token": token },
+      body: JSON.stringify({ url }),
+    });
+  } catch (_) {
+    const e = new Error("bridge unreachable"); e.unreachable = true; throw e;
+  }
   if (!r.ok) throw new Error("bridge-" + r.status);
   return await r.json();
 }
@@ -446,17 +465,18 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // the content script captured from the player (round 6).
     if (!_sender || !_sender.tab) { sendResponse({ ok: false, error: "No tab" }); return false; }
     const referer = msg.referer || (_sender && _sender.url) || (_sender.tab && _sender.tab.url) || undefined;
-    sendDownload(msg.url, msg.filename, referer, msg.audioUrl, msg.formatId, msg.manifestText).then((r) => sendResponse({ ok: r.ok, error: r.error, duplicate: r.duplicate, viaBrowser: r.viaBrowser }));
+    sendDownload(msg.url, msg.filename, referer, msg.audioUrl, msg.formatId, msg.manifestText, msg.audioOnly).then((r) => sendResponse({ ok: r.ok, error: r.error, duplicate: r.duplicate, viaBrowser: r.viaBrowser }));
     return true;
   }
   if (msg && msg.type === "getFormats") {
     // Quality popup asking for a page's formats (round 6). Only
-    // accept from a real tab's content script; the content script
-    // falls back to a one-click default send on any failure here,
-    // so an error response must never leave the button dead.
+    // accept from a real tab's content script. Failures carry the
+    // unreachable classification (round 8): the popup shows an
+    // error state only when the bridge could not be reached at
+    // all, and degraded rows otherwise — never a silent send.
     if (!_sender || !_sender.tab) { sendResponse({ ok: false, error: "No tab" }); return false; }
     getFormats(msg.url).then((j) => sendResponse(Object.assign({ ok: true }, j)))
-      .catch((e) => sendResponse({ ok: false, error: (e && e.message) || "formats failed" }));
+      .catch((e) => sendResponse({ ok: false, error: (e && e.message) || "formats failed", unreachable: !!(e && e.unreachable) }));
     return true;
   }
   if (msg && msg.type === "overlayCandidates") {

@@ -30,7 +30,7 @@ pub use extract::{
     plan_media_download_or_drive_fallback, FormatKind, MediaDownloadOptions, MediaFormat,
     MediaInfo, MediaPlan, PlanOutcome,
 };
-pub use ffmpeg::{ensure_ffmpeg, find_ffmpeg, merge_av};
+pub use ffmpeg::{ensure_ffmpeg, extract_audio, find_ffmpeg, merge_av};
 pub use image::{
     ensure_image_extension, image_ext_for_content_type, is_image_content_type, is_image_url,
     parse_srcset, pick_best_srcset_url, pick_srcset_url, url_path_extension, SrcsetCandidate,
@@ -38,10 +38,10 @@ pub use image::{
 pub use filename::{sanitize_filename, unique_path};
 pub use id::generate_download_id;
 pub use media::{
-    download_dash, download_dash_with, download_hls, download_hls_pair, download_hls_variant,
-    estimate_total_bytes, is_manifest_url, list_stream_formats, stream_kind_of_content_type,
-    stream_kind_of_url, CapturedManifest, DashDownloadOptions, StreamKind,
-    MAX_CAPTURED_MANIFEST_BYTES,
+    download_dash, download_dash_with, download_hls, download_hls_audio_only, download_hls_pair,
+    download_hls_variant, estimate_total_bytes, is_manifest_url, list_stream_formats,
+    stream_kind_of_content_type, stream_kind_of_url, CapturedManifest, DashDownloadOptions,
+    StreamKind, MAX_CAPTURED_MANIFEST_BYTES,
 };
 pub use threed::{
     download_gltf_bundle, fetch_gltf_plan, gltf_dependency_uris, is_gltf_url, is_model_url,

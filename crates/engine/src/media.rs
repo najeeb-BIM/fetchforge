@@ -732,26 +732,149 @@ pub fn parse_hls_master(text: &str, base_url: &str) -> HlsMaster {
     master
 }
 
-/// Parse an HLS media playlist into its segment URLs (resolved
-/// against `base_url`). Refuses encrypted playlists (EXT-X-KEY)
-/// and playlists with no segments.
-pub fn parse_hls_segments(text: &str, base_url: &str) -> Result<Vec<String>, String> {
+/// One HLS media segment: a URL plus the byte range of it the
+/// playlist assigns (`#EXT-X-BYTERANGE`), if any. A range means
+/// the segment is a SLICE of the URL's file, not the whole file:
+/// totallyacdn (atlantic, 2026-11-23) serves a film as byte
+/// ranges of ONE 12.68 GB MP4, and a fetch without the Range
+/// header streams that whole file until the read times out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HlsSegment {
+    pub url: String,
+    /// Inclusive byte range `(start, end)`, or None for a
+    /// whole-file segment.
+    pub range: Option<(u64, u64)>,
+}
+
+/// A parsed HLS media playlist: its segments plus the optional
+/// init segment (`#EXT-X-MAP` — the fMP4 header a byterange
+/// playlist's segments do not carry themselves; the player
+/// fetches it once and prepends it, and so must we, or the
+/// assembled file has no header and will not play).
+#[derive(Debug, Clone, Default)]
+pub struct HlsMediaPlaylist {
+    pub init: Option<HlsSegment>,
+    pub segments: Vec<HlsSegment>,
+}
+
+impl HlsMediaPlaylist {
+    /// How many pieces the worker downloads: the media segments
+    /// plus the init segment when present (same convention as
+    /// DASH — the init counts as a piece).
+    pub fn piece_count(&self) -> usize {
+        self.segments.len() + usize::from(self.init.is_some())
+    }
+
+    /// Segments for the downloader: the init segment first (when
+    /// present — same shape as DASH, where the init is piece 0),
+    /// then the media segments in playlist order.
+    fn into_segments(self) -> Vec<Segment> {
+        let mut out: Vec<Segment> = Vec::with_capacity(self.piece_count());
+        if let Some(init) = self.init {
+            out.push(Segment {
+                url: init.url,
+                range: init.range,
+            });
+        }
+        out.extend(self.segments.into_iter().map(|s| Segment {
+            url: s.url,
+            range: s.range,
+        }));
+        out
+    }
+}
+
+/// Parse one `#EXT-X-BYTERANGE` value (`n[@offset]`) into an
+/// inclusive byte range. An omitted offset continues from
+/// `default_offset` (the end of the previous sub-range, or 0 for
+/// the first). A malformed value is an error: silently ignoring
+/// it would fetch a whole multi-GB file instead of one slice.
+fn parse_byterange(value: &str, default_offset: u64) -> Result<(u64, u64), String> {
+    let (len_s, offset) = match value.split_once('@') {
+        Some((n, o)) => (
+            n,
+            o.parse::<u64>()
+                .map_err(|_| format!("Bad #EXT-X-BYTERANGE offset in '{value}'"))?,
+        ),
+        None => (value, default_offset),
+    };
+    let len: u64 = len_s
+        .parse()
+        .map_err(|_| format!("Bad #EXT-X-BYTERANGE length in '{value}'"))?;
+    if len == 0 {
+        return Err(format!(
+            "Bad #EXT-X-BYTERANGE in '{value}': a zero-length range is not a segment"
+        ));
+    }
+    let start = offset;
+    let end = start
+        .checked_add(len - 1)
+        .ok_or_else(|| format!("Bad #EXT-X-BYTERANGE in '{value}': the range overflows"))?;
+    Ok((start, end))
+}
+
+/// Parse an HLS media playlist into its segments (resolved
+/// against `base_url`), with byte ranges (`#EXT-X-BYTERANGE`)
+/// and the init segment (`#EXT-X-MAP`) when present. Refuses
+/// encrypted playlists (EXT-X-KEY) and playlists with no
+/// segments. A `#EXT-X-BYTERANGE` applies to the NEXT segment
+/// URI; an omitted offset continues from the previous segment's
+/// end (or 0 for the first ranged segment). Only the first
+/// `#EXT-X-MAP` is kept: a mid-playlist map change (ad insertion)
+/// cannot be represented in one assembled file.
+pub fn parse_hls_segments(text: &str, base_url: &str) -> Result<HlsMediaPlaylist, String> {
     if text.contains("#EXT-X-KEY") {
         return Err(
             "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
                 .to_string(),
         );
     }
-    let segments: Vec<String> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| resolve(base_url, l))
-        .collect();
-    if segments.is_empty() {
+    let mut playlist = HlsMediaPlaylist::default();
+    let mut pending_range: Option<(u64, u64)> = None;
+    // End of the last sub-range consumed (for omitted offsets);
+    // only ranged segments move it — a whole-file segment in
+    // between does not define a sub-range to continue from.
+    let mut next_offset: u64 = 0;
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(attrs) = line.strip_prefix("#EXT-X-MAP:") {
+            if playlist.init.is_none() {
+                let map: HashMap<&str, &str> = split_attrs(attrs).into_iter().collect();
+                if let Some(uri) = map.get("URI") {
+                    // A MAP byterange without an offset starts at
+                    // 0: the map has no previous sub-range.
+                    let range = match map.get("BYTERANGE") {
+                        Some(v) => Some(parse_byterange(v, 0)?),
+                        None => None,
+                    };
+                    playlist.init = Some(HlsSegment {
+                        url: resolve(base_url, uri),
+                        range,
+                    });
+                }
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("#EXT-X-BYTERANGE:") {
+            pending_range = Some(parse_byterange(value.trim(), next_offset)?);
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        let url = resolve(base_url, line);
+        let range = pending_range.take();
+        if let Some((_, end)) = range {
+            next_offset = end.saturating_add(1);
+        }
+        playlist.segments.push(HlsSegment { url, range });
+    }
+    if playlist.segments.is_empty() {
         return Err("Playlist contains no media segments".to_string());
     }
-    Ok(segments)
+    Ok(playlist)
 }
 
 /// Sum the `#EXTINF:<seconds>,` durations of a media playlist.
@@ -815,7 +938,7 @@ pub fn list_hls_formats(
     let title = title_from_manifest_url(&manifest_url);
     if master.variants.is_empty() {
         // Media playlist: validate it has segments, then one format.
-        let segments = parse_hls_segments(&text, &manifest_base_url(&manifest_url))?;
+        let playlist = parse_hls_segments(&text, &manifest_base_url(&manifest_url))?;
         return Ok(StreamInfo {
             kind: StreamKind::Hls,
             title,
@@ -834,7 +957,7 @@ pub fn list_hls_formats(
                 filesize: None,
                 needs_merge: false,
             }],
-            segment_count: Some(segments.len() as u64),
+            segment_count: Some(playlist.piece_count() as u64),
         });
     }
     let formats = master
@@ -870,7 +993,7 @@ pub fn list_hls_formats(
     let segment_count = match (&default_uri, &default_text) {
         (Some(uri), Some(text)) => parse_hls_segments(text, &manifest_base_url(uri))
             .ok()
-            .map(|s| s.len() as u64),
+            .map(|p| p.piece_count() as u64),
         _ => None,
     };
     Ok(StreamInfo {
@@ -1171,6 +1294,22 @@ pub fn estimate_total_bytes(
     Some(u64::try_from(est).unwrap_or(u64::MAX))
 }
 
+/// Exact total size of a download whose EVERY segment carries
+/// a byte range (HLS `#EXT-X-BYTERANGE`, DASH SegmentList
+/// `@mediaRange`): the sum of the range lengths. None when any
+/// segment is a whole-file fetch — then the measured estimate
+/// (see [`estimate_total_bytes`]) is all there is. With ranges
+/// the UI can show the true size from the first report instead
+/// of "~" extrapolated from a one-segment average.
+fn exact_total_bytes(segments: &[Segment]) -> Option<u64> {
+    let mut total: u128 = 0;
+    for seg in segments {
+        let (s, e) = seg.range?;
+        total += (e as u128).saturating_sub(s as u128) + 1;
+    }
+    Some(u64::try_from(total).unwrap_or(u64::MAX))
+}
+
 /// Directory holding one segment file per downloaded segment for
 /// the parallel path: `<part>.seg/` next to the `.part` file.
 /// Distinct from the legacy sidecar FILE (`<part>.segments`) so a
@@ -1190,23 +1329,34 @@ fn seg_file_name(index: usize) -> String {
 /// manifest must still list the same number of segments with the
 /// same first segment, or the saved pieces belong to a different
 /// playlist and the download restarts cleanly instead of
-/// assembling a corrupt file.
+/// assembling a corrupt file. A ranged first segment also pins
+/// its range: the same URL re-sliced by the CDN (same sign, new
+/// byte ranges) must not resume against the old pieces.
 fn read_seg_meta(seg_dir: &Path, segments: &[Segment]) -> bool {
     let Ok(saved) = std::fs::read_to_string(seg_dir.join("meta")) else {
         return false;
     };
     let mut count: Option<usize> = None;
     let mut first: Option<String> = None;
+    let mut first_range: Option<(u64, u64)> = None;
     for line in saved.lines() {
         if let Some(v) = line.strip_prefix("count=") {
             count = v.parse().ok();
         } else if let Some(v) = line.strip_prefix("first=") {
             first = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("first_range=") {
+            if let Some((s, e)) = v.split_once('-') {
+                if let (Ok(s), Ok(e)) = (s.parse(), e.parse()) {
+                    first_range = Some((s, e));
+                }
+            }
         }
     }
     match (count, first) {
         (Some(n), Some(f)) => {
-            n == segments.len() && segments.first().is_some_and(|s| s.url == f)
+            n == segments.len()
+                && segments.first().is_some_and(|s| s.url == f)
+                && first_range == segments.first().and_then(|s| s.range)
         }
         _ => false,
     }
@@ -1214,10 +1364,11 @@ fn read_seg_meta(seg_dir: &Path, segments: &[Segment]) -> bool {
 
 fn write_seg_meta(seg_dir: &Path, segments: &[Segment]) {
     let first = segments.first().map(|s| s.url.as_str()).unwrap_or("");
-    let _ = std::fs::write(
-        seg_dir.join("meta"),
-        format!("count={}\nfirst={}\n", segments.len(), first),
-    );
+    let mut meta = format!("count={}\nfirst={}\n", segments.len(), first);
+    if let Some((s, e)) = segments.first().and_then(|s| s.range) {
+        meta.push_str(&format!("first_range={s}-{e}\n"));
+    }
+    let _ = std::fs::write(seg_dir.join("meta"), meta);
 }
 
 /// Download `segments` into `part_path`, in parallel over the
@@ -1326,19 +1477,24 @@ fn download_segments(
         Ok(n) => Ok(n),
         Err(e) if should_fallback_sequential(&e, paused, cancelled) => {
             // Round 7: a parallel run that fails a segment on a
-            // TIMEOUT gets one sequential retry. totallyacdn
-            // (atlantic, 2026-11-23) timed out segment 2 with 4
-            // parallel workers + browser headers + HTTP/1.1 — the
-            // CDN appears to throttle concurrent connections from
-            // one client. The retry reuses the same segment dir,
-            // so pieces the parallel pass already landed are not
-            // re-fetched, and it is bounded by the same fail-fast
-            // and stall rules as any other pass. If the retry also
-            // fails, the ORIGINAL error stands: the sequential pass
-            // was a rescue attempt, and it must never rewrite the
-            // failure's diagnosis (e.g. a server that died between
-            // passes would otherwise turn a timeout into a
-            // "connection refused").
+            // TIMEOUT gets one sequential retry (a CDN throttling
+            // concurrent connections from one client may still
+            // serve a single connection). The retry reuses the
+            // same segment dir, so pieces the parallel pass
+            // already landed are not re-fetched, and it is
+            // bounded by the same fail-fast and stall rules as
+            // any other pass. If the retry also fails, the
+            // ORIGINAL error stands: the sequential pass was a
+            // rescue attempt, and it must never rewrite the
+            // failure's diagnosis (e.g. a server that died
+            // between passes would otherwise turn a timeout into
+            // a "connection refused").
+            // NOTE (round 8): the Atlantic case this fallback was
+            // built for turned out NOT to be concurrency at all —
+            // totallyacdn serves byteranged HLS and the engine
+            // was fetching without Range (see parse_hls_segments).
+            // The fallback stays: it is the right rescue for a
+            // genuine concurrency throttle.
             match download_segments_parallel(
                 client,
                 segments,
@@ -1470,6 +1626,10 @@ fn download_segments_parallel(
     let stop = AtomicBool::new(false);
     let first_error: Mutex<Option<String>> = Mutex::new(None);
     let last_progress = Mutex::new(Instant::now());
+    // Exact total when every segment carries a byte range (HLS
+    // byteranges, DASH SegmentList); the measured extrapolation
+    // otherwise (see the report closure below).
+    let known_total = exact_total_bytes(segments);
     let report = |progress: &(dyn Fn(Progress) + Send + Sync)| {
         let dl = downloaded.load(Ordering::Relaxed);
         let dn = done.load(Ordering::Relaxed) as u64;
@@ -1486,8 +1646,11 @@ fn download_segments_parallel(
             // here made the UI show 1324% on a nime DASH download
             // (2.2 GB cumulative bytes against a ~166 MB
             // audio-phase estimate, 2026-11-23).
-            estimated_total: estimate_total_bytes(dl, dn, total)
-                .map(|e| progress_base.saturating_add(e)),
+            estimated_total: known_total
+                .map(|e| progress_base.saturating_add(e))
+                .or_else(|| {
+                    estimate_total_bytes(dl, dn, total).map(|e| progress_base.saturating_add(e))
+                }),
         });
     };
     // Report the resumed state at once, so a resumed download
@@ -1804,6 +1967,9 @@ fn download_segments_sequential(
     let started = Instant::now();
     let mut last_progress = Instant::now();
     let total = segments.len() as u64;
+    // Exact total when every segment carries a byte range (see
+    // the parallel path); the measured extrapolation otherwise.
+    let known_total = exact_total_bytes(segments);
     for (i, seg) in segments.iter().enumerate().skip(start) {
         if cancelled.load(Ordering::Relaxed) {
             drop(out);
@@ -1879,8 +2045,12 @@ fn download_segments_sequential(
             // completed phases' exact bytes plus this phase's
             // measured estimate, so the percent never exceeds 100%
             // on a multi-phase download.
-            estimated_total: estimate_total_bytes(downloaded, done_now, total)
-                .map(|e| progress_base.saturating_add(e)),
+            estimated_total: known_total
+                .map(|e| progress_base.saturating_add(e))
+                .or_else(|| {
+                    estimate_total_bytes(downloaded, done_now, total)
+                        .map(|e| progress_base.saturating_add(e))
+                }),
         });
     }
     drop(out);
@@ -2009,19 +2179,15 @@ pub fn download_hls_variant(
     // Segments resolve against the variant playlist's own URL —
     // unwrapped when the variant came through a proxy worker, so
     // they are fetched from the real CDN, not the proxy origin.
-    let video_segments = parse_hls_segments(&variant_text, &manifest_base_url(&variant_uri))?
-        .into_iter()
-        .map(|url| Segment { url, range: None })
-        .collect::<Vec<_>>();
+    // Byte ranges ride along (see parse_hls_segments): a
+    // byterange playlist's segments are slices of one file, and
+    // fetching them without Range would stream the whole file.
+    let video_segments =
+        parse_hls_segments(&variant_text, &manifest_base_url(&variant_uri))?.into_segments();
     let audio_segments = match &audio_uri {
         Some(uri) => {
             let audio_text = fetch_text(&client, uri, referer)?;
-            Some(
-                parse_hls_segments(&audio_text, uri)?
-                    .into_iter()
-                    .map(|url| Segment { url, range: None })
-                    .collect::<Vec<_>>(),
-            )
+            Some(parse_hls_segments(&audio_text, uri)?.into_segments())
         }
         None => None,
     };
@@ -2082,6 +2248,89 @@ pub fn download_hls_variant(
     Ok(final_path)
 }
 
+/// Download only the audio track of an HLS variant (the popup's
+/// "Audio only" choice, round 8). When the variant's audio lives
+/// on a separate playlist (master audio group), download THAT
+/// playlist alone — never the video. When the audio is muxed
+/// into the variant, download the full variant and let the caller
+/// extract the audio (see [`crate::ffmpeg::extract_audio`]).
+/// Returns the downloaded file (an audio-only `.ts`, or the full
+/// video when muxed); the caller extracts/remuxes it to `.m4a`.
+#[allow(clippy::too_many_arguments)]
+pub fn download_hls_audio_only(
+    manifest_url: &str,
+    variant_uri: &str,
+    destination_dir: &Path,
+    filename: &str,
+    referer: &Option<String>,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
+) -> Result<PathBuf, String> {
+    let manifest_url = validate_url(manifest_url)?;
+    let variant_uri = validate_url(variant_uri)?;
+    // Resolve the variant's audio group from the master (skip the
+    // fetch when the "variant" is the manifest itself — a plain
+    // media playlist, whose audio is muxed by definition).
+    let audio_uri = if variant_uri != manifest_url {
+        let client = hls_client()?;
+        let master_text = manifest_text(&client, &manifest_url, referer, captured)?;
+        if master_text.contains("#EXT-X-KEY") {
+            return Err(
+                "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
+                    .to_string(),
+            );
+        }
+        let master = parse_hls_master(&master_text, &manifest_base_url(&manifest_url));
+        master
+            .variants
+            .iter()
+            .find(|v| v.uri == variant_uri)
+            .and_then(|v| v.audio_group.clone())
+            .and_then(|group| {
+                master
+                    .audio
+                    .iter()
+                    .find(|a| a.group_id == group)
+                    .map(|a| a.uri.clone())
+            })
+    } else {
+        None
+    };
+    match audio_uri {
+        // Separate audio: the audio playlist alone, as a plain
+        // media playlist (no merge — there is no video). The
+        // captured text belongs to the video playlist, so it is
+        // not passed: the audio playlist is fetched normally.
+        Some(uri) => download_hls_variant(
+            &uri,
+            &uri,
+            destination_dir,
+            filename,
+            referer,
+            None,
+            progress,
+            paused,
+            cancelled,
+            None,
+        ),
+        // Muxed: the full variant; the caller extracts the audio.
+        None => download_hls_variant(
+            &manifest_url,
+            &variant_uri,
+            destination_dir,
+            filename,
+            referer,
+            None,
+            progress,
+            paused,
+            cancelled,
+            captured,
+        ),
+    }
+}
+
 /// Download a PAIRED video + audio variant: two media playlists
 /// observed together (no master playlist was available — the
 /// extension saw only the variants, e.g. `v0.m3u8` + `audio_1.m3u8`
@@ -2123,14 +2372,10 @@ pub fn download_hls_pair(
                 .to_string(),
         );
     }
-    let video_segments = parse_hls_segments(&video_text, &manifest_base_url(&video_uri))?
-        .into_iter()
-        .map(|url| Segment { url, range: None })
-        .collect::<Vec<_>>();
-    let audio_segments = parse_hls_segments(&audio_text, &manifest_base_url(&audio_uri))?
-        .into_iter()
-        .map(|url| Segment { url, range: None })
-        .collect::<Vec<_>>();
+    let video_segments =
+        parse_hls_segments(&video_text, &manifest_base_url(&video_uri))?.into_segments();
+    let audio_segments =
+        parse_hls_segments(&audio_text, &manifest_base_url(&audio_uri))?.into_segments();
     let clean = crate::filename::sanitize_filename(filename);
     std::fs::create_dir_all(destination_dir).map_err(|e| e.to_string())?;
     let final_path = crate::filename::unique_path(destination_dir, &clean);
@@ -3306,14 +3551,108 @@ mod tests {
 
     #[test]
     fn parse_hls_segments_resolves_relative_urls_and_refuses_key() {
-        let segs = parse_hls_segments(MEDIA_PLAYLIST, "https://example.com/v/play.m3u8").unwrap();
-        assert_eq!(segs.len(), 3);
-        assert_eq!(segs[0], "https://example.com/v/seg0.ts");
-        assert_eq!(segs[2], "https://example.com/v/sub/seg2.ts");
+        let pl = parse_hls_segments(MEDIA_PLAYLIST, "https://example.com/v/play.m3u8").unwrap();
+        assert!(pl.init.is_none(), "a plain playlist has no init segment");
+        assert_eq!(pl.segments.len(), 3);
+        assert_eq!(pl.segments[0].url, "https://example.com/v/seg0.ts");
+        assert_eq!(pl.segments[0].range, None, "a plain segment has no range");
+        assert_eq!(pl.segments[2].url, "https://example.com/v/sub/seg2.ts");
         let enc = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:10,\nseg0.ts\n";
         let err = parse_hls_segments(enc, "https://example.com/v/play.m3u8").unwrap_err();
         assert!(err.contains("encrypted"), "error: {err}");
         assert!(parse_hls_segments("#EXTM3U\n#EXT-X-ENDLIST\n", "https://example.com/x").is_err());
+    }
+
+    #[test]
+    fn parse_hls_segments_reads_byteranges_with_explicit_offsets() {
+        // totallyacdn (atlantic, 2026-11-23): every segment is a
+        // slice of one giant MP4, addressed by explicit offsets.
+        let text = "#EXTM3U\n#EXTINF:10,\n#EXT-X-BYTERANGE:100@0\nmovie.mp4\n#EXTINF:10,\n#EXT-X-BYTERANGE:200@100\nmovie.mp4\n#EXT-X-ENDLIST\n";
+        let pl = parse_hls_segments(text, "https://cdn.example.com/v/play.m3u8").unwrap();
+        assert!(pl.init.is_none());
+        assert_eq!(pl.segments.len(), 2);
+        assert_eq!(pl.segments[0].url, "https://cdn.example.com/v/movie.mp4");
+        assert_eq!(
+            pl.segments[0].range,
+            Some((0, 99)),
+            "100 bytes at 0 => 0-99"
+        );
+        assert_eq!(pl.segments[1].range, Some((100, 299)));
+        assert_eq!(pl.piece_count(), 2);
+    }
+
+    #[test]
+    fn parse_hls_segments_continues_omitted_offsets() {
+        // An omitted offset continues from the previous segment's
+        // end; the FIRST ranged segment with an omitted offset
+        // starts at 0.
+        let text = "#EXTM3U\n#EXTINF:10,\n#EXT-X-BYTERANGE:50\nmovie.mp4\n#EXTINF:10,\n#EXT-X-BYTERANGE:60\nmovie.mp4\n#EXTINF:10,\n#EXT-X-BYTERANGE:70@500\nmovie.mp4\n#EXTINF:10,\n#EXT-X-BYTERANGE:80\nmovie.mp4\n#EXT-X-ENDLIST\n";
+        let pl = parse_hls_segments(text, "https://cdn.example.com/v/play.m3u8").unwrap();
+        assert_eq!(pl.segments[0].range, Some((0, 49)));
+        assert_eq!(pl.segments[1].range, Some((50, 109)), "continues from 50");
+        assert_eq!(
+            pl.segments[2].range,
+            Some((500, 569)),
+            "explicit offset resets the chain"
+        );
+        assert_eq!(pl.segments[3].range, Some((570, 649)), "continues from 570");
+    }
+
+    #[test]
+    fn parse_hls_segments_whole_file_segment_does_not_break_continuation() {
+        // A whole-file segment between ranged ones carries no
+        // sub-range, so the next omitted offset still continues
+        // from the last RANGED segment's end.
+        let text = "#EXTM3U\n#EXTINF:10,\n#EXT-X-BYTERANGE:100@0\nmovie.mp4\n#EXTINF:10,\nwhole.ts\n#EXTINF:10,\n#EXT-X-BYTERANGE:100\nmovie.mp4\n#EXT-X-ENDLIST\n";
+        let pl = parse_hls_segments(text, "https://cdn.example.com/v/play.m3u8").unwrap();
+        assert_eq!(pl.segments[0].range, Some((0, 99)));
+        assert_eq!(pl.segments[1].range, None);
+        assert_eq!(pl.segments[2].range, Some((100, 199)));
+    }
+
+    #[test]
+    fn parse_hls_segments_reads_map_init_segment() {
+        // fMP4 byterange playlists carry their header in EXT-X-MAP;
+        // without it the assembled file has no ftyp/moov and will
+        // not play. A MAP byterange without an offset starts at 0.
+        let text = "#EXTM3U\n#EXT-X-MAP:URI=\"movie.mp4\",BYTERANGE=\"40@0\"\n#EXTINF:10,\n#EXT-X-BYTERANGE:100@40\nmovie.mp4\n#EXT-X-ENDLIST\n";
+        let pl = parse_hls_segments(text, "https://cdn.example.com/v/play.m3u8").unwrap();
+        let init = pl.init.as_ref().expect("MAP init must be parsed");
+        assert_eq!(init.url, "https://cdn.example.com/v/movie.mp4");
+        assert_eq!(init.range, Some((0, 39)));
+        assert_eq!(pl.piece_count(), 2, "init counts as a piece");
+        // A MAP without BYTERANGE is a whole-file init.
+        let text2 = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:10,\nseg0.m4s\n#EXT-X-ENDLIST\n";
+        let pl2 = parse_hls_segments(text2, "https://cdn.example.com/v/play.m3u8").unwrap();
+        assert_eq!(
+            pl2.init.as_ref().unwrap().url,
+            "https://cdn.example.com/v/init.mp4"
+        );
+        assert_eq!(pl2.init.as_ref().unwrap().range, None);
+        // Only the first MAP is kept (a mid-playlist map change
+        // cannot be represented in one assembled file).
+        let text3 = "#EXTM3U\n#EXT-X-MAP:URI=\"init1.mp4\"\n#EXTINF:10,\nseg0.m4s\n#EXT-X-MAP:URI=\"init2.mp4\"\n#EXTINF:10,\nseg1.m4s\n#EXT-X-ENDLIST\n";
+        let pl3 = parse_hls_segments(text3, "https://cdn.example.com/v/play.m3u8").unwrap();
+        assert_eq!(
+            pl3.init.as_ref().unwrap().url,
+            "https://cdn.example.com/v/init1.mp4"
+        );
+    }
+
+    #[test]
+    fn parse_hls_segments_rejects_malformed_byterange() {
+        // A malformed BYTERANGE must fail the parse loudly: silently
+        // ignoring it would fetch a whole multi-GB file instead of
+        // one slice (the exact atlantic failure).
+        for bad in [
+            "#EXTM3U\n#EXT-X-BYTERANGE:abc@0\nseg.ts\n",
+            "#EXTM3U\n#EXT-X-BYTERANGE:100@xyz\nseg.ts\n",
+            "#EXTM3U\n#EXT-X-BYTERANGE:0@0\nseg.ts\n",
+            "#EXTM3U\n#EXT-X-MAP:URI=\"i.mp4\",BYTERANGE=\"nope\"\n#EXTINF:10,\nseg.ts\n",
+        ] {
+            let err = parse_hls_segments(bad, "https://cdn.example.com/v/play.m3u8").unwrap_err();
+            assert!(err.contains("BYTERANGE"), "error must name the tag: {err}");
+        }
     }
 
     #[test]
@@ -3423,6 +3762,97 @@ mod tests {
                             let _ = stream.write_all(
                                 b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                             );
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        });
+        (port, handle)
+    }
+
+    /// Loopback server for byterange tests: serves `files` by path,
+    /// honouring a single `Range: bytes=a-b` header with 206 + the
+    /// slice, and serving the WHOLE file with 200 when no Range
+    /// header is sent — exactly what totallyacdn does. That makes
+    /// the test fail loudly if the engine ignores byteranges (the
+    /// assembled file comes out N times too long). Records every
+    /// request as `(path, range-header-or-"")` in `hits`, in
+    /// arrival order.
+    fn serve_range_map(
+        files: HashMap<String, Vec<u8>>,
+        hits: std::sync::Arc<Mutex<Vec<(String, String)>>>,
+        stop: std::sync::Arc<AtomicBool>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    let range_hdr = req
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            if k.trim().eq_ignore_ascii_case("range") {
+                                Some(v.trim().to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    hits.lock().unwrap().push((path.clone(), range_hdr.clone()));
+                    let Some(body) = files.get(&path) else {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        let _ = stream.flush();
+                        continue;
+                    };
+                    // Single range only, as the engine sends it.
+                    let range = range_hdr.strip_prefix("bytes=").and_then(|r| {
+                        let (a, b) = r.split_once('-')?;
+                        let a: usize = a.parse().ok()?;
+                        let b: usize = b.parse().ok()?;
+                        if a > b || a >= body.len() {
+                            return None;
+                        }
+                        Some((a, b.min(body.len() - 1)))
+                    });
+                    match range {
+                        Some((a, b)) => {
+                            let slice = &body[a..=b];
+                            let head = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {a}-{b}/{}\r\nConnection: close\r\n\r\n",
+                                slice.len(),
+                                body.len()
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(slice);
+                        }
+                        None => {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(body);
                         }
                     }
                     let _ = stream.flush();
@@ -3757,30 +4187,33 @@ mod tests {
         // query are left alone.
         let base = "https://totallyacdn.cc/aws/hls/024781/audio_1.m3u8?sign=abc123&exp=999";
         let text = "#EXTM3U\n#EXTINF:10,\nseg0.ts\n#EXTINF:10,\nhttps://totallyacdn.cc/aws/hls/024781/seg1.ts\n#EXTINF:10,\nhttps://othercdn.example.com/x/seg2.ts\n#EXTINF:10,\nseg3.ts?token=zzz\n";
-        let segs = parse_hls_segments(text, base).unwrap();
+        let segs = parse_hls_segments(text, base).unwrap().segments;
         assert_eq!(segs.len(), 4);
         assert_eq!(
-            segs[0],
-            "https://totallyacdn.cc/aws/hls/024781/seg0.ts?sign=abc123&exp=999",
+            segs[0].url, "https://totallyacdn.cc/aws/hls/024781/seg0.ts?sign=abc123&exp=999",
             "relative segment must carry the playlist query"
         );
         assert_eq!(
-            segs[1],
-            "https://totallyacdn.cc/aws/hls/024781/seg1.ts?sign=abc123&exp=999",
+            segs[1].url, "https://totallyacdn.cc/aws/hls/024781/seg1.ts?sign=abc123&exp=999",
             "absolute same-origin segment must carry the playlist query"
         );
         assert_eq!(
-            segs[2], "https://othercdn.example.com/x/seg2.ts",
+            segs[2].url, "https://othercdn.example.com/x/seg2.ts",
             "cross-origin segment must NOT inherit the query"
         );
         assert_eq!(
-            segs[3],
-            "https://totallyacdn.cc/aws/hls/024781/seg3.ts?token=zzz",
+            segs[3].url, "https://totallyacdn.cc/aws/hls/024781/seg3.ts?token=zzz",
             "a segment with its own query keeps it"
         );
         // An unsigned playlist resolves plainly (no query invented).
-        let plain = parse_hls_segments("#EXTM3U\n#EXTINF:10,\nseg0.ts\n", "https://cdn.example.com/p/play.m3u8").unwrap();
-        assert_eq!(plain, vec!["https://cdn.example.com/p/seg0.ts".to_string()]);
+        let plain = parse_hls_segments(
+            "#EXTM3U\n#EXTINF:10,\nseg0.ts\n",
+            "https://cdn.example.com/p/play.m3u8",
+        )
+        .unwrap();
+        assert_eq!(plain.segments.len(), 1);
+        assert_eq!(plain.segments[0].url, "https://cdn.example.com/p/seg0.ts");
+        assert_eq!(plain.segments[0].range, None);
     }
 
     #[test]
@@ -3821,8 +4254,242 @@ mod tests {
         server.join().unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"SEGMENT-ZERO-SEGMENT-ONE");
         let hits = hits.lock().unwrap();
-        assert!(hits.contains(&"/seg0.ts?sign=s3cret".to_string()), "hits: {hits:?}");
-        assert!(hits.contains(&"/seg1.ts?sign=s3cret".to_string()), "hits: {hits:?}");
+        assert!(
+            hits.contains(&"/seg0.ts?sign=s3cret".to_string()),
+            "hits: {hits:?}"
+        );
+        assert!(
+            hits.contains(&"/seg1.ts?sign=s3cret".to_string()),
+            "hits: {hits:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_hls_variant_downloads_byteranges() {
+        // End-to-end version of the atlantic root cause (round 8):
+        // totallyacdn serves a film as byte ranges of ONE file.
+        // The test server honours Range with 206 and serves the
+        // WHOLE file on a request without one — so an engine that
+        // ignored byteranges would assemble 3 copies of the whole
+        // file (900 bytes) instead of the 3 slices (300 bytes).
+        // The third segment uses an omitted offset (continuation).
+        let mut file = Vec::new();
+        file.extend(std::iter::repeat_n(b'A', 100));
+        file.extend(std::iter::repeat_n(b'B', 100));
+        file.extend(std::iter::repeat_n(b'C', 100));
+        let playlist = b"#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\n#EXT-X-BYTERANGE:100@0\nmovie.mp4\n#EXTINF:10,\n#EXT-X-BYTERANGE:100@100\nmovie.mp4\n#EXTINF:10,\n#EXT-X-BYTERANGE:100\nmovie.mp4\n#EXT-X-ENDLIST\n".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/play.m3u8".to_string(), playlist);
+        files.insert("/movie.mp4".to_string(), file);
+        let hits: std::sync::Arc<Mutex<Vec<(String, String)>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_range_map(files, hits.clone(), stop.clone());
+        let dir = unique_temp_dir("hls-byterange");
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("http://127.0.0.1:{port}/play.m3u8");
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        // Collect the size estimates: with ranges the total is
+        // EXACT (300), known from the first report.
+        let estimates: std::sync::Arc<Mutex<Vec<Option<u64>>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let estimates_clone = estimates.clone();
+        let out = download_hls_variant(
+            &url,
+            &url,
+            &dir,
+            "out.ts",
+            &None,
+            None,
+            &move |p| estimates_clone.lock().unwrap().push(p.estimated_total),
+            &paused,
+            &cancelled,
+            None,
+        )
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let mut expected = Vec::new();
+        expected.extend(std::iter::repeat_n(b'A', 100));
+        expected.extend(std::iter::repeat_n(b'B', 100));
+        expected.extend(std::iter::repeat_n(b'C', 100));
+        assert_eq!(std::fs::read(&out).unwrap(), expected);
+        let hits = hits.lock().unwrap();
+        let seg_hits: Vec<&(String, String)> =
+            hits.iter().filter(|(p, _)| p == "/movie.mp4").collect();
+        assert_eq!(seg_hits.len(), 3, "three ranged fetches: {hits:?}");
+        for (_, range) in &seg_hits {
+            assert!(
+                range.starts_with("bytes="),
+                "every segment fetch must carry a Range header: {hits:?}"
+            );
+        }
+        assert!(
+            seg_hits.iter().any(|(_, r)| r == "bytes=0-99"),
+            "first slice: {hits:?}"
+        );
+        assert!(
+            seg_hits.iter().any(|(_, r)| r == "bytes=200-299"),
+            "omitted-offset continuation: {hits:?}"
+        );
+        let estimates = estimates.lock().unwrap();
+        assert!(
+            estimates.iter().any(|e| *e == Some(300)),
+            "exact total (300) must be reported: {estimates:?}"
+        );
+        assert!(
+            estimates.iter().all(|e| e.is_none() || *e == Some(300)),
+            "no other estimate may appear: {estimates:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_hls_variant_prepends_map_init() {
+        // The EXT-X-MAP init segment is fetched once (with its own
+        // byterange) and prepended to the assembled file — without
+        // it the file has no ftyp/moov header and will not play.
+        let mut file = Vec::new();
+        file.extend(std::iter::repeat_n(b'I', 40));
+        file.extend(std::iter::repeat_n(b'A', 100));
+        file.extend(std::iter::repeat_n(b'B', 100));
+        let playlist = b"#EXTM3U\n#EXT-X-MAP:URI=\"movie.mp4\",BYTERANGE=\"40@0\"\n#EXTINF:10,\n#EXT-X-BYTERANGE:100@40\nmovie.mp4\n#EXTINF:10,\n#EXT-X-BYTERANGE:100\nmovie.mp4\n#EXT-X-ENDLIST\n".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/play.m3u8".to_string(), playlist);
+        files.insert("/movie.mp4".to_string(), file);
+        let hits: std::sync::Arc<Mutex<Vec<(String, String)>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_range_map(files, hits.clone(), stop.clone());
+        let dir = unique_temp_dir("hls-map");
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("http://127.0.0.1:{port}/play.m3u8");
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let totals: std::sync::Arc<Mutex<Vec<Option<u64>>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let totals_clone = totals.clone();
+        let out = download_hls_variant(
+            &url,
+            &url,
+            &dir,
+            "out.mp4",
+            &None,
+            None,
+            &move |p| totals_clone.lock().unwrap().push(p.segments_total),
+            &paused,
+            &cancelled,
+            None,
+        )
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let mut expected = Vec::new();
+        expected.extend(std::iter::repeat_n(b'I', 40));
+        expected.extend(std::iter::repeat_n(b'A', 100));
+        expected.extend(std::iter::repeat_n(b'B', 100));
+        assert_eq!(std::fs::read(&out).unwrap(), expected);
+        let hits = hits.lock().unwrap();
+        assert!(
+            hits.iter()
+                .any(|(p, r)| p == "/movie.mp4" && r == "bytes=0-39"),
+            "the init slice must be fetched: {hits:?}"
+        );
+        let totals = totals.lock().unwrap();
+        assert!(
+            totals.iter().any(|t| *t == Some(3)),
+            "init + 2 segments = 3 pieces: {totals:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_hls_audio_only_downloads_only_the_audio_playlist() {
+        // The popup's "Audio only" choice for a master variant
+        // with a separate audio track: the audio playlist alone is
+        // downloaded — the video playlist is never even fetched.
+        let master = b"#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\",URI=\"audio.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720,AUDIO=\"aac\"\nvideo.m3u8\n#EXT-X-ENDLIST\n".to_vec();
+        let video_pl = b"#EXTM3U\n#EXTINF:10,\nv0.ts\n#EXT-X-ENDLIST\n".to_vec();
+        let audio_pl =
+            b"#EXTM3U\n#EXTINF:10,\na0.ts\n#EXTINF:10,\na1.ts\n#EXT-X-ENDLIST\n".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/master.m3u8".to_string(), master);
+        files.insert("/video.m3u8".to_string(), video_pl);
+        files.insert("/audio.m3u8".to_string(), audio_pl);
+        files.insert("/v0.ts".to_string(), b"VIDEO-BYTES".to_vec());
+        files.insert("/a0.ts".to_string(), b"AUDIO-ZERO-".to_vec());
+        files.insert("/a1.ts".to_string(), b"AUDIO-ONE".to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits.clone(), stop.clone());
+        let dir = unique_temp_dir("hls-audio-only");
+        std::fs::create_dir_all(&dir).unwrap();
+        let master_url = format!("http://127.0.0.1:{port}/master.m3u8");
+        let video_url = format!("http://127.0.0.1:{port}/video.m3u8");
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let out = download_hls_audio_only(
+            &master_url,
+            &video_url,
+            &dir,
+            "audio.ts",
+            &None,
+            &|_| {},
+            &paused,
+            &cancelled,
+            None,
+        )
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"AUDIO-ZERO-AUDIO-ONE");
+        let hits = hits.lock().unwrap();
+        assert!(
+            !hits
+                .iter()
+                .any(|h: &String| h.contains("video.m3u8") || h.contains("v0.ts")),
+            "the video track must never be fetched: {hits:?}"
+        );
+        assert!(hits.contains(&"/audio.m3u8".to_string()), "hits: {hits:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_hls_audio_only_falls_back_to_the_muxed_variant() {
+        // No separate audio track: the full (muxed) variant is
+        // downloaded and the caller extracts the audio from it.
+        let master = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720\nvideo.m3u8\n#EXT-X-ENDLIST\n".to_vec();
+        let video_pl = b"#EXTM3U\n#EXTINF:10,\nv0.ts\n#EXT-X-ENDLIST\n".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/master.m3u8".to_string(), master);
+        files.insert("/video.m3u8".to_string(), video_pl);
+        files.insert("/v0.ts".to_string(), b"MUXED-BYTES".to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let dir = unique_temp_dir("hls-audio-muxed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let master_url = format!("http://127.0.0.1:{port}/master.m3u8");
+        let video_url = format!("http://127.0.0.1:{port}/video.m3u8");
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let out = download_hls_audio_only(
+            &master_url,
+            &video_url,
+            &dir,
+            "audio.ts",
+            &None,
+            &|_| {},
+            &paused,
+            &cancelled,
+            None,
+        )
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"MUXED-BYTES");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

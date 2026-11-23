@@ -1014,16 +1014,19 @@
   function isManifestUrl(url) { return /\.(m3u8|mpd)([?#]|$)/i.test(String(url || "")); }
   function isDashUrl(url) { return /\.mpd([?#]|$)/i.test(String(url || "")); }
   function isMp4FamilyUrl(url) { return /\.(mp4|mov|m4v)([?#]|$)/i.test(String(url || "")); }
+  // Any direct video file (round 8): every download click on one
+  // shows the popup — no silent one-click sends for video.
+  function isVideoFileUrl(url) { return /\.(mp4|mov|m4v|mkv|webm|avi|ts|m2ts)([?#]|$)/i.test(String(url || "")); }
 
   // ---- Direct-file clip guard (round 7, Fix 6) ----
   //
   // The verdict can still be a short ad clip when the movie's
   // playlist is invisible (novahd 2026-11-23: a 15-second
   // /assets/p/*.mp4 clip was sent as "the movie" three times).
-  // Before a one-click send of a direct file on a long-form watch
-  // page, probe the file's duration from its moov/mvhd boxes; a
+  // Before a direct-file download on a long-form watch page,
+  // probe the file's duration from its moov/mvhd boxes; a
   // known-short clip is refused honestly on the button. Any probe
-  // failure fails OPEN (the send proceeds) — the button must
+  // failure fails OPEN (the popup opens) — the button must
   // never break a legitimate download. Same-origin only in
   // practice: a cross-origin fetch without CORS fails and
   // returns null (fail open). No host permissions are added.
@@ -1114,10 +1117,14 @@
     const audioUrl = ("audioUrl" in opts) ? opts.audioUrl : dl.audioUrl;
     const manifestText = ("manifestText" in opts) ? opts.manifestText : dl.manifestText;
     const filename = ("filename" in opts && opts.filename) ? opts.filename : defaultFilenameFor(dl);
+    // The popup's "Audio only" choice (round 8): the app delivers
+    // an audio file instead of the video. Undefined for a video
+    // send (the background drops it from the request).
+    const audioOnly = !!opts.audioOnly;
     btn.disabled = true;
     btn.textContent = "Sending…";
     btn.title = "";
-    sendRuntimeMessage({ type: "downloadMedia", url: url, filename: filename, audioUrl: audioUrl, referer: dl.referer, formatId: opts.formatId, manifestText: manifestText }).then(function (resp) {
+    sendRuntimeMessage({ type: "downloadMedia", url: url, filename: filename, audioUrl: audioUrl, referer: dl.referer, formatId: opts.formatId, manifestText: manifestText, audioOnly: audioOnly }).then(function (resp) {
       if (resp && resp.duplicate) {
         // Nothing new was queued: the file is already in the
         // app's downloads. Say so honestly — "Sent" would be a
@@ -1167,14 +1174,15 @@
     // closes it instead of sending.
     if (popupOpen) { closeQualityPopup(); return; }
     const dl = currentDownload;
-    // HLS master with real choices: parse the captured master text
+    // HLS master with choices: parse the captured master text
     // (from the verdict) into variant rows and let the user pick.
-    // A master with a single variant and no audio groups is not a
-    // real choice — it falls through to the one-click send.
+    // Round 8: a master with even ONE variant opens the popup —
+    // the audio choice alone is worth showing, and no video click
+    // sends silently any more.
     const masterText = dl.masterText || dl.manifestText;
     if (masterText) {
       const parsed = parseHlsMaster(masterText, dl.url);
-      if (parsed && parsed.rows.length >= 2) { openHlsPopup(btn, dl, parsed); return; }
+      if (parsed && parsed.rows.length >= 1) { openHlsPopup(btn, dl, parsed); return; }
     }
     // Page URL (viaPage, e.g. YouTube): ask the app for the
     // page's formats and let the user pick a quality.
@@ -1182,14 +1190,14 @@
     // DASH manifest (nime's VidLink index_web.mpd): ask the app
     // for the manifest's formats and let the user pick a quality,
     // like a page URL. The bridge fetches the .mpd itself; if it
-    // cannot, the popup falls back to the one-click send.
+    // cannot, the popup still shows with the default quality.
     if (isDashUrl(dl.url)) { openFormatsPopup(btn, dl); return; }
-    // Direct files (image/3D/PDF/direct .mp4) and single-variant
-    // streams keep the current one-click send: no popup, no choice
-    // to make. EXCEPT a direct mp4-family file on a long-form
-    // watch page (a video over 10 minutes is playing somewhere on
-    // the page): probe its duration first — a known-short clip is
-    // refused honestly instead of being sent as the movie.
+    // Direct mp4-family files on a long-form watch page (a video
+    // over 10 minutes is playing somewhere on the page): probe
+    // the file's duration first — a known-short clip is refused
+    // honestly instead of being sent as the movie (round-7 clip
+    // guard). The refusal shows INSTEAD of the popup, never
+    // behind it; a probe failure fails OPEN to the popup.
     if (!isManifestUrl(dl.url) && isMp4FamilyUrl(dl.url) && (dl.pageVideoDuration || 0) > 600) {
       btn.disabled = true;
       btn.textContent = "Checking…";
@@ -1204,11 +1212,29 @@
             btn.title = "";
           }, 5000);
         } else {
-          sendCurrentDownload(btn, dl, {});
+          // The probe disabled the button: restore it before the
+          // popup opens, or the button sits disabled on
+          // "Checking…" while the user picks a quality.
+          btn.disabled = false;
+          btn.textContent = "↓ FetchForge";
+          btn.title = "";
+          openSimplePopup(btn, dl);
         }
-      }).catch(function () { sendCurrentDownload(btn, dl, {}); });
+      }).catch(function () {
+        btn.disabled = false;
+        btn.textContent = "↓ FetchForge";
+        btn.title = "";
+        openSimplePopup(btn, dl);
+      });
       return;
     }
+    // Single-variant HLS (a media playlist, no master text) and
+    // direct video files: the popup still appears (round 8 — no
+    // silent one-click sends for video) with the one known quality
+    // plus the audio choice.
+    if (isManifestUrl(dl.url) || isVideoFileUrl(dl.url)) { openSimplePopup(btn, dl); return; }
+    // Images, 3D models, PDFs and documents keep the one-click
+    // send: there is no quality or audio choice to make.
     sendCurrentDownload(btn, dl, {});
   }
 
@@ -1216,12 +1242,17 @@
   //
   // Parses captured master-playlist text into variant rows reading
   // like `1080p · 5.2 Mbps · H.264` (resolution · bandwidth ·
-  // friendly codec name), sorted by BANDWIDTH descending, plus
+  // friendly codec name), sorted by HEIGHT descending, then
+  // bandwidth (round 8: the quality ladder is highest-first —
+  // 1080 or higher, then 720, then 480, then lower), plus
   // audio-only rows from EXT-X-MEDIA audio groups. The top row is
-  // the highest-bandwidth variant, labelled "Best" and pre-selected.
-  // Returns { rows: [{ label, url, audioUrl?, selected }] } or null
-  // when the text is not a master playlist (no #EXT-X-STREAM-INF).
-  // Relative variant URIs resolve against the master URL.
+  // the highest variant, labelled "Best" and pre-selected.
+  // Returns { rows: [{ label, url, audioUrl?, audioOnly?, selected }], hasAudioRows }
+  // or null when the text is not a master playlist (no
+  // #EXT-X-STREAM-INF). Relative variant URIs resolve against the
+  // master URL. hasAudioRows says whether any audio-only row was
+  // added: when false the audio is muxed into the variants, and
+  // the popup offers an "Audio only" row for the best variant.
   function parseHlsAttrs(s) {
     const out = {};
     const re = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/g;
@@ -1288,11 +1319,14 @@
       }
     }
     if (!variants.length) return null; // not a master playlist
+    // Quality ladder, highest first: height, then bandwidth.
+    // (A 720p variant at a fat bitrate must never outrank 1080p.)
     variants.sort(function (a, b) {
+      const ah = hlsVariantHeight(a.attrs), bh = hlsVariantHeight(b.attrs);
+      if (bh !== ah) return bh - ah;
       const ab = Number(a.attrs.BANDWIDTH || a.attrs["AVERAGE-BANDWIDTH"] || 0);
       const bb = Number(b.attrs.BANDWIDTH || b.attrs["AVERAGE-BANDWIDTH"] || 0);
-      if (bb !== ab) return bb - ab;
-      return hlsVariantHeight(b.attrs) - hlsVariantHeight(a.attrs);
+      return bb - ab;
     });
     const rows = [];
     const seenUrls = new Set();
@@ -1321,14 +1355,18 @@
     });
     // Audio-only rows, one per audio group with a downloadable URI.
     // A group without a URI has its audio embedded in the variants
-    // and offers nothing to download separately.
+    // and offers nothing to download separately. audioOnly marks
+    // the row so the popup sends it with the audio-only flag —
+    // without it the audio playlist would download as a video file.
+    let hasAudioRows = false;
     Object.keys(audioGroups).forEach(function (gid) {
       const g = audioGroups[gid];
       if (!g.uri || seenUrls.has(g.uri)) return;
       seenUrls.add(g.uri);
-      rows.push({ label: "Audio only" + (g.name ? " · " + g.name : ""), url: g.uri, audioUrl: undefined, selected: false });
+      hasAudioRows = true;
+      rows.push({ label: "Audio only" + (g.name ? " · " + g.name : ""), url: g.uri, audioUrl: undefined, audioOnly: true, selected: false });
     });
-    return { rows: rows };
+    return { rows: rows, hasAudioRows: hasAudioRows };
   }
 
   // ---- IDM-style quality popup (round 6, study C1–C3) ----
@@ -1413,9 +1451,65 @@
       addQualityRow(r.label, !!r.selected, function () {
         const name = currentPopupFilename();
         closeQualityPopup();
-        sendCurrentDownload(btn, dl, { url: r.url, audioUrl: r.audioUrl, manifestText: capturedTextFor(r.url), filename: name });
+        sendCurrentDownload(btn, dl, { url: r.url, audioUrl: r.audioUrl, manifestText: capturedTextFor(r.url), filename: name, audioOnly: !!r.audioOnly });
       });
     });
+    // Muxed master (no separate audio track to pick): offer the
+    // audio of the best variant — the engine extracts it after
+    // the download (round 8).
+    if (!parsed.hasAudioRows && parsed.rows.length) {
+      const best = parsed.rows[0];
+      addQualityRow("Audio only", false, function () {
+        const name = currentPopupFilename();
+        closeQualityPopup();
+        sendCurrentDownload(btn, dl, { url: best.url, audioUrl: undefined, manifestText: capturedTextFor(best.url), filename: name, audioOnly: true });
+      });
+    }
+  }
+  // The popup for downloads with exactly one known quality (round
+  // 8): a single-variant HLS media playlist or a direct video
+  // file. No silent one-click send for video — the user always
+  // sees the video choice and the audio choice.
+  function openSimplePopup(btn, dl) {
+    if (!openQualityPopup("Choose quality", null, popupDefaultName(dl, null))) return;
+    // The one known quality: the container when the URL names one.
+    const m = /\.([a-z0-9]+)([?#]|$)/i.exec(dl.url || "");
+    const container = m ? m[1].toUpperCase() : "";
+    addQualityRow("Video" + (container ? " · " + container : ""), true, function () {
+      const name = currentPopupFilename();
+      closeQualityPopup();
+      sendCurrentDownload(btn, dl, { filename: name });
+    });
+    // Audio only: a paired audio sibling downloads alone (the
+    // captured text belongs to the video playlist, so it is NOT
+    // sent along); otherwise the engine extracts the audio from
+    // the video after downloading it.
+    addQualityRow("Audio only", false, function () {
+      const name = currentPopupFilename();
+      closeQualityPopup();
+      if (dl.audioUrl) {
+        sendCurrentDownload(btn, dl, { url: dl.audioUrl, audioUrl: undefined, manifestText: undefined, filename: name, audioOnly: true });
+      } else {
+        sendCurrentDownload(btn, dl, { filename: name, audioOnly: true });
+      }
+    });
+  }
+  // Sort bridge formats into the popup ladder (round 8): video
+  // highest-first (height, then bitrate), audio-only rows last.
+  // The server already sorts best-first; this is defence in depth
+  // (and the unit under test for the ladder order).
+  function sortFormatsForPopup(formats) {
+    const list = (formats || []).slice();
+    function audioRank(f) { return f && f.kind === "audio_only" ? 1 : 0; }
+    list.sort(function (a, b) {
+      const ar = audioRank(a), br = audioRank(b);
+      if (ar !== br) return ar - br;
+      const ah = Number(a.height || 0), bh = Number(b.height || 0);
+      if (ah !== bh) return bh - ah;
+      const av = Number(a.vbr || 0), bv = Number(b.vbr || 0);
+      return bv - av;
+    });
+    return list;
   }
   function openFormatsPopup(btn, dl) {
     if (!openQualityPopup("Choose quality", null, popupDefaultName(dl, null))) return;
@@ -1425,37 +1519,57 @@
     floatOverlay.popupBody.appendChild(loading);
     const reqId = ++popupRequestId;
     let settled = false;
-    // On timeout or error, fall back to the one-click send at
-    // default quality — NEVER leave the user with a dead button.
-    // Every path checks reqId: if the popup was closed meanwhile
-    // (X, outside click, verdict change), nothing is sent at all.
-    function fallbackOneClick() {
+    // Round 8: NEVER a silent one-click send. When the formats
+    // cannot be determined but the bridge IS reachable, the popup
+    // still shows with the single known quality plus the audio
+    // choice (DASH only — a page URL's audio needs the quality
+    // list, yt-dlp has no usable audio path without a format id).
+    // Only a total failure to reach the bridge shows an error
+    // state in the popup. Every path checks reqId: if the popup
+    // was closed meanwhile (X, outside click, verdict change),
+    // nothing is shown or sent at all.
+    function showDegradedPopup() {
       if (reqId !== popupRequestId) return;
-      // If the user typed a name while the qualities were loading,
-      // keep it — the fallback must not throw their rename away.
-      const name = popupFilenameDirty ? currentPopupFilename() : null;
-      closeQualityPopup();
-      sendCurrentDownload(btn, dl, name ? { filename: name } : {});
+      floatOverlay.popupTitle.textContent = "Choose quality";
+      floatOverlay.popupSubtitle.textContent = "Quality info unavailable";
+      floatOverlay.popupSubtitle.style.display = "block";
+      floatOverlay.popupBody.textContent = "";
+      popupRows = [];
+      addQualityRow("Video · default quality", true, function () {
+        const name = currentPopupFilename();
+        closeQualityPopup();
+        sendCurrentDownload(btn, dl, { filename: name });
+      });
+      if (isDashUrl(dl.url)) {
+        addQualityRow("Audio only", false, function () {
+          const name = currentPopupFilename();
+          closeQualityPopup();
+          sendCurrentDownload(btn, dl, { filename: name, audioOnly: true });
+        });
+      }
+    }
+    function showUnreachableError() {
+      if (reqId !== popupRequestId) return;
+      floatOverlay.popupTitle.textContent = "FetchForge app not reachable";
+      floatOverlay.popupSubtitle.textContent = "Open the FetchForge app and check the extension is paired, then try again.";
+      floatOverlay.popupSubtitle.style.display = "block";
+      floatOverlay.popupBody.textContent = "";
+      popupRows = [];
     }
     const timer = window.setTimeout(function () {
       if (settled) return;
       settled = true;
-      fallbackOneClick();
+      // Timeout: the bridge is likely busy (yt-dlp extraction is
+      // slow), not down — show the degraded popup, not an error.
+      showDegradedPopup();
     }, FORMATS_TIMEOUT_MS);
     sendRuntimeMessage({ type: "getFormats", url: dl.url }).then(function (resp) {
       if (settled || reqId !== popupRequestId) return;
       settled = true;
       window.clearTimeout(timer);
+      if (resp && resp.unreachable) { showUnreachableError(); return; }
       if (!resp || !resp.ok || !Array.isArray(resp.formats) || !resp.formats.length) {
-        fallbackOneClick();
-        return;
-      }
-      // A single format is not a real choice — fall through to the
-      // one-click send at that quality instead of showing a popup
-      // with one row (same rule as the HLS master path, and the
-      // DASH single-representation case).
-      if (resp.formats.length < 2) {
-        fallbackOneClick();
+        showDegradedPopup();
         return;
       }
       floatOverlay.popupTitle.textContent = "Choose quality";
@@ -1472,7 +1586,9 @@
       floatOverlay.popupBody.textContent = "";
       popupRows = [];
       let anySelected = false;
-      resp.formats.forEach(function (f) {
+      // A single format ALSO shows the popup now (round 8): the
+      // one row plus the filename field, no silent send.
+      sortFormatsForPopup(resp.formats).forEach(function (f) {
         const selected = !anySelected && f.format_id === resp.default_format_id;
         if (selected) anySelected = true;
         addQualityRow(f.label || f.format_id, selected, function () {
@@ -1496,7 +1612,9 @@
       if (settled || reqId !== popupRequestId) return;
       settled = true;
       window.clearTimeout(timer);
-      fallbackOneClick();
+      // The runtime message itself failed (the background script
+      // is unreachable): the bridge cannot be reached from here.
+      showUnreachableError();
     });
   }
 

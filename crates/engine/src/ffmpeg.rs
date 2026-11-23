@@ -311,6 +311,55 @@ pub fn merge_av(
     ))
 }
 
+/// Extract the audio track of a downloaded video into a standalone
+/// audio file with ffmpeg (the popup's "Audio only" choice for
+/// direct MP4s and muxed HLS variants). First attempt is a stream
+/// copy (`-vn -c:a copy`: no re-encode, no quality loss); that
+/// fails only when the source codec cannot live in the target
+/// container, in which case a single AAC re-encode is retried
+/// (only then — a codec that copies must never be re-encoded).
+/// The caller picks the output container (`.m4a` for AAC-family
+/// sources); a failed extraction removes any partial output and
+/// returns ffmpeg's error tail, exactly like [`merge_av`].
+pub fn extract_audio(ffmpeg: &Path, input: &Path, output: &Path) -> Result<(), String> {
+    let run = |args: &[&str]| -> Result<(), String> {
+        let mut cmd = Command::new(ffmpeg);
+        cmd.args(["-y", "-i"])
+            .arg(input)
+            .args(args)
+            .arg(output)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        no_console_window(&mut cmd);
+        let out = cmd
+            .output()
+            .map_err(|e| format!("Could not run ffmpeg to extract the audio track ({e})."))?;
+        if out.status.success() && output.is_file() {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(output);
+        let tail: String = String::from_utf8_lossy(&out.stderr)
+            .chars()
+            .rev()
+            .take(300)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        Err(format!("ffmpeg could not extract the audio track. {tail}"))
+    };
+    // Stream copy first: the common case (AAC in MP4) is lossless
+    // and near-instant. Re-encode only when the copy is impossible.
+    match run(&["-vn", "-c:a", "copy"]) {
+        Ok(()) => Ok(()),
+        Err(copy_err) => match run(&["-vn", "-c:a", "aac"]) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(copy_err),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +532,100 @@ mod tests {
         let out2 = dir.join("merged2.mp4");
         assert!(merge_av(&ffmpeg, &bad, &audio, &out2).is_err());
         assert!(!out2.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_audio_copies_aac_and_reencodes_only_when_copy_fails() {
+        // Needs a real ffmpeg; skip (do not fail) where none exists,
+        // so the suite stays green on machines without ffmpeg.
+        let ffmpeg = match find_on_path(ffmpeg_exe_name()) {
+            Some(p) => p,
+            None => return,
+        };
+        let dir = unique_temp_dir("extract-audio");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |args: &[&str]| {
+            Command::new(&ffmpeg)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        // Case 1: AAC in MP4 — stream copy, no re-encode. The
+        // output must be audio-only (no video stream) and decode.
+        let muxed = dir.join("muxed.mp4");
+        assert!(mk(&[
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:d=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            muxed.to_str().unwrap()
+        ]));
+        let out = dir.join("audio.m4a");
+        extract_audio(&ffmpeg, &muxed, &out).unwrap();
+        assert!(out.is_file());
+        assert!(std::fs::metadata(&out).unwrap().len() > 0);
+        let probe = Command::new(&ffmpeg)
+            .arg("-i")
+            .arg(&out)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        let info = String::from_utf8_lossy(&probe.stderr);
+        assert!(info.contains("Audio: aac"), "probe: {info}");
+        assert!(
+            !info.contains("Video:"),
+            "output must be audio-only: {info}"
+        );
+        // Case 2: PCM in MKV cannot be copied into .m4a (the mp4
+        // muxer has no tag for pcm_s16le), so the single AAC
+        // re-encode fallback must produce a working .m4a.
+        let pcm = dir.join("pcm.mkv");
+        assert!(mk(&[
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:d=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "pcm_s16le",
+            pcm.to_str().unwrap()
+        ]));
+        let out2 = dir.join("audio2.m4a");
+        extract_audio(&ffmpeg, &pcm, &out2).unwrap();
+        assert!(out2.is_file());
+        assert!(std::fs::metadata(&out2).unwrap().len() > 0);
+        // Case 3: garbage in is a clear error with no partial output.
+        let bad = dir.join("bad.mp4");
+        std::fs::write(&bad, b"not a video").unwrap();
+        let out3 = dir.join("audio3.m4a");
+        assert!(extract_audio(&ffmpeg, &bad, &out3).is_err());
+        assert!(!out3.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -129,6 +129,144 @@ pub struct DownloadRecord {
     /// `#[serde(default)]` so older history files still load.
     #[serde(default)]
     pub audio_only: bool,
+    /// Media downloads only (round 10, item 8): the quality the
+    /// user picked, as the site DECLARED it — the variant's height
+    /// in pixels and its bandwidth in kbps, recorded at plan time.
+    /// Compared against the delivered values at completion: when
+    /// the site mislabels its top variant (Soap2Day 2026-11-23:
+    /// picked "1080p 3 Mbps", delivered 720p at 865 kb/s), the
+    /// record says so instead of claiming the picked quality.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub picked_height: Option<u32>,
+    #[serde(default)]
+    pub picked_vbr_kbps: Option<u32>,
+    /// Media downloads only (round 10, item 8): the quality the
+    /// file ACTUALLY is, probed with ffmpeg at completion
+    /// (best-effort: None when ffmpeg is unavailable or the probe
+    /// fails — the download still completes).
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub delivered_height: Option<u32>,
+    #[serde(default)]
+    pub delivered_bitrate_kbps: Option<u32>,
+    /// Media downloads only (round 10, item 8): a plain-English
+    /// note when the delivered stream is clearly worse than the
+    /// picked one (e.g. "Delivered 720p at ~865 kb/s; the site
+    /// listed this stream as 1080p / 3000 kb/s"). None when the
+    /// delivered quality matches the pick, or when either side
+    /// is unknown.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub quality_note: Option<String>,
+}
+
+impl DownloadRecord {
+    /// Apply one progress report, monotonically (round 10, items
+    /// 2/6): progress never moves backwards. A phase change (the
+    /// HLS audio phase restarting its segment counter — Plex
+    /// 2026-11-23 went 645/820 back to 353/821 while bytes kept
+    /// growing) or a re-plan with a smaller total must not lower
+    /// a counter the UI already showed. The estimate is the one
+    /// exception: it refines as segments land, so the latest
+    /// value wins.
+    pub fn apply_progress(&mut self, p: &crate::download::Progress) {
+        self.downloaded_bytes = self.downloaded_bytes.max(p.downloaded);
+        if let Some(t) = p.total {
+            self.total_bytes = Some(self.total_bytes.map_or(t, |old| old.max(t)));
+        }
+        if let Some(d) = p.segments_done {
+            self.segments_done = self.segments_done.max(d);
+        }
+        if let Some(t) = p.segments_total {
+            self.segments_total = Some(self.segments_total.map_or(t, |old| old.max(t)));
+        }
+        if let Some(e) = p.estimated_total {
+            self.estimated_total_bytes = Some(e);
+        }
+        self.updated_unix = now_secs();
+    }
+
+    /// Mark the record Completed for the finished file (round 10,
+    /// item 2): the file on disk is the truth about its size. A
+    /// plan total can be badly wrong (the novahd yt-dlp record
+    /// claimed 121 MB for a 3.37 GB file, because the video
+    /// format had no filesize and the total was the audio track
+    /// alone), so the completed record reconciles against the
+    /// real file size instead of trusting the plan. When the file
+    /// cannot be statted, the old behaviour stands (downloaded =
+    /// planned total, or the last reported bytes).
+    pub fn complete_with_file(&mut self, final_path: &std::path::Path) {
+        self.status = Status::Completed;
+        self.destination = final_path.to_string_lossy().to_string();
+        if let Some(name) = final_path.file_name() {
+            self.filename = name.to_string_lossy().to_string();
+        }
+        match std::fs::metadata(final_path) {
+            Ok(meta) if meta.is_file() => {
+                let size = meta.len();
+                self.downloaded_bytes = size;
+                self.total_bytes = Some(size);
+            }
+            _ => {
+                self.downloaded_bytes = self.total_bytes.unwrap_or(self.downloaded_bytes);
+            }
+        }
+        self.error = None;
+        self.updated_unix = now_secs();
+    }
+
+    /// Record the delivered stream's probed quality and, when it
+    /// is clearly worse than the picked quality, note the
+    /// mismatch (round 10, item 8). A height below the picked
+    /// height, or a bitrate under 60% of the picked bandwidth,
+    /// counts as worse. Either side unknown means no note — an
+    /// honest "unknown" beats a guessed accusation.
+    pub fn apply_delivered_quality(&mut self, height: Option<u32>, bitrate_kbps: Option<u32>) {
+        if let Some(h) = height {
+            self.delivered_height = Some(h);
+        }
+        if let Some(b) = bitrate_kbps {
+            self.delivered_bitrate_kbps = Some(b);
+        }
+        let height_worse = matches!(
+            (self.picked_height, self.delivered_height),
+            (Some(p), Some(d)) if d < p
+        );
+        let bitrate_worse = matches!(
+            (self.picked_vbr_kbps, self.delivered_bitrate_kbps),
+            (Some(p), Some(d)) if (d as u64) * 100 < (p as u64) * 60
+        );
+        if !height_worse && !bitrate_worse {
+            return;
+        }
+        let mut delivered = String::new();
+        if let Some(h) = self.delivered_height {
+            delivered.push_str(&format!("{h}p"));
+        }
+        if let Some(b) = self.delivered_bitrate_kbps {
+            if !delivered.is_empty() {
+                delivered.push_str(" at ");
+            }
+            delivered.push_str(&format!("~{b} kb/s"));
+        }
+        let mut picked = String::new();
+        if let Some(h) = self.picked_height {
+            picked.push_str(&format!("{h}p"));
+        }
+        if let Some(b) = self.picked_vbr_kbps {
+            if !picked.is_empty() {
+                picked.push_str(" / ");
+            }
+            picked.push_str(&format!("{b} kb/s"));
+        }
+        if delivered.is_empty() || picked.is_empty() {
+            return;
+        }
+        self.quality_note = Some(format!(
+            "Delivered {delivered}; the site listed this stream as {picked}."
+        ));
+    }
 }
 
 fn is_false(v: &bool) -> bool {
@@ -234,6 +372,138 @@ fn same_download_root(destination: &str, download_dir: &str) -> bool {
         return true;
     }
     std::path::Path::new(destination).starts_with(std::path::Path::new(download_dir))
+}
+
+/// Delete every file belonging to a download record (round 10, item
+/// 13's "delete the files too"): the final file, its `.part` /
+/// `.audio.part`, its segment dir (`.part.seg`) and legacy sidecar
+/// (`.part.segments`), yt-dlp partials (`<stem>.*.part` / `.ytdl` /
+/// `.temp`), and the manifest sidecar (`manifests/<id>.m3u8` in the
+/// data dir). The final file is found through the record's
+/// destination (a completed record stores the full file path) or,
+/// for a record that never completed, as `<dir>/<filename>` in the
+/// download folder and one level of category subfolders (the only
+/// depths the worker writes to). Returns how many files were
+/// removed (a segment dir counts its files).
+///
+/// Safety: only paths under `download_dir` (or the exact manifest
+/// sidecar path) are ever removed. A destination pointing outside
+/// the download folder (the user moved folders since) is NOT
+/// deleted — the record is removed from the list, but no foreign
+/// file is touched. The download dir itself is never deleted.
+pub fn delete_download_files(
+    record: &DownloadRecord,
+    download_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+) -> usize {
+    let mut removed = 0usize;
+    let canonical_root = std::fs::canonicalize(download_dir).ok();
+    let under_root = |p: &std::path::Path| -> bool {
+        match (&canonical_root, std::fs::canonicalize(p)) {
+            (Some(root), Ok(canon)) => canon.starts_with(root),
+            // Unresolvable path (already gone): only a path built
+            // under the download dir is ever passed here, so a
+            // failed canonicalize means "nothing to delete", not
+            // "unsafe".
+            _ => p.starts_with(download_dir),
+        }
+    };
+    // Plain fn (not a closure): the seg-dir branch below adds to
+    // `removed` directly, which a capturing closure forbids.
+    fn try_remove_file(p: &std::path::Path) -> bool {
+        p.is_file() && std::fs::remove_file(p).is_ok()
+    }
+    // Candidate dirs: the download folder + one level of category
+    // subfolders.
+    let mut dirs = vec![download_dir.to_path_buf()];
+    if let Ok(entries) = std::fs::read_dir(download_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                dirs.push(p);
+            }
+        }
+    }
+    // The final file: a completed record stores its full path;
+    // anything else stores the folder, so the file is
+    // <dir>/<filename>.
+    let mut finals: Vec<PathBuf> = Vec::new();
+    let dest = std::path::Path::new(&record.destination);
+    if dest.is_file() && under_root(dest) {
+        finals.push(dest.to_path_buf());
+    } else {
+        for d in &dirs {
+            let cand = d.join(&record.filename);
+            if cand.is_file() {
+                finals.push(cand);
+            }
+        }
+    }
+    for final_path in &finals {
+        let name = final_path.file_name().unwrap().to_string_lossy().to_string();
+        let parent = final_path.parent().unwrap_or(download_dir);
+        if try_remove_file(final_path) {
+            removed += 1;
+        }
+        // .part / .audio.part and their segment dirs + sidecars.
+        for suffix in [".part", ".audio.part"] {
+            let part = parent.join(format!("{name}{suffix}"));
+            if try_remove_file(&part) {
+                removed += 1;
+            }
+            let seg_dir = parent.join(format!("{name}{suffix}.seg"));
+            if seg_dir.is_dir() {
+                let mut n = 0usize;
+                if let Ok(files) = std::fs::read_dir(&seg_dir) {
+                    for f in files.flatten() {
+                        if f.metadata().map(|m| m.is_file()).unwrap_or(false) {
+                            n += 1;
+                        }
+                    }
+                }
+                if std::fs::remove_dir_all(&seg_dir).is_ok() {
+                    removed += n;
+                }
+            }
+            let sidecar = parent.join(format!("{name}{suffix}.segments"));
+            if try_remove_file(&sidecar) {
+                removed += 1;
+            }
+        }
+    }
+    // yt-dlp partials: <stem>.*.part / .ytdl / .temp in each
+    // candidate dir (merge parts are named <stem>.f<id>.mp4.part).
+    let stem = std::path::Path::new(&record.filename)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !stem.is_empty() {
+        let prefix = format!("{stem}.");
+        for d in &dirs {
+            if let Ok(entries) = std::fs::read_dir(d) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.starts_with(&prefix)
+                        && (name.ends_with(".part")
+                            || name.ends_with(".ytdl")
+                            || name.ends_with(".temp"))
+                    {
+                        if try_remove_file(&e.path()) {
+                            removed += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Manifest sidecar (data dir, not the download folder).
+    let sidecar = data_dir
+        .join("manifests")
+        .join(format!("{}.m3u8", record.id));
+    if try_remove_file(&sidecar) {
+        removed += 1;
+    }
+    removed
 }
 
 impl Store {
@@ -376,7 +646,24 @@ impl Store {
     /// Records the other process removed (Clear finished / auto-trim)
     /// are also pruned from memory, so this process's next save does
     /// not resurrect them from stale memory.
-    pub fn reload_from_disk(&mut self) {
+    ///
+    /// `active` is the set of download ids THIS process is currently
+    /// running (its live job map). Only those records are protected
+    /// from disk: a worker's status and progress live in memory, and
+    /// a stale Paused on disk must not flip a progressing download
+    /// (round 7: that is exactly what happened to the nime DASH
+    /// download on 2026-11-23). Round 10: the round-7 rule protected
+    /// ANY record whose in-memory status was Downloading, which froze
+    /// the desktop UI on stale progress forever for bridge-driven
+    /// downloads — the desktop never runs them, so its copy never
+    /// advanced, while the bridge's newer disk copy was ignored
+    /// (LookMovie showed "1 / 1,009 pieces" against 228/1009 + 2.7 GB
+    /// on disk; the completed novahd record showed as "downloading"
+    /// 0 B). A record this process is NOT running refreshes from a
+    /// newer disk copy like any other record. A terminal record
+    /// never un-completes: no process re-runs it, so a non-terminal
+    /// disk copy can only be a stomp.
+    pub fn reload_from_disk(&mut self, active: &std::collections::HashSet<String>) {
         let Ok(text) = fs::read_to_string(&self.path) else {
             return;
         };
@@ -393,20 +680,13 @@ impl Store {
                 None => {
                     self.records.insert(id, disk_rec);
                 }
-                // Round 7: never let disk overwrite a record this
-                // process owns. An actively-downloading record's
-                // status and progress live in memory: a stale Paused
-                // on disk (written by a short-lived native-host
-                // launch before round 7 moved recovery behind the
-                // bind) must not flip a progressing download to
-                // Paused — that is exactly what happened to the nime
-                // DASH download on 2026-11-23 (it kept downloading
-                // while the UI said Paused). A terminal record never
-                // un-completes either: no other process can resume
-                // or re-run it, so disk can only hold an older or
-                // stomped view of it.
+                // Actively running in this process: memory wins,
+                // whatever disk says.
+                Some(_) if active.contains(&id) => {}
+                // Terminal in memory, non-terminal on disk: a
+                // terminal record never un-completes.
                 Some(ours)
-                    if ours.status == Status::Downloading || ours.status.is_terminal() => {}
+                    if ours.status.is_terminal() && !disk_rec.status.is_terminal() => {}
                 Some(ours) if disk_rec.updated_unix > ours.updated_unix => {
                     self.records.insert(id, disk_rec);
                 }
@@ -417,8 +697,8 @@ impl Store {
         // process holds that is absent from disk was deleted by the
         // other process and saved. The grace period protects a
         // record this process just created but has not saved yet.
-        // An actively-downloading record is never pruned: its
-        // worker lives in this process, so its absence from disk
+        // A record this process is actively running is never
+        // pruned: its worker lives here, so its absence from disk
         // can only mean the file was replaced mid-download, and
         // dropping it from memory would orphan the worker.
         let now = now_secs();
@@ -426,7 +706,7 @@ impl Store {
             .records
             .values()
             .filter(|r| {
-                r.status != Status::Downloading
+                !active.contains(&r.id)
                     && !disk_ids.contains(&r.id)
                     && now.saturating_sub(r.updated_unix) > REMOVAL_GRACE_SECS
             })
@@ -621,6 +901,11 @@ mod tests {
             segments_done: 0,
             estimated_total_bytes: None,
             audio_only: false,
+            picked_height: None,
+            picked_vbr_kbps: None,
+            delivered_height: None,
+            delivered_bitrate_kbps: None,
+            quality_note: None,
         });
         s.save().unwrap();
         let mut s2 = Store::load(path);
@@ -657,6 +942,11 @@ mod tests {
             segments_done: 0,
             estimated_total_bytes: None,
             audio_only: false,
+            picked_height: None,
+            picked_vbr_kbps: None,
+            delivered_height: None,
+            delivered_bitrate_kbps: None,
+            quality_note: None,
         }
     }
 
@@ -762,7 +1052,7 @@ mod tests {
         a.save().unwrap();
         assert!(b.get("two").is_none(), "B must not see two before reload");
         // ...but reload_from_disk picks it up without losing "one".
-        b.reload_from_disk();
+        b.reload_from_disk(&std::collections::HashSet::new());
         assert!(b.get("one").is_some(), "one must survive reload");
         assert!(b.get("two").is_some(), "two must appear after reload");
     }
@@ -797,7 +1087,12 @@ mod tests {
         a.upsert(rec_status("done", Status::Paused, old, now));
         a.upsert(rec_status("paused", Status::Failed, old, now));
         a.save().unwrap();
-        b.reload_from_disk();
+        // Round 10: "active" is running in THIS process (B), so it
+        // is protected; "done" is terminal, so it never
+        // un-completes; "paused" is neither, so it refreshes.
+        let mut active = std::collections::HashSet::new();
+        active.insert("active".to_string());
+        b.reload_from_disk(&active);
         let kept = b.get("active").expect("active must survive reload");
         assert_eq!(
             kept.status,
@@ -839,7 +1134,9 @@ mod tests {
         // to simulate a disk file that lost it.
         a.records.remove("active");
         a.save().unwrap();
-        b.reload_from_disk();
+        let mut active = std::collections::HashSet::new();
+        active.insert("active".to_string());
+        b.reload_from_disk(&active);
         assert!(
             b.get("active").is_some(),
             "an active download must never be pruned"
@@ -983,7 +1280,7 @@ mod tests {
         assert!(b.get("gone").is_some());
         // ...but reload prunes them instead of leaving them to be
         // resurrected by B's next save.
-        b.reload_from_disk();
+        b.reload_from_disk(&std::collections::HashSet::new());
         assert!(
             b.get("gone").is_none(),
             "removed records must be pruned on reload"
@@ -1037,7 +1334,7 @@ mod tests {
         // B creates a record but has not saved it yet: it is absent
         // from disk but young, so a reload must not prune it.
         b.upsert(rec_status("fresh", Status::Downloading, now, now));
-        b.reload_from_disk();
+        b.reload_from_disk(&std::collections::HashSet::new());
         assert!(
             b.get("fresh").is_some(),
             "a just-created record must survive reload"
@@ -1193,6 +1490,216 @@ mod tests {
             .id,
             "audio"
         );
+    }
+
+    #[test]
+    fn reload_from_disk_refreshes_non_active_downloading_records() {
+        // Round 10, item 6: the desktop's copy of a BRIDGE-driven
+        // download is stale (the desktop never runs it), so a
+        // newer disk copy must win — the round-7 rule kept the
+        // stale in-memory copy over ANY disk copy and the UI
+        // showed "1 / 1,009 pieces" against 228/1009 + 2.7 GB on
+        // disk, and a completed novahd record as "downloading"
+        // 0 B. A record the other process COMPLETED must refresh
+        // to Completed too.
+        let dir = std::env::temp_dir().join("fetchforge-test-store-reload-r10");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("downloads.json");
+        let old = now_secs() - 3600;
+        let mut a = Store::load(path.clone());
+        let mut stale = rec_status("movie", Status::Downloading, old, old);
+        stale.downloaded_bytes = 1_000_000;
+        stale.segments_done = 1;
+        stale.segments_total = Some(1009);
+        a.upsert(stale);
+        let mut done_stale = rec_status("done", Status::Downloading, old, old);
+        done_stale.downloaded_bytes = 0;
+        a.upsert(done_stale);
+        a.save().unwrap();
+        // B loads the same file, so B holds the stale copies.
+        let mut b = Store::load(path.clone());
+        // The other process (the bridge) advances "movie" and
+        // completes "done", and saves.
+        let now = now_secs();
+        let mut fresh = rec_status("movie", Status::Downloading, old, now);
+        fresh.downloaded_bytes = 2_700_000_000;
+        fresh.segments_done = 228;
+        fresh.segments_total = Some(1009);
+        a.upsert(fresh);
+        let mut done_fresh = rec_status("done", Status::Completed, old, now);
+        done_fresh.downloaded_bytes = 3_367_173_048;
+        done_fresh.total_bytes = Some(3_367_173_048);
+        a.upsert(done_fresh);
+        a.save().unwrap();
+        // B runs NOTHING: neither record is in its active set.
+        b.reload_from_disk(&std::collections::HashSet::new());
+        let got = b.get("movie").unwrap();
+        assert_eq!(got.downloaded_bytes, 2_700_000_000);
+        assert_eq!(got.segments_done, 228);
+        assert_eq!(
+            b.get("done").unwrap().status,
+            Status::Completed,
+            "a record the other process completed must show Completed"
+        );
+    }
+
+    #[test]
+    fn apply_progress_never_moves_backwards() {
+        // Round 10, items 2/6: the Plex HLS record went 645/820
+        // back to 353/821 when the audio phase restarted its
+        // segment counter. Progress reports apply monotonically:
+        // a smaller value never overwrites a larger one.
+        let mut r = rec("p");
+        r.status = Status::Downloading;
+        r.downloaded_bytes = 500_000_000;
+        r.total_bytes = Some(1_000_000_000);
+        r.segments_done = 645;
+        r.segments_total = Some(820);
+        let backwards = crate::download::Progress {
+            downloaded: 488_702_134,
+            total: Some(900_000_000),
+            bytes_per_sec: 1000.0,
+            segments_done: Some(353),
+            segments_total: Some(821),
+            estimated_total: Some(950_000_000),
+        };
+        r.apply_progress(&backwards);
+        assert_eq!(r.downloaded_bytes, 500_000_000, "bytes must not go back");
+        assert_eq!(r.total_bytes, Some(1_000_000_000), "total must not shrink");
+        assert_eq!(r.segments_done, 645, "segments must not go back");
+        assert_eq!(
+            r.segments_total,
+            Some(821),
+            "a larger total is still accepted"
+        );
+        assert_eq!(
+            r.estimated_total_bytes,
+            Some(950_000_000),
+            "the estimate refines (latest wins)"
+        );
+        // A forward report still applies.
+        let forward = crate::download::Progress {
+            downloaded: 600_000_000,
+            total: None,
+            bytes_per_sec: 1000.0,
+            segments_done: Some(700),
+            segments_total: None,
+            estimated_total: None,
+        };
+        r.apply_progress(&forward);
+        assert_eq!(r.downloaded_bytes, 600_000_000);
+        assert_eq!(r.segments_done, 700);
+        assert_eq!(r.total_bytes, Some(1_000_000_000), "None never wipes a total");
+    }
+
+    #[test]
+    fn complete_with_file_reconciles_against_real_size() {
+        // Round 10, item 2: the novahd record claimed 121 MB for
+        // a 3.37 GB file. Completion trusts the file on disk.
+        let dir = std::env::temp_dir().join("fetchforge-test-store-complete");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let file = dir.join("Movie.mp4");
+        fs::write(&file, vec![0u8; 12345]).unwrap();
+        let mut r = rec("c");
+        r.status = Status::Downloading;
+        r.downloaded_bytes = 100;
+        r.total_bytes = Some(121_000_000);
+        r.complete_with_file(&file);
+        assert_eq!(r.status, Status::Completed);
+        assert_eq!(r.downloaded_bytes, 12345);
+        assert_eq!(r.total_bytes, Some(12345));
+        assert_eq!(r.filename, "Movie.mp4");
+        // A missing file falls back to the old behaviour (planned
+        // total, or last reported bytes) instead of erroring.
+        let mut r2 = rec("c2");
+        r2.status = Status::Downloading;
+        r2.downloaded_bytes = 77;
+        r2.total_bytes = None;
+        r2.complete_with_file(&dir.join("gone.mp4"));
+        assert_eq!(r2.downloaded_bytes, 77);
+        assert_eq!(r2.total_bytes, None);
+    }
+
+    #[test]
+    fn apply_delivered_quality_notes_mismatch_only() {
+        // Round 10, item 8: Soap2Day picked 1080p / 3000 kb/s and
+        // delivered 720p at 865 kb/s — the record must say so.
+        let mut r = rec("q");
+        r.picked_height = Some(1080);
+        r.picked_vbr_kbps = Some(3000);
+        r.apply_delivered_quality(Some(720), Some(865));
+        assert_eq!(r.delivered_height, Some(720));
+        assert_eq!(r.delivered_bitrate_kbps, Some(865));
+        assert_eq!(
+            r.quality_note.as_deref(),
+            Some("Delivered 720p at ~865 kb/s; the site listed this stream as 1080p / 3000 kb/s.")
+        );
+        // A matching delivery gets no note.
+        let mut ok = rec("q2");
+        ok.picked_height = Some(1080);
+        ok.picked_vbr_kbps = Some(3000);
+        ok.apply_delivered_quality(Some(1080), Some(2900));
+        assert!(ok.quality_note.is_none());
+        // Unknown on either side: no note, no accusation.
+        let mut unknown = rec("q3");
+        unknown.apply_delivered_quality(Some(720), Some(865));
+        assert!(unknown.quality_note.is_none());
+    }
+
+    #[test]
+    fn delete_download_files_removes_only_its_own_files() {
+        // Round 10, item 13: "delete the files too" removes the
+        // final file, parts, segment dir, sidecars and yt-dlp
+        // partials — and nothing else.
+        let base = std::env::temp_dir().join("fetchforge-test-store-delete");
+        let _ = fs::remove_dir_all(&base);
+        let download_dir = base.join("Downloads");
+        let cat = download_dir.join("Video");
+        let data_dir = base.join("data");
+        let manifests = data_dir.join("manifests");
+        fs::create_dir_all(&cat).unwrap();
+        fs::create_dir_all(&manifests).unwrap();
+        // Another download's file: must survive.
+        fs::write(download_dir.join("Other.mp4"), b"keep").unwrap();
+        // This download's files (in the category subfolder).
+        fs::write(cat.join("Movie.mp4"), b"film").unwrap();
+        fs::write(cat.join("Movie.mp4.part"), b"part").unwrap();
+        fs::create_dir_all(cat.join("Movie.mp4.part.seg")).unwrap();
+        fs::write(cat.join("Movie.mp4.part.seg").join("000000.seg"), b"s").unwrap();
+        fs::write(cat.join("Movie.mp4.part.seg").join("000001.seg"), b"s").unwrap();
+        fs::write(cat.join("Movie.mp4.part.segments"), b"sidecar").unwrap();
+        fs::write(cat.join("Movie.f140.mp4.part"), b"ytdlp").unwrap();
+        fs::write(manifests.join("rec1.m3u8"), b"#EXTM3U").unwrap();
+        let mut r = rec("rec1");
+        r.filename = "Movie.mp4".to_string();
+        r.destination = cat.join("Movie.mp4").to_string_lossy().to_string();
+        let removed = delete_download_files(&r, &download_dir, &data_dir);
+        // Movie.mp4 + .part + 2 seg files + .segments + ytdlp
+        // partial + manifest sidecar = 7.
+        assert_eq!(removed, 7);
+        assert!(!cat.join("Movie.mp4").exists());
+        assert!(!cat.join("Movie.mp4.part").exists());
+        assert!(!cat.join("Movie.mp4.part.seg").exists());
+        assert!(!cat.join("Movie.mp4.part.segments").exists());
+        assert!(!cat.join("Movie.f140.mp4.part").exists());
+        assert!(!manifests.join("rec1.m3u8").exists());
+        assert!(
+            download_dir.join("Other.mp4").exists(),
+            "another download's file must survive"
+        );
+        // A destination outside the download folder is never
+        // deleted (the user moved folders since).
+        let outside = base.join("Elsewhere");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("Moved.mp4"), b"moved").unwrap();
+        let mut r2 = rec("rec2");
+        r2.filename = "Moved.mp4".to_string();
+        r2.destination = outside.join("Moved.mp4").to_string_lossy().to_string();
+        let removed2 = delete_download_files(&r2, &download_dir, &data_dir);
+        assert_eq!(removed2, 0);
+        assert!(outside.join("Moved.mp4").exists());
     }
 
     #[test]

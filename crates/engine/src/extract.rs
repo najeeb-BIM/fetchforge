@@ -199,6 +199,13 @@ pub struct MediaFormat {
     pub vbr: Option<f64>,
     /// Frames per second, when yt-dlp reports it.
     pub fps: Option<f64>,
+    /// Audio language tag (e.g. "en", "es") when yt-dlp reports
+    /// one. Round 10, item 3: the multi-audio selector keeps the
+    /// best audio stream of EACH language; without tags there is
+    /// nothing to distinguish and the single-audio selector is
+    /// used. None for video formats and untagged audio.
+    #[serde(default)]
+    pub language: Option<String>,
     /// File size in bytes: `filesize`, falling back to
     /// `filesize_approx` (then `filesize_approx` is true).
     pub filesize: Option<u64>,
@@ -406,6 +413,7 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
             let abr = f.get("abr").and_then(|v| v.as_f64());
             let vbr = f.get("vbr").and_then(|v| v.as_f64());
             let fps = f.get("fps").and_then(|v| v.as_f64());
+            let language = opt_str(f, "language").map(|s| s.to_string());
             let (filesize, filesize_approx) =
                 match f.get("filesize").and_then(|v| v.as_u64()) {
                     Some(s) => (Some(s), false),
@@ -446,6 +454,7 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
                 abr,
                 vbr,
                 fps,
+                language,
                 filesize,
                 filesize_approx,
                 needs_merge,
@@ -470,6 +479,7 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
                 abr: None,
                 vbr: None,
                 fps: None,
+                language: None,
                 filesize,
                 filesize_approx: false,
                 needs_merge: false,
@@ -506,6 +516,16 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
             )
             .then(b.filesize.unwrap_or(0).cmp(&a.filesize.unwrap_or(0)))
     });
+    // Round 10, item 10: the same stream can appear twice in
+    // yt-dlp's list (YouTube listed 140 m4a twice, identical
+    // entries, and the picker showed it twice). Keep the first of
+    // each format id — the sort already put the best first. Keyed
+    // on format id, NOT on the label: distinct streams can share
+    // a label (YouTube's HLS audio entries 233/234 are both
+    // "Audio only · mp4" yet different qualities) and must both
+    // survive.
+    let mut seen_ids = std::collections::HashSet::new();
+    formats.retain(|f| seen_ids.insert(f.format_id.clone()));
     let default_format_id = pick_default_format(&formats, &extractor);
     Ok(MediaInfo {
         title,
@@ -599,6 +619,99 @@ pub fn format_selector(format: &MediaFormat) -> String {
         }
         _ => format.format_id.clone(),
     }
+}
+
+/// Best AudioOnly format per distinct language tag (round 10,
+/// item 3): one entry per language, preferring the
+/// container-compatible extension when `compat_ext` is set, then
+/// highest abr. Formats with no language tag group under "" (a
+/// single entry), so a page with no language tags yields exactly
+/// one audio — the old single-audio behaviour.
+fn best_audio_per_language<'a>(
+    formats: &'a [MediaFormat],
+    compat_ext: &str,
+) -> Vec<&'a MediaFormat> {
+    let mut langs: Vec<&str> = Vec::new();
+    for f in formats.iter().filter(|f| f.kind == FormatKind::AudioOnly) {
+        let lang = f.language.as_deref().unwrap_or("");
+        if !langs.contains(&lang) {
+            langs.push(lang);
+        }
+    }
+    let mut out = Vec::new();
+    for lang in langs {
+        let best = formats
+            .iter()
+            .filter(|f| {
+                f.kind == FormatKind::AudioOnly
+                    && f.language.as_deref().unwrap_or("") == lang
+            })
+            .max_by(|a, b| {
+                let a_compat = !compat_ext.is_empty() && a.ext == compat_ext;
+                let b_compat = !compat_ext.is_empty() && b.ext == compat_ext;
+                a_compat.cmp(&b_compat).then(
+                    a.abr
+                        .unwrap_or(0.0)
+                        .partial_cmp(&b.abr.unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+            });
+        if let Some(f) = best {
+            out.push(f);
+        }
+    }
+    out
+}
+
+/// The yt-dlp `-f` selector for a chosen format, keeping every
+/// audio language the source offers (round 10, item 3). When the
+/// page's AudioOnly formats carry two or more distinct `language`
+/// tags, the first branch names the best audio stream of EACH
+/// language explicitly (`<video>+<aud-en>+<aud-es>/...`) and the
+/// download runs with `--audio-multistreams` (see
+/// [`selector_has_multiple_audio`]) so yt-dlp keeps them all
+/// instead of merging only the first. One language (or no
+/// language tags at all) falls back to [`format_selector`]:
+/// explicit per-language ids are what stop a merge-all selector
+/// from grabbing same-language duplicates on YouTube. The
+/// fallback branches keep the old behaviour (best audio, then
+/// video alone), so a page whose audio list changed mid-run
+/// still downloads.
+pub fn format_selector_multi(format: &MediaFormat, formats: &[MediaFormat]) -> String {
+    if format.kind != FormatKind::VideoOnly {
+        return format.format_id.clone();
+    }
+    let compat = match format.ext.as_str() {
+        "mp4" => "m4a",
+        "webm" => "webm",
+        _ => "",
+    };
+    let audios = best_audio_per_language(formats, compat);
+    let tagged: Vec<&&MediaFormat> = audios.iter().filter(|f| f.language.is_some()).collect();
+    if tagged.len() < 2 {
+        return format_selector(format);
+    }
+    let multi = format!(
+        "{}+{}",
+        format.format_id,
+        tagged
+            .iter()
+            .map(|f| f.format_id.as_str())
+            .collect::<Vec<_>>()
+            .join("+")
+    );
+    format!("{multi}/{}", format_selector(format))
+}
+
+/// Does this yt-dlp `-f` selector's first branch join the video
+/// with two or more audio streams (round 10, item 3)? Only the
+/// first `/`-branch counts — the fallback branches are
+/// single-audio by construction. The downloader passes
+/// `--audio-multistreams` exactly when this is true, so no new
+/// record field is needed to carry the choice.
+fn selector_has_multiple_audio(selector: &str) -> bool {
+    let first = selector.split('/').next().unwrap_or("");
+    first.matches('+').count() >= 2
 }
 
 // ---------------------------------------------------------------------------
@@ -788,6 +901,14 @@ fn list_formats_with_fallback(
 pub fn list_formats(data_dir: &Path, url: &str) -> Result<MediaInfo, String> {
     if crate::media::is_manifest_url(url) {
         let info = crate::media::list_stream_formats(url, &None, None)?;
+        return Ok(stream_info_to_media_info(&info));
+    }
+    // Round 10, item 4: extensionless playlist URLs (MoviesJoy /
+    // NOXX / 123Movies) carry no .m3u8/.mpd, so the check above
+    // misses them — sniff the first bytes before yt-dlp. A failed
+    // sniff (None) falls through to yt-dlp as before.
+    if let Some(kind) = crate::media::sniff_stream_kind(url, &None) {
+        let info = crate::media::list_stream_formats_kind(url, kind, &None, None)?;
         return Ok(stream_info_to_media_info(&info));
     }
     let ytdlp = ensure_ytdlp(data_dir)?;
@@ -1371,6 +1492,11 @@ fn stream_info_to_media_info(info: &crate::media::StreamInfo) -> MediaInfo {
                 abr: f.abr_kbps,
                 vbr: f.vbr_kbps,
                 fps: f.fps,
+                // The native HLS/DASH path keeps all audio tracks
+                // by construction (media.rs downloads every audio
+                // rendition), so no language tag is needed here —
+                // tags only drive the yt-dlp multi-audio selector.
+                language: None,
                 filesize: f.filesize,
                 filesize_approx: false,
                 needs_merge: f.needs_merge,
@@ -1450,6 +1576,13 @@ pub struct MediaPlan {
     /// "0 / N pieces" before the first segment lands. None for
     /// yt-dlp downloads and when the count could not be determined.
     pub segments_total: Option<u64>,
+    /// What the user picked (round 10, item 8): the chosen
+    /// format's height and video bitrate, copied to the record so
+    /// the delivered file can be probed against them and a
+    /// mismatch surfaced instead of claimed. None when the format
+    /// reports no height / bitrate.
+    pub picked_height: Option<u32>,
+    pub picked_vbr_kbps: Option<u32>,
 }
 
 fn stem_for_title(title: &str) -> String {
@@ -1490,6 +1623,28 @@ fn stem_for_title(title: &str) -> String {
             }
         }
     }
+    // Round 10, item 11: junk titles that name no film — a
+    // notification ("New Message!"), an error page ("Something's
+    // not right", 404 / "Page not found"), or a generic site
+    // tagline ("Watch Movies & TV Series Online For Free") — are
+    // not filenames. Fall back to "video"; the extension tries the
+    // video title / h1 / og:title first, and the popup filename
+    // field stays editable as the user's override.
+    let lower = t.to_ascii_lowercase();
+    let junk = lower == "new message"
+        || lower == "new message!"
+        || lower.contains("something's not right")
+        || lower.contains("something went wrong")
+        || lower.contains("404")
+        || lower.contains("page not found")
+        || lower.contains("online for free")
+        || lower.contains("watch movies")
+        || lower.contains("watch tv")
+        || lower.contains("movies & tv")
+        || lower.contains("movies and tv");
+    if junk {
+        return "video".to_string();
+    }
     let clean = sanitize_filename(t);
     let stem = Path::new(&clean)
         .file_stem()
@@ -1524,6 +1679,13 @@ pub fn plan_media_download(
     if crate::media::is_manifest_url(url) {
         return plan_stream_download(url, format_id, filename, referer, captured);
     }
+    // Round 10, item 4: extensionless playlist URLs — sniff
+    // before yt-dlp, same as list_formats (the caller may already
+    // have sniffed once; a second 2 KB ranged GET is cheap and
+    // keeps each layer correct on its own).
+    if let Some(kind) = crate::media::sniff_stream_kind(url, referer) {
+        return plan_stream_download_kind(url, kind, format_id, filename, referer, captured);
+    }
     let info = list_formats(data_dir, url)?;
     plan_from_info(&info, format_id, filename)
 }
@@ -1538,7 +1700,23 @@ fn plan_stream_download(
     referer: &Option<String>,
     captured: Option<&crate::media::CapturedManifest>,
 ) -> Result<MediaPlan, String> {
-    let info = crate::media::list_stream_formats(url, referer, captured)?;
+    let kind = crate::media::stream_kind_of_url(url)
+        .ok_or_else(|| "Not an HLS (.m3u8) or DASH (.mpd) URL.".to_string())?;
+    plan_stream_download_kind(url, kind, format_id, filename, referer, captured)
+}
+
+/// [`plan_stream_download`] with the protocol given (round 10,
+/// item 4): for extensionless playlist URLs the caller already
+/// sniffed the kind from the first bytes.
+fn plan_stream_download_kind(
+    url: &str,
+    kind: crate::media::StreamKind,
+    format_id: Option<&str>,
+    filename: Option<&str>,
+    referer: &Option<String>,
+    captured: Option<&crate::media::CapturedManifest>,
+) -> Result<MediaPlan, String> {
+    let info = crate::media::list_stream_formats_kind(url, kind, referer, captured)?;
     let media = stream_info_to_media_info(&info);
     let mut plan = plan_from_info(&media, format_id, filename)?;
     plan.stream_kind = Some(info.kind);
@@ -1650,23 +1828,62 @@ fn plan_from_info(
     // the video format's extension is the best guess until then.
     let expected_ext = chosen.ext.as_str();
     let filename = format!("{stem}.{expected_ext}");
-    // Total: the chosen format's size, plus the best audio stream's
+    // Total: the chosen format's size, plus the audio stream's
     // size when a merge is planned (yt-dlp downloads both).
-    let mut total = chosen.filesize;
+    // Round 10, item 2: a video format with no filesize used to
+    // contribute nothing, so the total was the audio size alone
+    // (novahd: 121 MB shown for a 3.37 GB file). Estimate from
+    // bitrate x duration when the size is unknown (vbr/abr are
+    // kbps; x125 = bytes/s).
+    let est_size = |filesize: Option<u64>, bitrate_kbps: Option<f64>| -> Option<u64> {
+        filesize.or_else(|| {
+            let d = info.duration_secs?;
+            let b = bitrate_kbps?;
+            if d == 0 || b <= 0.0 {
+                None
+            } else {
+                Some((b * 125.0 * d as f64) as u64)
+            }
+        })
+    };
+    let mut total = est_size(chosen.filesize, chosen.vbr);
     if chosen.needs_merge {
-        if let Some(audio) = info
-            .formats
+        // Sum the audio streams the multi selector actually
+        // downloads: the best of each tagged language when there
+        // are two or more, else the single best audio (old
+        // behaviour — max abr across all audio formats).
+        let compat = match chosen.ext.as_str() {
+            "mp4" => "m4a",
+            "webm" => "webm",
+            _ => "",
+        };
+        let audios = best_audio_per_language(&info.formats, compat);
+        let tagged: Vec<&MediaFormat> = audios
             .iter()
-            .filter(|f| f.kind == FormatKind::AudioOnly)
-            .max_by(|a, b| {
-                a.abr
-                    .unwrap_or(0.0)
-                    .partial_cmp(&b.abr.unwrap_or(0.0))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .and_then(|f| f.filesize)
-        {
-            total = Some(total.unwrap_or(0) + audio);
+            .copied()
+            .filter(|f| f.language.is_some())
+            .collect();
+        let to_sum: Vec<&MediaFormat> = if tagged.len() >= 2 {
+            tagged
+        } else {
+            info.formats
+                .iter()
+                .filter(|f| f.kind == FormatKind::AudioOnly)
+                .max_by(|a, b| {
+                    a.abr
+                        .unwrap_or(0.0)
+                        .partial_cmp(&b.abr.unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .into_iter()
+                .collect()
+        };
+        let audio_total: u64 = to_sum
+            .iter()
+            .filter_map(|f| est_size(f.filesize, f.abr))
+            .sum();
+        if audio_total > 0 {
+            total = Some(total.unwrap_or(0) + audio_total);
         }
     }
     let mut plan = MediaPlan {
@@ -1676,7 +1893,7 @@ fn plan_from_info(
         format_id: chosen.format_id.clone(),
         format_label: chosen.label.clone(),
         needs_merge: chosen.needs_merge,
-        selector: format_selector(chosen),
+        selector: format_selector_multi(chosen, &info.formats),
         stream_kind: None,
         // HTML-fallback plans: extraction resolved the page to an
         // embedded stream/file URL, and the worker downloads the
@@ -1686,6 +1903,8 @@ fn plan_from_info(
         // yt-dlp downloads have no segment list; stream plans set
         // this from the manifest (see plan_stream_download).
         segments_total: None,
+        picked_height: chosen.height,
+        picked_vbr_kbps: chosen.vbr.map(|v| v as u32),
     };
     // A resolved manifest is routed to the stream engine (empty
     // yt-dlp selector, stream_kind set) exactly as if the user had
@@ -1793,7 +2012,10 @@ fn escape_template(s: &str) -> String {
 /// Parse a size token such as `939.19KiB`, `4.12MiB`, `1.34MiB/s`
 /// (the `/s` suffix is stripped by the caller) into bytes.
 fn parse_size_token(token: &str) -> Option<u64> {
-    let token = token.trim();
+    // Round 10, item 2: yt-dlp prefixes estimated totals with a
+    // tilde ("~3.37GiB") and the parse failed on it, so the
+    // novahd total fell back to the plan's (wrong) 121 MB.
+    let token = token.trim().trim_start_matches('~');
     if token.eq_ignore_ascii_case("unknown") {
         return None;
     }
@@ -1974,6 +2196,13 @@ pub fn download_media_with_stall(
         .arg(&out_template)
         .arg("--print")
         .arg("after_move:filepath");
+    // Round 10, item 3: a multi-audio selector (first branch
+    // joins the video with two or more audio streams) needs
+    // --audio-multistreams or yt-dlp keeps only the first audio
+    // track (novahd: 1 English track of 7 offered).
+    if selector_has_multiple_audio(&selector) {
+        cmd.arg("--audio-multistreams");
+    }
     if let Some(r) = &opts.referer {
         // The page the download came from: some CDNs and proxies
         // refuse requests without the Referer they expect.
@@ -2207,6 +2436,12 @@ mod tests {
                 // Audio-only.
                 {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2",
                  "abr": 128.0, "filesize": 10000000},
+                // Round 10, item 10: yt-dlp listed 140 twice on
+                // Big Buck Bunny (identical entries) and the picker
+                // showed it twice. The duplicate must be deduped
+                // (parsed count stays 8).
+                {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2",
+                 "abr": 128.0, "filesize": 10000000},
                 {"format_id": "251", "ext": "webm", "vcodec": "none", "acodec": "opus",
                  "abr": 160.0, "filesize": 12000000},
                 // YouTube HLS audio-only entries: vcodec explicitly
@@ -2218,6 +2453,30 @@ mod tests {
                  "protocol": "m3u8_native", "format_note": "Default, low"},
                 {"format_id": "234", "ext": "mp4", "vcodec": "none",
                  "protocol": "m3u8_native", "format_note": "Default, high"}
+            ]
+        })
+    }
+
+    // Round 10, items 2/3: the novahd shape — a 1080p video-only
+    // format with NO filesize (vbr 3000 kbps, duration 2:52:15)
+    // and audio in three languages (en twice, different containers).
+    fn multilang_json() -> serde_json::Value {
+        serde_json::json!({
+            "title": "Novahd Test Film",
+            "extractor": "generic",
+            "duration": 10335,
+            "webpage_url": "https://example.com/watch",
+            "formats": [
+                {"format_id": "2637", "ext": "mp4", "vcodec": "avc1", "acodec": "none",
+                 "height": 1080, "width": 1920, "vbr": 3000.0},
+                {"format_id": "a-en-m4a", "ext": "m4a", "vcodec": "none", "acodec": "mp4a",
+                 "abr": 128.0, "filesize": 100000000, "language": "en"},
+                {"format_id": "a-en-opus", "ext": "webm", "vcodec": "none", "acodec": "opus",
+                 "abr": 160.0, "filesize": 120000000, "language": "en"},
+                {"format_id": "a-es", "ext": "m4a", "vcodec": "none", "acodec": "mp4a",
+                 "abr": 128.0, "filesize": 90000000, "language": "es"},
+                {"format_id": "a-fr", "ext": "m4a", "vcodec": "none", "acodec": "mp4a",
+                 "abr": 96.0, "filesize": 80000000, "language": "fr"}
             ]
         })
     }
@@ -2378,6 +2637,79 @@ mod tests {
     }
 
     #[test]
+    fn parse_media_info_dedupes_identical_formats() {
+        // Round 10, item 10: the fixture lists 140 twice; the
+        // parsed list holds it once and the total stays 8.
+        let info = parse_media_info(&youtube_json(), "https://example.com").unwrap();
+        assert_eq!(info.formats.len(), 8);
+        assert_eq!(
+            info.formats
+                .iter()
+                .filter(|f| f.format_id == "140")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn format_selector_multi_keeps_one_audio_per_language() {
+        // Round 10, item 3: three tagged languages → the first
+        // branch names the best audio of each (en picks the m4a
+        // over the higher-bitrate opus, so the merge stays mp4);
+        // the fallback branches keep the single-audio selector.
+        let info = parse_media_info(&multilang_json(), "https://example.com").unwrap();
+        let video = info.formats.iter().find(|f| f.format_id == "2637").unwrap();
+        assert_eq!(
+            format_selector_multi(video, &info.formats),
+            "2637+a-en-m4a+a-es+a-fr/2637+bestaudio[ext=m4a]/2637+bestaudio/2637"
+        );
+        assert!(selector_has_multiple_audio(&format_selector_multi(
+            video,
+            &info.formats
+        )));
+        // No language tags (YouTube fixture): falls back to the
+        // single-audio selector — no multi-audio flag.
+        let yt = parse_media_info(&youtube_json(), "https://example.com").unwrap();
+        let v137 = yt.formats.iter().find(|f| f.format_id == "137").unwrap();
+        assert_eq!(
+            format_selector_multi(v137, &yt.formats),
+            format_selector(v137)
+        );
+        assert!(!selector_has_multiple_audio(&format_selector_multi(
+            v137, &yt.formats
+        )));
+        // One tagged language only: still single-audio.
+        let mut one = multilang_json();
+        let formats = one.get_mut("formats").unwrap().as_array_mut().unwrap();
+        formats.retain(|f| f["language"].as_str() != Some("es") && f["language"].as_str() != Some("fr"));
+        let one = parse_media_info(&one, "https://example.com").unwrap();
+        let v = one.formats.iter().find(|f| f.format_id == "2637").unwrap();
+        assert_eq!(format_selector_multi(v, &one.formats), format_selector(v));
+        // Detector: only the first branch counts.
+        assert!(selector_has_multiple_audio("2637+a+b/2637+bestaudio/2637"));
+        assert!(!selector_has_multiple_audio("137+bestaudio[ext=m4a]/137+bestaudio/137"));
+        assert!(!selector_has_multiple_audio("22"));
+    }
+
+    #[test]
+    fn plan_from_info_estimates_missing_size_and_sums_all_languages() {
+        // Round 10, items 2/3: no filesize on the video → estimate
+        // 3000 kbps x 125 x 10335 s = 3,875,625,000 B; audio total
+        // sums the best of EACH language (100M + 90M + 80M), not
+        // just one. Picked quality is recorded for the delivered
+        // probe (item 8).
+        let info = parse_media_info(&multilang_json(), "https://example.com").unwrap();
+        let plan = plan_from_info(&info, Some("2637"), None).unwrap();
+        assert_eq!(plan.total_bytes, Some(3_875_625_000 + 270_000_000));
+        assert_eq!(plan.picked_height, Some(1080));
+        assert_eq!(plan.picked_vbr_kbps, Some(3000));
+        assert_eq!(
+            plan.selector,
+            "2637+a-en-m4a+a-es+a-fr/2637+bestaudio[ext=m4a]/2637+bestaudio/2637"
+        );
+    }
+
+    #[test]
     fn plan_from_info_computes_filename_and_merge_total() {
         let info = parse_media_info(&youtube_json(), "https://example.com").unwrap();
         // Explicit video-only choice: filename uses the video ext,
@@ -2436,6 +2768,19 @@ mod tests {
         assert_eq!(parse_size_token("1.5GiB"), Some((1.5 * 1024.0 * 1024.0 * 1024.0) as u64));
         assert_eq!(parse_size_token("512B"), Some(512));
         assert_eq!(parse_size_token("Unknown"), None);
+        // Round 10, item 2: yt-dlp prefixes estimated totals with
+        // "~" ("~3.37GiB" for the novahd film) — the parse used to
+        // fail on it and the total fell back to the plan's 121 MB.
+        assert_eq!(
+            parse_size_token("~3.37GiB"),
+            Some((3.37 * 1024.0 * 1024.0 * 1024.0) as u64)
+        );
+        assert_eq!(
+            parse_progress_line("[download]  54.4% of ~3.37GiB at    1.34MiB/s ETA 00:00")
+                .unwrap()
+                .1,
+            Some((3.37 * 1024.0 * 1024.0 * 1024.0) as u64)
+        );
     }
 
     #[test]
@@ -3363,7 +3708,21 @@ exit 0
         // Round 7: a spam notification overlay rewrote a tab title
         // to "(1) New Message!" and the file was saved under that
         // name; atlantic's title started with "Watching ".
-        assert_eq!(stem_for_title("(1) New Message!"), "New Message!");
+        // Round 10, item 11: stripping "(1)" is not enough — the
+        // remaining text is still fake, so junk titles fall back
+        // to "video" instead of becoming the filename.
+        assert_eq!(stem_for_title("(1) New Message!"), "video");
+        assert_eq!(stem_for_title("New Message!"), "video");
+        assert_eq!(stem_for_title("Something's not right"), "video");
+        assert_eq!(stem_for_title("404 - Page Not Found"), "video");
+        assert_eq!(
+            stem_for_title("Soap2Day – Watch Movies & TV Series Online For Free"),
+            "video"
+        );
+        assert_eq!(
+            stem_for_title("Movies Online for Free at Lookmovie2"),
+            "video"
+        );
         assert_eq!(stem_for_title("(12) The Odyssey"), "The Odyssey");
         assert_eq!(stem_for_title("(1) (2) Stacked"), "Stacked");
         assert_eq!(stem_for_title("Watching The Odyssey"), "The Odyssey");

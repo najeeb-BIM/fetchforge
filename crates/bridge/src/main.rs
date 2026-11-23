@@ -211,6 +211,22 @@ struct Job {
     cancelled: Arc<AtomicBool>,
 }
 
+/// One paired browser (round 10, item 15): the extension's stable
+/// instance id (generated once per browser profile, stored in the
+/// extension's storage.local) plus a display name ("Chrome",
+/// "Firefox", "Edge"). Recorded at pair/verify time, persisted to
+/// paired.json, deduped by instance id — re-pairing the same
+/// browser updates its timestamp, never adds a second row. The
+/// count is real: browsers paired by pasting a token manually
+/// (no verify call) are NOT counted, and the UI shows nothing
+/// rather than a guessed number when the list cannot be read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PairedBrowser {
+    instance_id: String,
+    browser_name: String,
+    paired_unix: u64,
+}
+
 struct App {
     settings: Settings,
     data_dir: PathBuf,
@@ -223,6 +239,9 @@ struct App {
     /// oldest first. Persisted to detected.json; a corrupt file
     /// starts empty with a warning, never a crash.
     detected: Mutex<Vec<DetectedItem>>,
+    /// Browsers paired by code (POST /pair/verify). Persisted to
+    /// paired.json; cleared by rotate_token ("Unpair all").
+    paired: Mutex<Vec<PairedBrowser>>,
 }
 
 impl App {
@@ -254,6 +273,18 @@ impl App {
             },
             Err(_) => Vec::new(),
         };
+        let paired = match std::fs::read_to_string(data_dir.join("paired.json")) {
+            Ok(text) => match serde_json::from_str::<Vec<PairedBrowser>>(&text) {
+                Ok(items) => items,
+                Err(_) => {
+                    eprintln!(
+                        "FetchForge WARNING: paired.json is not valid JSON; paired-browsers list started empty"
+                    );
+                    Vec::new()
+                }
+            },
+            Err(_) => Vec::new(),
+        };
         Arc::new(Self {
             settings,
             data_dir,
@@ -263,7 +294,64 @@ impl App {
             jobs: Mutex::new(HashMap::new()),
             active: Mutex::new(0),
             detected: Mutex::new(detected),
+            paired: Mutex::new(paired),
         })
+    }
+
+    /// Record a pairing (round 10, item 15): dedupe by instance id
+    /// (a re-pair refreshes the timestamp), persist best-effort.
+    /// An empty instance id is not recorded — the count must stay
+    /// real, and an anonymous pairing is not a countable browser.
+    fn record_paired_browser(&self, instance_id: &str, browser_name: &str) {
+        let id = instance_id.trim();
+        if id.is_empty() {
+            return;
+        }
+        let name = browser_name.trim();
+        let name = if name.is_empty() { "Browser" } else { name };
+        let now = now_unix();
+        let mut list = self.paired.lock().unwrap();
+        if let Some(existing) = list.iter_mut().find(|b| b.instance_id == id) {
+            existing.browser_name = name.to_string();
+            existing.paired_unix = now;
+        } else {
+            list.push(PairedBrowser {
+                instance_id: id.to_string(),
+                browser_name: name.to_string(),
+                paired_unix: now,
+            });
+        }
+        drop(list);
+        self.save_paired();
+    }
+
+    /// Best-effort persistence of the paired list (tmp file +
+    /// rename, like the store). A failed save is logged, never fatal.
+    fn save_paired(&self) {
+        let list = self.paired.lock().unwrap();
+        let text = match serde_json::to_string(&*list) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        drop(list);
+        let path = self.data_dir.join("paired.json");
+        let tmp = self.data_dir.join("paired.json.tmp");
+        if std::fs::write(&tmp, text).is_err() {
+            return;
+        }
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// Ids of downloads this process is currently running (its live
+    /// job map), for `reload_from_disk`: only those records are
+    /// protected from disk (round 10, item 6). A finished worker
+    /// removes its job (see `spawn_worker`), so the set is exactly
+    /// the running workers — never stale entries for downloads
+    /// that already finished.
+    fn active_job_ids(&self) -> std::collections::HashSet<String> {
+        self.jobs.lock().unwrap().keys().cloned().collect()
     }
 
     /// Mark records left Downloading by a previous run as Paused
@@ -346,7 +434,8 @@ impl App {
     /// immediately; paired browsers must re-pair with a new code.
     /// The new token is NOT returned here — the app reads it from the
     /// token file, and extensions must re-pair, never receive it
-    /// automatically.
+    /// automatically. The paired-browsers list is cleared too
+    /// (round 10, item 15): an unpaired browser is not a paired one.
     fn rotate_token(&self) -> Result<(), String> {
         let new_token = generate_token();
         let path = self.data_dir.join("bridge-token.txt");
@@ -358,6 +447,11 @@ impl App {
         }
         *self.token.lock().unwrap() = new_token;
         *self.pairing.lock().unwrap() = fetchforge_engine::pairing::PairingState::new();
+        {
+            let mut paired = self.paired.lock().unwrap();
+            paired.clear();
+        }
+        self.save_paired();
         Ok(())
     }
 
@@ -450,6 +544,24 @@ impl App {
                         audio_only,
                     );
                 }
+                // Round 10, item 4: some playlist endpoints serve a
+                // generic content type, so the check above misses
+                // them (MoviesJoy/NOXX/123Movies served HLS master
+                // text as a ~940 B "file"). Sniff the first bytes:
+                // playlist text re-routes to the media path instead
+                // of being saved as a junk file. A failed sniff
+                // fails open (the normal path below).
+                if fetchforge_engine::sniff_stream_kind(&clean_url, &referer).is_some() {
+                    return self.add_media_download(
+                        &clean_url,
+                        filename,
+                        format_id,
+                        referer,
+                        audio_url,
+                        manifest_text,
+                        audio_only,
+                    );
+                }
                 let (mut filename, total, resumable) = (
                     filename
                         .as_deref()
@@ -527,6 +639,11 @@ impl App {
                     segments_done: 0,
                     estimated_total_bytes: None,
                     audio_only: false,
+                    picked_height: None,
+                    picked_vbr_kbps: None,
+                    delivered_height: None,
+                    delivered_bitrate_kbps: None,
+                    quality_note: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -592,6 +709,11 @@ impl App {
                     segments_done: 0,
                     estimated_total_bytes: None,
                     audio_only: false,
+                    picked_height: None,
+                    picked_vbr_kbps: None,
+                    delivered_height: None,
+                    delivered_bitrate_kbps: None,
+                    quality_note: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -626,7 +748,7 @@ impl App {
                     // loaded — a stale in-memory match would return
                     // a download the user already removed instead of
                     // queueing the new one (2026-11-22 incident).
-                    store.reload_from_disk();
+                    store.reload_from_disk(&self.active_job_ids());
                     if let Some(mut existing) = store.find_duplicate(
                         clean_url,
                         &record_filename,
@@ -669,6 +791,11 @@ impl App {
                         segments_done: 0,
                         estimated_total_bytes: None,
                         audio_only: false,
+                        picked_height: None,
+                        picked_vbr_kbps: None,
+                        delivered_height: None,
+                        delivered_bitrate_kbps: None,
+                        quality_note: None,
                     };
                     store.upsert(rec.clone());
                     let _ = store.save();
@@ -703,6 +830,11 @@ impl App {
                     segments_done: 0,
                     estimated_total_bytes: None,
                     audio_only: false,
+                    picked_height: None,
+                    picked_vbr_kbps: None,
+                    delivered_height: None,
+                    delivered_bitrate_kbps: None,
+                    quality_note: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -755,7 +887,7 @@ impl App {
             // Fresh disk state before the duplicate check (see
             // add_gltf_download): a record the other process
             // cleared must not match from stale memory.
-            store.reload_from_disk();
+            store.reload_from_disk(&self.active_job_ids());
             let audio_filename = audio_only.then(|| {
                 let stem = provisional
                     .rsplit_once('.')
@@ -811,6 +943,11 @@ impl App {
                 segments_done: 0,
                 estimated_total_bytes: None,
                 audio_only,
+                picked_height: None,
+                picked_vbr_kbps: None,
+                delivered_height: None,
+                delivered_bitrate_kbps: None,
+                quality_note: None,
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -910,7 +1047,7 @@ impl App {
                 // novahd download vanished this way — the plan
                 // matched the cleared clip in stale memory and
                 // removed the new record).
-                store.reload_from_disk();
+                store.reload_from_disk(&self.active_job_ids());
                 if store
                     .find_duplicate_except(
                         &record_url,
@@ -942,6 +1079,11 @@ impl App {
                 updated.needs_merge = plan.needs_merge;
                 updated.format_selector = Some(plan.selector);
                 updated.stream_kind = plan.stream_kind.map(|k| k.as_str().to_string());
+                // Round 10, item 8: the picked quality as the site
+                // declared it — the completion probe compares the
+                // delivered file against these.
+                updated.picked_height = plan.picked_height;
+                updated.picked_vbr_kbps = plan.picked_vbr_kbps;
                 updated.audio_url = paired_audio;
                 // HLS/DASH only: the manifest's segment count, so
                 // the UI can show "0 / N pieces" before the first
@@ -1019,7 +1161,7 @@ impl App {
             // Fresh disk state before the duplicate check (see
             // add_gltf_download): a record the other process
             // cleared must not match from stale memory.
-            store.reload_from_disk();
+            store.reload_from_disk(&self.active_job_ids());
             let audio_filename = audio_only.then(|| {
                 let stem = filename
                     .rsplit_once('.')
@@ -1073,12 +1215,28 @@ impl App {
                 segments_done: 0,
                 estimated_total_bytes: None,
                 audio_only,
+                picked_height: None,
+                picked_vbr_kbps: None,
+                delivered_height: None,
+                delivered_bitrate_kbps: None,
+                quality_note: None,
             };
             store.upsert(rec.clone());
             let _ = store.save();
             drop(store);
             self.spawn_worker(id);
             Ok(rec)
+        }
+    }
+
+    /// Remove a job from the map when its worker ends — but only
+    /// if the map still holds THIS job: a resume spawns a fresh
+    /// job under the same id, and the old worker must not remove
+    /// the new job.
+    fn remove_job_if_current(&self, id: &str, job: &Arc<Job>) {
+        let mut jobs = self.jobs.lock().unwrap();
+        if jobs.get(id).is_some_and(|j| Arc::ptr_eq(j, job)) {
+            jobs.remove(id);
         }
     }
 
@@ -1100,6 +1258,10 @@ impl App {
                     drop(active);
                     std::thread::sleep(std::time::Duration::from_millis(250));
                     if job.cancelled.load(Ordering::Relaxed) {
+                        // Cancelled while waiting for a slot: the
+                        // job leaves the map, or its id stays
+                        // "protected" from disk reloads forever.
+                        app.remove_job_if_current(&id, &job);
                         return;
                     }
                     active = app.active.lock().unwrap();
@@ -1111,8 +1273,36 @@ impl App {
                 let mut active = app.active.lock().unwrap();
                 *active = active.saturating_sub(1);
             }
+            // Round 10: the job leaves the map when its worker
+            // ends, so `active_job_ids` is exactly the running
+            // workers. A paused worker's job is removed too: its
+            // record is Paused (run_one set the status before
+            // returning), and a resume spawns a fresh job — the
+            // stale entry must not keep the record "protected"
+            // from disk forever.
+            app.remove_job_if_current(&id, &job);
             let _ = result;
         });
+    }
+
+    /// Best-effort delivered-quality probe (round 10, item 8):
+    /// probe the finished file with ffmpeg (when one is already
+    /// available — never downloaded for this) and record its real
+    /// resolution/bitrate, plus a mismatch note when the site
+    /// mislabelled the stream. A missing ffmpeg or a failed probe
+    /// leaves the record unchanged: the download already
+    /// completed, and a probe failure must never fail it. Only
+    /// media downloads carry picked values, so direct/gltf
+    /// records skip the probe entirely.
+    fn probe_delivered_quality(&self, r: &mut DownloadRecord, final_path: &Path) {
+        if r.picked_height.is_none() && r.picked_vbr_kbps.is_none() {
+            return;
+        }
+        if let Ok(ffmpeg) = fetchforge_engine::find_ffmpeg(&self.data_dir) {
+            if let Some(q) = fetchforge_engine::probe_video_quality(&ffmpeg, final_path) {
+                r.apply_delivered_quality(q.height, q.bitrate_kbps);
+            }
+        }
     }
 
     /// "Audio only" post-step (extension popup, round 8): turn a
@@ -1247,24 +1437,11 @@ impl App {
         let store_clone = &self.store;
         let progress = |p: fetchforge_engine::Progress| {
             let mut store = store_clone.lock().unwrap();
-            if let Some(r) = store.get(&app_id).cloned() {
-                let mut r = r;
-                r.downloaded_bytes = p.downloaded;
-                r.total_bytes = p.total.or(r.total_bytes);
-                // Segment progress (HLS/DASH only): only overwrite when
-                // the report carries a value — yt-dlp and direct
-                // downloads report None here, and must never wipe
-                // the plan-time segment count.
-                if let Some(d) = p.segments_done {
-                    r.segments_done = d;
-                }
-                if let Some(t) = p.segments_total {
-                    r.segments_total = Some(t);
-                }
-                if let Some(e) = p.estimated_total {
-                    r.estimated_total_bytes = Some(e);
-                }
-                r.updated_unix = now_unix();
+            if let Some(mut r) = store.get(&app_id).cloned() {
+                // Monotonic (round 10, items 2/6): progress never
+                // moves backwards — a phase change or re-plan must
+                // not lower a counter the UI already showed.
+                r.apply_progress(&p);
                 store.upsert(r);
                 let _ = store.save();
             }
@@ -1288,14 +1465,9 @@ impl App {
                 };
                 let mut store = self.store.lock().unwrap();
                 if let Some(mut r) = store.get(id).cloned() {
-                    r.status = Status::Completed;
-                    r.destination = final_path.to_string_lossy().to_string();
-                    if let Some(name) = final_path.file_name() {
-                        r.filename = name.to_string_lossy().to_string();
-                    }
-                    r.downloaded_bytes = r.total_bytes.unwrap_or(r.downloaded_bytes);
-                    r.error = None;
-                    r.updated_unix = now_unix();
+                    // Reconcile against the real file (round 10,
+                    // item 2): the plan total can be badly wrong.
+                    r.complete_with_file(&final_path);
                     store.upsert(r);
                     let _ = store.save();
                 }
@@ -1362,24 +1534,11 @@ impl App {
         let store_clone = &self.store;
         let progress = |p: fetchforge_engine::Progress| {
             let mut store = store_clone.lock().unwrap();
-            if let Some(r) = store.get(&app_id).cloned() {
-                let mut r = r;
-                r.downloaded_bytes = p.downloaded;
-                r.total_bytes = p.total.or(r.total_bytes);
-                // Segment progress (HLS/DASH only): only overwrite when
-                // the report carries a value — yt-dlp and direct
-                // downloads report None here, and must never wipe
-                // the plan-time segment count.
-                if let Some(d) = p.segments_done {
-                    r.segments_done = d;
-                }
-                if let Some(t) = p.segments_total {
-                    r.segments_total = Some(t);
-                }
-                if let Some(e) = p.estimated_total {
-                    r.estimated_total_bytes = Some(e);
-                }
-                r.updated_unix = now_unix();
+            if let Some(mut r) = store.get(&app_id).cloned() {
+                // Monotonic (round 10, items 2/6): progress never
+                // moves backwards — a phase change or re-plan must
+                // not lower a counter the UI already showed.
+                r.apply_progress(&p);
                 store.upsert(r);
                 let _ = store.save();
             }
@@ -1394,14 +1553,10 @@ impl App {
             Ok(final_path) => {
                 let mut store = self.store.lock().unwrap();
                 if let Some(mut r) = store.get(&id).cloned() {
-                    r.status = Status::Completed;
-                    r.destination = final_path.to_string_lossy().to_string();
-                    if let Some(name) = final_path.file_name() {
-                        r.filename = name.to_string_lossy().to_string();
-                    }
-                    r.downloaded_bytes = r.total_bytes.unwrap_or(r.downloaded_bytes);
-                    r.error = None;
-                    r.updated_unix = now_unix();
+                    // Reconcile against the real file (round 10,
+                    // item 2): the plan total can be badly wrong.
+                    r.complete_with_file(&final_path);
+                    self.probe_delivered_quality(&mut r, &final_path);
                     store.upsert(r);
                     let _ = store.save();
                 }
@@ -1456,24 +1611,11 @@ impl App {
         let store_clone = &self.store;
         let progress = |p: fetchforge_engine::Progress| {
             let mut store = store_clone.lock().unwrap();
-            if let Some(r) = store.get(&app_id).cloned() {
-                let mut r = r;
-                r.downloaded_bytes = p.downloaded;
-                r.total_bytes = p.total.or(r.total_bytes);
-                // Segment progress (HLS/DASH only): only overwrite when
-                // the report carries a value — yt-dlp and direct
-                // downloads report None here, and must never wipe
-                // the plan-time segment count.
-                if let Some(d) = p.segments_done {
-                    r.segments_done = d;
-                }
-                if let Some(t) = p.segments_total {
-                    r.segments_total = Some(t);
-                }
-                if let Some(e) = p.estimated_total {
-                    r.estimated_total_bytes = Some(e);
-                }
-                r.updated_unix = now_unix();
+            if let Some(mut r) = store.get(&app_id).cloned() {
+                // Monotonic (round 10, items 2/6): progress never
+                // moves backwards — a phase change or re-plan must
+                // not lower a counter the UI already showed.
+                r.apply_progress(&p);
                 store.upsert(r);
                 let _ = store.save();
             }
@@ -1576,14 +1718,10 @@ impl App {
                 };
                 let mut store = self.store.lock().unwrap();
                 if let Some(mut r) = store.get(&id).cloned() {
-                    r.status = Status::Completed;
-                    r.destination = final_path.to_string_lossy().to_string();
-                    if let Some(name) = final_path.file_name() {
-                        r.filename = name.to_string_lossy().to_string();
-                    }
-                    r.downloaded_bytes = r.total_bytes.unwrap_or(r.downloaded_bytes);
-                    r.error = None;
-                    r.updated_unix = now_unix();
+                    // Reconcile against the real file (round 10,
+                    // item 2): the plan total can be badly wrong.
+                    r.complete_with_file(&final_path);
+                    self.probe_delivered_quality(&mut r, &final_path);
                     store.upsert(r);
                     let _ = store.save();
                 }
@@ -1646,24 +1784,11 @@ impl App {
         let store_clone = &self.store;
         let progress = |p: fetchforge_engine::Progress| {
             let mut store = store_clone.lock().unwrap();
-            if let Some(r) = store.get(&app_id).cloned() {
-                let mut r = r;
-                r.downloaded_bytes = p.downloaded;
-                r.total_bytes = p.total.or(r.total_bytes);
-                // Segment progress (HLS/DASH only): only overwrite when
-                // the report carries a value — yt-dlp and direct
-                // downloads report None here, and must never wipe
-                // the plan-time segment count.
-                if let Some(d) = p.segments_done {
-                    r.segments_done = d;
-                }
-                if let Some(t) = p.segments_total {
-                    r.segments_total = Some(t);
-                }
-                if let Some(e) = p.estimated_total {
-                    r.estimated_total_bytes = Some(e);
-                }
-                r.updated_unix = now_unix();
+            if let Some(mut r) = store.get(&app_id).cloned() {
+                // Monotonic (round 10, items 2/6): progress never
+                // moves backwards — a phase change or re-plan must
+                // not lower a counter the UI already showed.
+                r.apply_progress(&p);
                 store.upsert(r);
                 let _ = store.save();
             }
@@ -1694,14 +1819,10 @@ impl App {
                 };
                 let mut store = self.store.lock().unwrap();
                 if let Some(mut r) = store.get(&id).cloned() {
-                    r.status = Status::Completed;
-                    r.destination = final_path.to_string_lossy().to_string();
-                    if let Some(name) = final_path.file_name() {
-                        r.filename = name.to_string_lossy().to_string();
-                    }
-                    r.downloaded_bytes = r.total_bytes.unwrap_or(r.downloaded_bytes);
-                    r.error = None;
-                    r.updated_unix = now_unix();
+                    // Reconcile against the real file (round 10,
+                    // item 2): the plan total can be badly wrong.
+                    r.complete_with_file(&final_path);
+                    self.probe_delivered_quality(&mut r, &final_path);
                     store.upsert(r);
                     let _ = store.save();
                 }
@@ -1750,24 +1871,11 @@ impl App {
         let store_clone = &self.store;
         let progress = |p: fetchforge_engine::Progress| {
             let mut store = store_clone.lock().unwrap();
-            if let Some(r) = store.get(&app_id).cloned() {
-                let mut r = r;
-                r.downloaded_bytes = p.downloaded;
-                r.total_bytes = p.total.or(r.total_bytes);
-                // Segment progress (HLS/DASH only): only overwrite when
-                // the report carries a value — yt-dlp and direct
-                // downloads report None here, and must never wipe
-                // the plan-time segment count.
-                if let Some(d) = p.segments_done {
-                    r.segments_done = d;
-                }
-                if let Some(t) = p.segments_total {
-                    r.segments_total = Some(t);
-                }
-                if let Some(e) = p.estimated_total {
-                    r.estimated_total_bytes = Some(e);
-                }
-                r.updated_unix = now_unix();
+            if let Some(mut r) = store.get(&app_id).cloned() {
+                // Monotonic (round 10, items 2/6): progress never
+                // moves backwards — a phase change or re-plan must
+                // not lower a counter the UI already showed.
+                r.apply_progress(&p);
                 store.upsert(r);
                 let _ = store.save();
             }
@@ -1783,14 +1891,9 @@ impl App {
             Ok(final_path) => {
                 let mut store = self.store.lock().unwrap();
                 if let Some(mut r) = store.get(&id).cloned() {
-                    r.status = Status::Completed;
-                    r.destination = final_path.to_string_lossy().to_string();
-                    if let Some(name) = final_path.file_name() {
-                        r.filename = name.to_string_lossy().to_string();
-                    }
-                    r.downloaded_bytes = r.total_bytes.unwrap_or(r.downloaded_bytes);
-                    r.error = None;
-                    r.updated_unix = now_unix();
+                    // Reconcile against the real file (round 10,
+                    // item 2): the plan total can be badly wrong.
+                    r.complete_with_file(&final_path);
                     store.upsert(r);
                     let _ = store.save();
                 }
@@ -1843,6 +1946,57 @@ impl App {
         }
     }
 
+    /// Delete a download (round 10, item 13): stop it first when
+    /// it is running (cancel the job, then wait up to ~5 s for the
+    /// worker to acknowledge by leaving Downloading), remove the
+    /// record, and — when the user chose "delete the files too" —
+    /// delete its files. Returns how many files were removed (0
+    /// when only the list entry was removed). A missing record is
+    /// an error. A worker that never acknowledges (parked in one
+    /// long network call) still has its record removed — its later
+    /// status update is a no-op on a missing record — and its
+    /// files are still deleted on the user's instruction; the
+    /// worst case is an orphaned .part the next Clear cache
+    /// removes.
+    fn delete_download(&self, id: &str, delete_files: bool) -> Result<usize, String> {
+        if let Some(job) = self.jobs.lock().unwrap().get(id).cloned() {
+            job.cancelled.store(true, Ordering::Relaxed);
+            for _ in 0..50 {
+                let still_running = {
+                    let store = self.store.lock().unwrap();
+                    store
+                        .get(id)
+                        .is_some_and(|r| r.status == Status::Downloading)
+                };
+                if !still_running {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        let record = {
+            let mut store = self.store.lock().unwrap();
+            store.reload_from_disk(&self.active_job_ids());
+            let rec = match store.get(id) {
+                Some(r) => r.clone(),
+                None => return Err("Download not found.".to_string()),
+            };
+            store.remove(id);
+            if let Err(e) = store.save() {
+                return Err(e);
+            }
+            rec
+        };
+        if !delete_files {
+            return Ok(0);
+        }
+        Ok(fetchforge_engine::delete_download_files(
+            &record,
+            std::path::Path::new(&self.settings.download_dir),
+            &self.data_dir,
+        ))
+    }
+
     /// Empty the detector list (memory + detected.json). Detector
     /// items only — downloads and history are never touched.
     /// Returns how many items were removed.
@@ -1883,7 +2037,7 @@ impl App {
         // downloading) and paused downloads keep every segment.
         let (live_ids, live_filenames): (Vec<String>, Vec<String>) = {
             let mut store = self.store.lock().unwrap();
-            store.reload_from_disk();
+            store.reload_from_disk(&self.active_job_ids());
             let mut ids = Vec::new();
             let mut names = Vec::new();
             for rec in store.all() {
@@ -2342,17 +2496,31 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
     // one-time code it was given by the user. Only on a correct code is
     // the bridge token returned, to the extension background script only.
     if method == "POST" && path == "/pair/verify" {
-        let code = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| {
-                v.get("code")
-                    .and_then(|n| n.as_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+        let code = parsed
+            .as_ref()
+            .and_then(|v| v.get("code").and_then(|n| n.as_str()))
+            .unwrap_or("")
+            .to_string();
+        // Round 10, item 15: the extension sends its stable
+        // instance id + browser name so the app can count paired
+        // browsers. Both are optional (older extensions send
+        // neither) — an anonymous pairing still succeeds, it just
+        // is not counted.
+        let browser_id = parsed
+            .as_ref()
+            .and_then(|v| v.get("browser_id").and_then(|n| n.as_str()))
+            .unwrap_or("")
+            .to_string();
+        let browser_name = parsed
+            .as_ref()
+            .and_then(|v| v.get("browser_name").and_then(|n| n.as_str()))
+            .unwrap_or("")
+            .to_string();
         let result = app.pairing.lock().unwrap().verify(&code);
         match result {
             Ok(()) => {
+                app.record_paired_browser(&browser_id, &browser_name);
                 let token = app.token.lock().unwrap().clone();
                 let b = serde_json::json!({"paired": true, "token": token}).to_string();
                 let _ = stream.write_all(http_response(200, &b).as_bytes());
@@ -2417,6 +2585,21 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
         }
         return;
     }
+    // Paired browsers (app only, token required; round 10, item
+    // 15): the real count of browsers paired by code, plus their
+    // names and pairing times. Browsers paired by pasting a token
+    // manually are not in the list — the count is what was
+    // recorded, never a guess.
+    if method == "GET" && path == "/pair/browsers" {
+        let browsers: Vec<PairedBrowser> = app.paired.lock().unwrap().clone();
+        let b = serde_json::json!({
+            "count": browsers.len(),
+            "browsers": browsers
+        })
+        .to_string();
+        let _ = stream.write_all(http_response(200, &b).as_bytes());
+        return;
+    }
     // Pairing code status (app only, token required): lets the app
     // show a "code used" transition when the extension claims the
     // code, instead of the countdown just running out. `used` stays
@@ -2436,7 +2619,7 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
         let list: Vec<DownloadRecord> = {
             let mut store = app.store.lock().unwrap();
             // Pick up downloads added by the desktop app since launch.
-            store.reload_from_disk();
+            store.reload_from_disk(&app.active_job_ids());
             store.all().into_iter().cloned().collect()
         };
         let body = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
@@ -2553,7 +2736,7 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
     if method == "POST" && path == "/downloads/clear-finished" {
         let removed = {
             let mut store = app.store.lock().unwrap();
-            store.reload_from_disk();
+            store.reload_from_disk(&app.active_job_ids());
             let n = store.remove_finished();
             if let Err(e) = store.save() {
                 let b = serde_json::json!({"error": e}).to_string();
@@ -2596,6 +2779,33 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
                         job.cancelled.store(true, Ordering::Relaxed);
                     }
                     let _ = stream.write_all(http_response(200, "{}").as_bytes());
+                    return;
+                }
+                // Round 10, item 13: delete a download (any state).
+                // Body {"delete_files": true} also deletes the
+                // files from disk; false (or absent) removes only
+                // the list entry and keeps the files.
+                "delete" => {
+                    let delete_files = serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("delete_files").and_then(|b| b.as_bool())
+                        })
+                        .unwrap_or(false);
+                    match app.delete_download(id, delete_files) {
+                        Ok(files) => {
+                            let b = serde_json::json!({
+                                "deleted": true,
+                                "files_deleted": files
+                            })
+                            .to_string();
+                            let _ = stream.write_all(http_response(200, &b).as_bytes());
+                        }
+                        Err(e) => {
+                            let b = serde_json::json!({"error": e}).to_string();
+                            let _ = stream.write_all(http_response(404, &b).as_bytes());
+                        }
+                    }
                     return;
                 }
                 _ => {}
@@ -3691,6 +3901,11 @@ mod tests {
             segments_done: 0,
             estimated_total_bytes: None,
             audio_only: false,
+            picked_height: None,
+            picked_vbr_kbps: None,
+            delivered_height: None,
+            delivered_bitrate_kbps: None,
+            quality_note: None,
         }
     }
 

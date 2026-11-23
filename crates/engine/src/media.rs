@@ -88,6 +88,68 @@ pub fn stream_kind_of_content_type(content_type: &str) -> Option<StreamKind> {
     }
 }
 
+/// Bytes fetched by [`sniff_stream_kind`]: enough to see the
+/// `#EXTM3U` header or the `<MPD` root element of a DASH manifest.
+const SNIFF_PREFIX_BYTES: usize = 2048;
+
+/// Classify the first bytes of a response as a stream manifest
+/// (round 10, item 4): HLS playlists start with `#EXTM3U`
+/// (allowing a UTF-8 BOM and leading whitespace); DASH manifests
+/// are XML whose first 2 KB contain `<MPD`. Anything else is not
+/// a playlist — binary media, HTML, JSON all return None. Pure
+/// function, unit-tested; [`sniff_stream_kind`] fetches the bytes.
+pub fn classify_stream_prefix(prefix: &[u8]) -> Option<StreamKind> {
+    let text = String::from_utf8_lossy(prefix);
+    let trimmed = text.trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace());
+    if trimmed.starts_with("#EXTM3U") {
+        return Some(StreamKind::Hls);
+    }
+    if trimmed.starts_with("<?xml") && trimmed.contains("<MPD") {
+        return Some(StreamKind::Dash);
+    }
+    if trimmed.starts_with("<MPD") {
+        return Some(StreamKind::Dash);
+    }
+    None
+}
+
+/// Sniff an extensionless URL's first bytes to tell a playlist
+/// from a file (round 10, item 4). Some playlist endpoints serve
+/// a generic content type, so content-type routing alone misses
+/// them (MoviesJoy/NOXX/123Movies served HLS master text as a
+/// ~940 B "file"). One ranged GET (first 2 KB, 30 s timeout);
+/// content type first, then the prefix classifier. None on any
+/// failure — the caller proceeds down its normal path (fail open).
+/// Never sends cookies or credentials (the client has none).
+pub fn sniff_stream_kind(url: &str, referer: &Option<String>) -> Option<StreamKind> {
+    use std::io::Read;
+    let client = hls_client_with_timeout(Duration::from_secs(30)).ok()?;
+    let req = browser_headers(
+        client
+            .get(url)
+            .header("Range", format!("bytes=0-{}", SNIFF_PREFIX_BYTES - 1)),
+        referer,
+    );
+    let resp = req.send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    if let Some(ct) = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(kind) = stream_kind_of_content_type(ct) {
+            return Some(kind);
+        }
+    }
+    let mut prefix = Vec::new();
+    resp.take(SNIFF_PREFIX_BYTES as u64)
+        .read_to_end(&mut prefix)
+        .ok()?;
+    classify_stream_prefix(&prefix)
+}
+
 /// One quality option of a stream, in protocol-neutral form. The
 /// extraction module converts these to [`crate::extract::MediaFormat`]
 /// for the picker, so HLS/DASH qualities look exactly like yt-dlp
@@ -141,9 +203,24 @@ pub fn list_stream_formats(
     captured: Option<&CapturedManifest>,
 ) -> Result<StreamInfo, String> {
     match stream_kind_of_url(url) {
-        Some(StreamKind::Hls) => list_hls_formats(url, referer, captured),
-        Some(StreamKind::Dash) => list_dash_formats(url, referer, captured),
+        Some(kind) => list_stream_formats_kind(url, kind, referer, captured),
         None => Err("Not an HLS (.m3u8) or DASH (.mpd) URL.".to_string()),
+    }
+}
+
+/// [`list_stream_formats`] with the protocol given (round 10,
+/// item 4): for extensionless playlist URLs the caller already
+/// sniffed the kind from the first bytes, so the URL extension
+/// must not be consulted.
+pub fn list_stream_formats_kind(
+    url: &str,
+    kind: StreamKind,
+    referer: &Option<String>,
+    captured: Option<&CapturedManifest>,
+) -> Result<StreamInfo, String> {
+    match kind {
+        StreamKind::Hls => list_hls_formats(url, referer, captured),
+        StreamKind::Dash => list_dash_formats(url, referer, captured),
     }
 }
 
@@ -1029,6 +1106,10 @@ struct Segment {
 /// instead of assembling a corrupt file. Returns the total bytes in
 /// the part file when done. `progress_base` offsets the reported
 /// bytes (a DASH audio phase reports after the video bytes).
+/// `segments_base` does the same for the segment counts (round 10,
+/// items 2/6): without it the audio phase restarted its counter at
+/// 0 and the Plex record went 645/820 back to 353/821 while bytes
+/// kept growing. Counts are cumulative across phases, like bytes.
 #[allow(clippy::too_many_arguments)]
 /// Does this segment-fetch error look like a timeout (the server
 /// never answered) rather than a fast refusal (HTTP error,
@@ -1431,6 +1512,7 @@ fn download_segments(
     part_path: &Path,
     referer: &Option<String>,
     progress_base: u64,
+    segments_base: u64,
     progress: &(dyn Fn(Progress) + Send + Sync),
     paused: &AtomicBool,
     cancelled: &AtomicBool,
@@ -1454,6 +1536,7 @@ fn download_segments(
             part_path,
             referer,
             progress_base,
+            segments_base,
             progress,
             paused,
             cancelled,
@@ -1467,6 +1550,7 @@ fn download_segments(
         part_path,
         referer,
         progress_base,
+        segments_base,
         progress,
         paused,
         cancelled,
@@ -1501,6 +1585,7 @@ fn download_segments(
                 part_path,
                 referer,
                 progress_base,
+                segments_base,
                 progress,
                 paused,
                 cancelled,
@@ -1533,6 +1618,7 @@ fn download_segments(
                 part_path,
                 referer,
                 progress_base,
+                segments_base,
                 progress,
                 paused,
                 cancelled,
@@ -1575,6 +1661,7 @@ fn download_segments_parallel(
     part_path: &Path,
     referer: &Option<String>,
     progress_base: u64,
+    segments_base: u64,
     progress: &(dyn Fn(Progress) + Send + Sync),
     paused: &AtomicBool,
     cancelled: &AtomicBool,
@@ -1638,8 +1725,8 @@ fn download_segments_parallel(
             downloaded: progress_base + dl,
             total: None,
             bytes_per_sec: dl as f64 / elapsed,
-            segments_done: Some(dn),
-            segments_total: Some(total),
+            segments_done: Some(segments_base + dn),
+            segments_total: Some(segments_base + total),
             // The estimate is COMBINED: completed phases contribute
             // their exact bytes (progress_base) and the current
             // phase its measured estimate. A per-phase estimate
@@ -1915,6 +2002,7 @@ fn download_segments_sequential(
     part_path: &Path,
     referer: &Option<String>,
     progress_base: u64,
+    segments_base: u64,
     progress: &(dyn Fn(Progress) + Send + Sync),
     paused: &AtomicBool,
     cancelled: &AtomicBool,
@@ -2039,8 +2127,8 @@ fn download_segments_sequential(
             downloaded: progress_base + downloaded,
             total: None,
             bytes_per_sec: downloaded as f64 / elapsed,
-            segments_done: Some(done_now),
-            segments_total: Some(total),
+            segments_done: Some(segments_base + done_now),
+            segments_total: Some(segments_base + total),
             // Combined estimate, as in the parallel path: the
             // completed phases' exact bytes plus this phase's
             // measured estimate, so the percent never exceeds 100%
@@ -2201,6 +2289,7 @@ pub fn download_hls_variant(
         &video_part,
         referer,
         0,
+        0,
         progress,
         paused,
         cancelled,
@@ -2233,6 +2322,7 @@ pub fn download_hls_variant(
         &audio_part,
         referer,
         video_bytes,
+        video_segments.len() as u64,
         progress,
         paused,
         cancelled,
@@ -2386,6 +2476,7 @@ pub fn download_hls_pair(
         &video_part,
         referer,
         0,
+        0,
         progress,
         paused,
         cancelled,
@@ -2409,6 +2500,7 @@ pub fn download_hls_pair(
         &audio_part,
         referer,
         video_bytes,
+        video_segments.len() as u64,
         progress,
         paused,
         cancelled,
@@ -3414,6 +3506,7 @@ pub fn download_dash_with(
         &video_part,
         &opts.referer,
         0,
+        0,
         progress,
         paused,
         cancelled,
@@ -3447,6 +3540,7 @@ pub fn download_dash_with(
         &audio_part,
         &opts.referer,
         video_bytes,
+        segments.len() as u64,
         progress,
         paused,
         cancelled,
@@ -4749,6 +4843,7 @@ mod tests {
             &part,
             &None,
             0,
+            0,
             &|_| {},
             &paused,
             &cancelled,
@@ -4790,6 +4885,7 @@ mod tests {
             &segments,
             &part,
             &None,
+            0,
             0,
             &|_| {},
             &paused,
@@ -5660,6 +5756,7 @@ mod tests {
             &part_p,
             &None,
             0,
+            0,
             &move |p| reports_c.lock().unwrap().push(p),
             &paused,
             &cancelled,
@@ -5678,6 +5775,7 @@ mod tests {
             &part_s,
             &None,
             0,
+            0,
             &|_| {},
             &paused,
             &cancelled,
@@ -5694,6 +5792,137 @@ mod tests {
         assert_eq!(last.segments_done, Some(8));
         assert_eq!(last.segments_total, Some(8));
         assert_eq!(last.estimated_total, Some(expected.len() as u64));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir_p);
+        let _ = std::fs::remove_dir_all(&dir_s);
+    }
+
+    #[test]
+    fn classify_stream_prefix_spots_playlists_not_files() {
+        // Round 10, item 4: the first bytes decide playlist vs file.
+        assert_eq!(
+            classify_stream_prefix(b"#EXTM3U\n#EXT-X-VERSION:3\n"),
+            Some(StreamKind::Hls)
+        );
+        // BOM + leading whitespace tolerated.
+        assert_eq!(
+            classify_stream_prefix(b"\xef\xbb\xbf\n#EXTM3U\n"),
+            Some(StreamKind::Hls)
+        );
+        assert_eq!(
+            classify_stream_prefix(
+                b"<?xml version=\"1.0\"?>\n<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\">"
+            ),
+            Some(StreamKind::Dash)
+        );
+        assert_eq!(
+            classify_stream_prefix(b"<MPD type=\"static\">"),
+            Some(StreamKind::Dash)
+        );
+        // XML that is not a DASH manifest, HTML, JSON, binary media.
+        assert_eq!(
+            classify_stream_prefix(b"<?xml version=\"1.0\"?>\n<root/>"),
+            None
+        );
+        assert_eq!(classify_stream_prefix(b"<html><body>hi"), None);
+        assert_eq!(classify_stream_prefix(b"{\"status\":\"ok\"}"), None);
+        assert_eq!(
+            classify_stream_prefix(&[0, 0, 0, 24, b'f', b't', b'y', b'p']),
+            None
+        );
+        assert_eq!(classify_stream_prefix(b""), None);
+    }
+
+    #[test]
+    fn segment_counts_are_cumulative_across_phases() {
+        // Round 10, items 2/6: the Plex record went 645/820 back to
+        // 353/821 when the audio phase started — its counter was
+        // phase-local. A segments_base offsets the counts the same
+        // way progress_base offsets the bytes, on both the parallel
+        // and the sequential path. Max-based assertions: parallel
+        // reports can land out of order, but no report may exceed
+        // the true total and the peak must reach it.
+        let bodies: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("SEGMENT-{i}-").repeat(i + 1).into_bytes())
+            .collect();
+        let mut files = HashMap::new();
+        for (i, b) in bodies.iter().enumerate() {
+            files.insert(format!("/seg{i}.ts"), b.clone());
+        }
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let segments: Vec<Segment> = (0..8)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
+                range: None,
+            })
+            .collect();
+        let client = hls_client().unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+
+        // Parallel path with base 100 (a completed 100-segment
+        // video phase): counts run 100..108 of 108, never 0..8.
+        let dir_p = unique_temp_dir("seg-cumulative-parallel");
+        std::fs::create_dir_all(&dir_p).unwrap();
+        let part_p = dir_p.join("audio.ts.part");
+        let reports: std::sync::Arc<Mutex<Vec<Progress>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let reports_c = reports.clone();
+        download_segments(
+            &client,
+            &segments,
+            &part_p,
+            &None,
+            0,
+            100,
+            &move |p| reports_c.lock().unwrap().push(p),
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .unwrap();
+        let reports = reports.lock().unwrap();
+        assert!(!reports.is_empty());
+        assert!(reports.iter().all(|p| p.segments_total == Some(108)));
+        // No report may fall below the base (the Plex bug: the
+        // audio phase restarted at 0); the peak must reach 108.
+        assert!(reports.iter().all(|p| p.segments_done.unwrap() >= 100));
+        assert_eq!(
+            reports.iter().map(|p| p.segments_done.unwrap()).max(),
+            Some(108)
+        );
+        drop(reports);
+
+        // Sequential path with base 50: counts run 51..58 of 58.
+        let dir_s = unique_temp_dir("seg-cumulative-sequential");
+        std::fs::create_dir_all(&dir_s).unwrap();
+        let part_s = dir_s.join("audio.ts.part");
+        let reports2: std::sync::Arc<Mutex<Vec<Progress>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let reports2_c = reports2.clone();
+        download_segments_sequential(
+            &client,
+            &segments,
+            &part_s,
+            &None,
+            0,
+            50,
+            &move |p| reports2_c.lock().unwrap().push(p),
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .unwrap();
+        let reports2 = reports2.lock().unwrap();
+        assert!(!reports2.is_empty());
+        assert!(reports2.iter().all(|p| p.segments_total == Some(58)));
+        assert_eq!(
+            reports2.iter().map(|p| p.segments_done.unwrap()).max(),
+            Some(58)
+        );
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir_p);
@@ -5725,6 +5954,7 @@ mod tests {
             &segments,
             &part,
             &None,
+            0,
             0,
             &|_| {},
             &paused,
@@ -5764,6 +5994,7 @@ mod tests {
             &segments,
             &part,
             &None,
+            0,
             0,
             &|_| {},
             &paused,
@@ -5888,6 +6119,7 @@ mod tests {
             &part,
             &None,
             0,
+            0,
             &|_| {},
             &paused,
             &cancelled,
@@ -5945,6 +6177,7 @@ mod tests {
             &segments,
             &part,
             &None,
+            0,
             0,
             &|_| {},
             &paused,
@@ -6239,6 +6472,7 @@ mod tests {
             &part,
             &None,
             0,
+            0,
             &|_| {},
             &paused,
             &cancelled,
@@ -6306,6 +6540,7 @@ mod tests {
             &segments,
             &part,
             &None,
+            0,
             0,
             &|_| {},
             &paused,
@@ -6446,6 +6681,7 @@ mod tests {
             &part,
             &None,
             0,
+            0,
             &|_| {},
             &paused,
             &cancelled,
@@ -6521,6 +6757,7 @@ mod tests {
             &part,
             &None,
             0,
+            0,
             &|_| {},
             &paused,
             &cancelled,
@@ -6583,6 +6820,7 @@ mod tests {
             &segments,
             &part,
             &None,
+            0,
             0,
             &|_| {},
             &paused,
@@ -6728,6 +6966,7 @@ mod tests {
                 &part,
                 &None,
                 0,
+                0,
                 &|_| {},
                 &paused,
                 &cancelled,
@@ -6797,6 +7036,7 @@ mod tests {
             &part,
             &None,
             1_000_000,
+            0,
             &move |p| reports_clone.lock().unwrap().push((p.downloaded, p.estimated_total)),
             &paused,
             &cancelled,

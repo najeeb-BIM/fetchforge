@@ -55,12 +55,15 @@ const LONG_FILE = mp4WithMoov(mvhdV0(1000, 10356000)); // 2h52m36s, the film
 // ---------- Context 1: pure helpers (Fix 5 + Fix 6 parser) ----------
 const ctx1 = makeContext(
   { document: { title: "" }, window: {} },
-  [extractMany(contentSrc, ["pageTitleStem", "sanitizeFilenameStem", "parseMp4Duration"], 2)]
+  [extractMany(contentSrc, ["pageTitleStem", "isJunkTitle", "sanitizeFilenameStem", "parseMp4Duration"], 2)]
 );
 
 test("Fix 5: strips a leading (N) notification count", () => {
+  // Round 10, item 11: the badge is stripped AND the remaining
+  // fake notification text is junk, so the stem is now empty
+  // (the caller falls through to the video title / h1 / og:title).
   ctx1.document.title = "(1) New Message!";
-  assertEq(runIn(ctx1, "pageTitleStem()"), "New Message!");
+  assertEq(runIn(ctx1, "pageTitleStem()"), "");
   ctx1.document.title = "(12) The Odyssey";
   assertEq(runIn(ctx1, "pageTitleStem()"), "The Odyssey");
   ctx1.document.title = "(1) (2) Stacked";
@@ -129,8 +132,11 @@ const ctx2 = makeContext(
     document: { title: "The Odyssey | NovaHD" },
     window: { setTimeout: () => 1, clearTimeout: () => {} },
     sendRuntimeMessage: (msg) => { sendCalls2.push(msg); return Promise.resolve(nextReply); },
+    // Round 10: sendCurrentDownload reads/writes the module-level
+    // revert timer; the harness provides it as a context global.
+    sendRevertTimer: null,
   },
-  [extractMany(contentSrc, ["sendCurrentDownload", "defaultFilenameFor", "pageTitleStem", "stemOfFilename", "sanitizeFilenameStem", "isManifestUrl", "shortFailureReason"], 2)]
+  [extractMany(contentSrc, ["sendCurrentDownload", "defaultFilenameFor", "pageTitleStem", "pageNameHint", "isJunkTitle", "stemOfFilename", "sanitizeFilenameStem", "isManifestUrl", "shortFailureReason"], 2)]
 );
 function clickSend(reply, dl) {
   nextReply = reply;
@@ -354,8 +360,8 @@ const ctx4 = makeContext(
     + "const FORMATS_TIMEOUT_MS = 15000;\nlet floatOverlay = null;\n"
     + "globalThis.__popupRows = function () { return popupRows; };\n"
     + "globalThis.__popupOpen = function () { return popupOpen; };\n"
-    + "function sendCurrentDownload(btn, dl, opts) { globalThis.__sendCalls.push({ btn: btn, dl: dl, opts: opts }); }\n",
-    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "stemOfFilename", "sortFormatsForPopup", "isDashUrl"], 2),
+    + "function pickAndSend(btn, dl, opts) { opts = opts || {}; if (!opts.filename) opts.filename = currentPopupFilename(); globalThis.__sendCalls.push({ btn: btn, dl: dl, opts: opts }); return Promise.resolve({ ok: true }); }\n",
+    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "stemOfFilename", "sortFormatsForPopup", "isDashUrl"], 2),
   ]
 );
 ctx4.__sendCalls = sendCalls4;
@@ -469,7 +475,8 @@ test("Round 8: timeout shows the degraded popup and a late reply never overwrite
   await tick();
   assertEq(sendCalls4.length, 0);
   assertEq(overlay.popup.style.display, "flex");
-  assertEq(overlay.popupSubtitle.textContent, "Quality info unavailable");
+  // Round 10, item 12: the timeout path names its own reason.
+  assertEq(overlay.popupSubtitle.textContent, "The app took too long to list the qualities — it may be busy. Try again in a moment.");
   assertEq(overlay.popupBody.children.length, 2, "degraded DASH rows");
   // The late reply arrives after the timeout: it must not
   // overwrite the degraded popup (settled guard).
@@ -564,8 +571,8 @@ const ctx6 = makeContext(
     "let popupOpen = false;\nlet popupRows = [];\nlet popupRequestId = 0;\nlet popupFilenameDirty = false;\nlet floatOverlay = null;\n"
     + "globalThis.__popupRows = function () { return popupRows; };\n"
     + "function capturedTextFor(url) { return undefined; }\n"
-    + "function sendCurrentDownload(btn, dl, opts) { globalThis.__sendCalls.push({ btn: btn, dl: dl, opts: opts }); }\n",
-    extractMany(contentSrc, ["openHlsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "stemOfFilename"], 2),
+    + "function pickAndSend(btn, dl, opts) { opts = opts || {}; if (!opts.filename) opts.filename = currentPopupFilename(); globalThis.__sendCalls.push({ btn: btn, dl: dl, opts: opts }); return Promise.resolve({ ok: true }); }\n",
+    extractMany(contentSrc, ["openHlsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "stemOfFilename"], 2),
   ]
 );
 ctx6.__sendCalls = sendCalls6;

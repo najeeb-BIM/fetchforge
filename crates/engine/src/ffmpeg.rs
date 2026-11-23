@@ -360,6 +360,88 @@ pub fn extract_audio(ffmpeg: &Path, input: &Path, output: &Path) -> Result<(), S
     }
 }
 
+/// What a delivered file actually is (round 10, item 8): its video
+/// height and overall bitrate, probed from the file itself — the
+/// site's label for the picked stream may be wrong (Soap2Day
+/// listed 1080p/3 Mbps and delivered 720p/865 kb/s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeQuality {
+    pub height: Option<u32>,
+    pub bitrate_kbps: Option<u32>,
+}
+
+/// Probe a finished file's delivered resolution and bitrate with
+/// `ffmpeg -i` (round 10, item 8). ffprobe is NOT in the install
+/// (only ffmpeg.exe is extracted), so the info is parsed from
+/// ffmpeg's stderr: `Stream #0:0: Video: ... 1280x720 ...` and
+/// `Duration: ..., bitrate: 865 kb/s`. Best-effort: None when
+/// ffmpeg cannot run, the file is not a video, or nothing parses
+/// — the caller never fails a completed download over a probe.
+/// `-i` alone exits immediately after printing the file info, so
+/// no timeout machinery is needed.
+pub fn probe_video_quality(ffmpeg: &Path, file: &Path) -> Option<ProbeQuality> {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.arg("-i")
+        .arg(file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    no_console_window(&mut cmd);
+    let out = cmd.output().ok()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    parse_ffmpeg_probe(&stderr)
+}
+
+/// Parse `ffmpeg -i` stderr into a ProbeQuality (pure function,
+/// unit-tested on canned output). Height comes from the first
+/// `Video:` stream line (`1280x720`); bitrate from the
+/// `bitrate: N kb/s` field on the Duration line.
+fn parse_ffmpeg_probe(stderr: &str) -> Option<ProbeQuality> {
+    let mut height = None;
+    let mut bitrate_kbps = None;
+    for line in stderr.lines() {
+        if height.is_none() {
+            if let Some(v) = line.split("Video:").nth(1) {
+                // "... h264, yuv420p, 1280x720 [SAR ...], 25 fps ..."
+                for token in v.split(|c: char| c == ' ' || c == ',' || c == '[') {
+                    let token = token.trim_end_matches(']');
+                    if let Some((w, h)) = token.split_once('x') {
+                        if let (Ok(_), Ok(hh)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                            if hh > 0 {
+                                height = Some(hh);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if bitrate_kbps.is_none() {
+            if let Some(b) = line.split("bitrate:").nth(1) {
+                // " 865 kb/s" — the first number wins; "N/A" parses
+                // to nothing and stays None.
+                let num: String = b
+                    .trim()
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                if let Ok(v) = num.parse::<f64>() {
+                    if v > 0.0 {
+                        bitrate_kbps = Some(v as u32);
+                    }
+                }
+            }
+        }
+    }
+    if height.is_none() && bitrate_kbps.is_none() {
+        return None;
+    }
+    Some(ProbeQuality {
+        height,
+        bitrate_kbps,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +453,39 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("fetchforge-test-{tag}-{pid}-{nanos}"))
+    }
+
+    #[test]
+    fn parse_ffmpeg_probe_reads_height_and_bitrate() {
+        // Round 10, item 8: canned `ffmpeg -i` stderr in the
+        // Soap2Day shape (720p, 865 kb/s) plus the no-video and
+        // garbage cases. No ffmpeg binary needed.
+        let stderr = "ffmpeg version 9.1-full_build-www.gyan.dev Copyright (c) 2000-2025\n\
+             Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'Scream 7.mp4':\n\
+             \x20 Duration: 01:49:23.04, start: 0.000000, bitrate: 865 kb/s\n\
+             \x20 Stream #0:0(und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(tv, bt709), 1280x720 [SAR 1:1 DAR 16:9], 25 fps, 25 tbr, 90k tbn (default)\n\
+             \x20 Stream #0:1(und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, 128 kb/s (default)\n";
+        assert_eq!(
+            parse_ffmpeg_probe(stderr),
+            Some(ProbeQuality {
+                height: Some(720),
+                bitrate_kbps: Some(865),
+            })
+        );
+        // Audio-only file: no Video line, bitrate still parsed.
+        let audio_only = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'song.m4a':\n\
+             \x20 Duration: 00:03:12.00, start: 0.000000, bitrate: 129 kb/s\n\
+             \x20 Stream #0:0(und): Audio: aac (LC), 44100 Hz, stereo, fltp, 128 kb/s\n";
+        assert_eq!(
+            parse_ffmpeg_probe(audio_only),
+            Some(ProbeQuality {
+                height: None,
+                bitrate_kbps: Some(129),
+            })
+        );
+        // Garbage / empty: None, never a panic.
+        assert_eq!(parse_ffmpeg_probe(""), None);
+        assert_eq!(parse_ffmpeg_probe("not a video at all\n"), None);
     }
 
     #[test]

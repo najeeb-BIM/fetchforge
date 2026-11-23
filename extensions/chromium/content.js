@@ -249,6 +249,22 @@
   // 2026-11-22: a 15-second /assets/p/*.mp4 clip was sent while a
   // 2:52 HLS movie was playing). The stream that is playing is the
   // playlist, never the clip.
+  // Quality hints in a file URL, for ranking <source> candidates
+  // (round 10, item 8): a height hint (1080p, 720p, 1920x1080, 4k)
+  // outranks a bitrate hint (512kb), and a bigger number wins
+  // within a kind. 0 when the URL carries no hint.
+  function qualityHintScore(url) {
+    const lower = url.toLowerCase();
+    if (/\b4k\b/.test(lower)) return 10000 + 2160;
+    let m = lower.match(/(\d{3,4})p\b/);
+    if (m) return 10000 + parseInt(m[1], 10);
+    m = lower.match(/(\d{3,4})x(\d{3,4})/);
+    if (m) return 10000 + parseInt(m[2], 10);
+    m = lower.match(/(\d+)kb/);
+    if (m) return parseInt(m[1], 10);
+    return 0;
+  }
+
   function mediaSource(el) {
     const candidates = [];
     if (el.currentSrc) candidates.push(el.currentSrc);
@@ -259,8 +275,15 @@
       const u = (s.getAttribute && s.getAttribute("src")) || s.src;
       if (u) candidates.push(u);
     }
+    // The playing source (an http(s) currentSrc) always wins when
+    // present — it is what is actually playing. A blob: currentSrc
+    // (MSE playback) does not count: the <source> elements are
+    // fallbacks then, and they are ranked instead.
+    const playingSrc = el.currentSrc && resolveUrl(el.currentSrc);
+    const hasPlayingSrc = !!(playingSrc && /^https?:\/\//i.test(playingSrc));
     let sawBlob = false;
     let directFile = null;
+    let bestRanked = null; // { url, score } — best <source> by quality hints
     for (const raw of candidates) {
       const u = resolveUrl(raw);
       if (!u || u.startsWith("data:")) continue; // data: URLs are skipped
@@ -286,6 +309,8 @@
           return out;
         }
         if (!directFile) directFile = u;
+        const score = qualityHintScore(u);
+        if (!bestRanked || score > bestRanked.score) bestRanked = { url: u, score: score };
       }
     }
     // A playlist in the resource-timing log (or captured by the
@@ -293,7 +318,14 @@
     // note above.
     const playlist = findPlaylistFromResources();
     if (playlist) return { url: playlist.url, viaPage: false, viaStream: true, audioUrl: playlist.audioUrl, manifestText: playlist.manifestText, masterText: playlist.masterText };
-    if (directFile) return { url: directFile, viaPage: false };
+    if (directFile) {
+      // Round 10, item 8: with no playing source, the best-ranked
+      // encode wins over the first in document order (Internet
+      // Archive: the 512kb mp4 was first, the 1080p file ranked
+      // higher). Ties and hint-less URLs keep document order.
+      const file = (!hasPlayingSrc && bestRanked) ? bestRanked.url : directFile;
+      return { url: file, viaPage: false };
+    }
     if (sawBlob) {
       // The player loads its stream through Media Source Extensions:
       // the real URL is not in the DOM, but the browser's
@@ -981,6 +1013,26 @@
     if (out.length > 100) out = out.slice(0, 100).replace(/[. ]+$/, "").trim();
     return out;
   }
+  // Junk titles that name no film (round 10, item 11): a
+  // notification ("New Message!"), an error page ("Something's
+  // not right", 404 / "Page not found"), or a generic site
+  // tagline ("Watch Movies & TV Series Online For Free"). The
+  // engine has the same list (stem_for_title) as a second line
+  // of defence; the extension checks first so the popup's
+  // filename field shows the better name.
+  function isJunkTitle(title) {
+    const lower = String(title || "").toLowerCase();
+    return lower === "new message" || lower === "new message!"
+      || lower.indexOf("something's not right") !== -1
+      || lower.indexOf("something went wrong") !== -1
+      || lower.indexOf("404") !== -1
+      || lower.indexOf("page not found") !== -1
+      || lower.indexOf("online for free") !== -1
+      || lower.indexOf("watch movies") !== -1
+      || lower.indexOf("watch tv") !== -1
+      || lower.indexOf("movies & tv") !== -1
+      || lower.indexOf("movies and tv") !== -1;
+  }
   function pageTitleStem() {
     let title = (document.title || "").trim();
     if (!title) return "";
@@ -1004,7 +1056,38 @@
     title = title.replace(/^watch\s+/i, "").trim();
     if (!title) return "";
     title = title.replace(/\s*\|\s*[^|]*$/, "").trim();
+    // A junk title names no film — return "" so the caller falls
+    // through to the video title / h1 / og:title (pageNameHint)
+    // instead of saving "New Message!" or a site tagline.
+    if (isJunkTitle(title)) return "";
     return sanitizeFilenameStem(title);
+  }
+  function pageNameHint() {
+    // Round 10, item 11: when the document title is junk (or
+    // empty), the next-best name for the auto-fill — the playing
+    // video's title/aria-label, the page h1, or the og:title.
+    // Each candidate is junk-checked the same way (an error
+    // page's h1 can be junk too) and sanitised; the first
+    // non-empty one wins. The popup filename field stays
+    // editable, so a wrong hint is the user's to fix.
+    try {
+      const v = document.querySelector("video");
+      if (v) {
+        const vt = (v.getAttribute("title") || v.getAttribute("aria-label") || "").trim();
+        if (vt && !isJunkTitle(vt)) { const s = sanitizeFilenameStem(vt); if (s) return s; }
+      }
+      const h1 = document.querySelector("h1");
+      if (h1) {
+        const ht = (h1.textContent || "").trim();
+        if (ht && !isJunkTitle(ht)) { const s = sanitizeFilenameStem(ht); if (s) return s; }
+      }
+      const og = document.querySelector('meta[property="og:title"]');
+      if (og) {
+        const ot = (og.getAttribute("content") || "").trim();
+        if (ot && !isJunkTitle(ot)) { const s = sanitizeFilenameStem(ot); if (s) return s; }
+      }
+    } catch (_) { /* DOM unavailable; fall through */ }
+    return "";
   }
   function stemOfFilename(filename) {
     // The verdict filename ("index_287.ts", "movie.mp4") without
@@ -1022,6 +1105,8 @@
     if (serverTitle) { const s = sanitizeFilenameStem(serverTitle); if (s) return s; }
     const t = pageTitleStem();
     if (t) return t;
+    const hint = pageNameHint();
+    if (hint) return hint;
     const f = stemOfFilename(dl && dl.filename);
     if (f) return f;
     return "download";
@@ -1125,7 +1210,7 @@
     // keep their real filename.
     if (!dl) return undefined;
     if (dl.viaPage) return dl.filename;
-    if (isManifestUrl(dl.url)) return pageTitleStem() || dl.filename;
+    if (isManifestUrl(dl.url)) return pageTitleStem() || pageNameHint() || dl.filename;
     return dl.filename;
   }
   function currentPopupFilename() {
@@ -1133,6 +1218,14 @@
     const v = input ? sanitizeFilenameStem(input.value) : "";
     return v || "download";
   }
+  // The pending button-revert timer (round 10, item 7): a stale
+  // timer from an earlier send could fire during a later send
+  // and revert "Sent to FetchForge" early. Only one is ever live.
+  let sendRevertTimer = null;
+  // Returns a promise resolving to the background's response
+  // (round 10, items 5/7) — the popup stays open until the send
+  // resolves, and the response is never lost. The promise never
+  // rejects: a transport failure resolves to a failure object.
   function sendCurrentDownload(btn, dl, opts) {
     opts = opts || {};
     const url = opts.url || dl.url;
@@ -1143,10 +1236,14 @@
     // an audio file instead of the video. Undefined for a video
     // send (the background drops it from the request).
     const audioOnly = !!opts.audioOnly;
+    // Clear any pending revert timer from an earlier send first:
+    // a stale timer firing mid-send reverted the button before
+    // "Sent" could be seen (item 7's likely mechanism).
+    if (sendRevertTimer) { window.clearTimeout(sendRevertTimer); sendRevertTimer = null; }
     btn.disabled = true;
     btn.textContent = "Sending…";
     btn.title = "";
-    sendRuntimeMessage({ type: "downloadMedia", url: url, filename: filename, audioUrl: audioUrl, referer: dl.referer, formatId: opts.formatId, manifestText: manifestText, audioOnly: audioOnly }).then(function (resp) {
+    return sendRuntimeMessage({ type: "downloadMedia", url: url, filename: filename, audioUrl: audioUrl, referer: dl.referer, formatId: opts.formatId, manifestText: manifestText, audioOnly: audioOnly }).then(function (resp) {
       if (resp && resp.duplicate) {
         // Nothing new was queued: the file is already in the
         // app's downloads. Say so honestly — "Sent" would be a
@@ -1171,20 +1268,56 @@
         btn.textContent = "Failed — " + shortFailureReason(resp && resp.error);
         btn.title = (resp && resp.error) || "Download failed";
       }
-      window.setTimeout(function () {
+      // "Sent" (and the other outcomes) stay for 10 s, not 5 —
+      // the 5 s window was too short to notice in sparse
+      // screenshots, and a stale revert timer could cut it
+      // shorter still (item 7).
+      sendRevertTimer = window.setTimeout(function () {
+        sendRevertTimer = null;
         btn.disabled = false;
         btn.textContent = "↓ FetchForge";
         btn.title = "";
-      }, 5000);
+      }, 10000);
+      return resp;
     }).catch(function () {
       btn.textContent = "Failed — app not running";
       btn.title = "Could not reach the FetchForge app";
-      window.setTimeout(function () {
+      sendRevertTimer = window.setTimeout(function () {
+        sendRevertTimer = null;
         btn.disabled = false;
         btn.textContent = "↓ FetchForge";
         btn.title = "";
-      }, 5000);
+      }, 10000);
+      return { ok: false, error: "Could not reach the FetchForge app" };
     });
+  }
+  // Round 10, item 5: a popup pick sends WITHOUT closing the
+  // popup first — the popup stays open until the send resolves,
+  // so a rejection shows its error inside the popup instead of
+  // closing silently (YesMovies). On success — or a duplicate /
+  // viaBrowser outcome, which the button reports honestly — the
+  // popup closes; on failure it stays open with the error.
+  function pickAndSend(btn, dl, opts) {
+    opts = opts || {};
+    if (!("filename" in opts) || !opts.filename) opts.filename = currentPopupFilename();
+    const p = sendCurrentDownload(btn, dl, opts);
+    if (p && p.then) {
+      p.then(function (resp) {
+        if (resp && (resp.ok || resp.duplicate || resp.viaBrowser)) { closeQualityPopup(); return; }
+        showPopupSendError(resp && resp.error);
+      });
+    }
+    return p;
+  }
+  function showPopupSendError(reason) {
+    // Only show if the popup is still open (the user may have
+    // closed it with X while the send was in flight).
+    if (!popupOpen || !floatOverlay || !floatOverlay.popupBody) return;
+    floatOverlay.popupTitle.textContent = "Download failed";
+    floatOverlay.popupSubtitle.textContent = reason ? String(reason) : "The app could not start this download.";
+    floatOverlay.popupSubtitle.style.display = "block";
+    floatOverlay.popupBody.textContent = "";
+    popupRows = [];
   }
 
   function onOverlayClick(btn) {
@@ -1206,6 +1339,13 @@
       const parsed = parseHlsMaster(masterText, dl.url);
       if (parsed && parsed.rows.length >= 1) { openHlsPopup(btn, dl, parsed); return; }
     }
+    // Round 10, item 1: an observed playlist — the background's
+    // webRequest observer classified it by Content-Type, so the
+    // URL may carry no .m3u8 extension — opens the formats popup
+    // like a DASH manifest: the bridge fetches the playlist and
+    // lists its variants. Without this the verdict's kind was
+    // dropped and the click one-click sent the playlist text.
+    if (dl.kind === "playlist") { openFormatsPopup(btn, dl); return; }
     // Page URL (viaPage, e.g. YouTube): ask the app for the
     // page's formats and let the user pick a quality.
     if (dl.viaPage) { openFormatsPopup(btn, dl); return; }
@@ -1471,9 +1611,7 @@
     if (!openQualityPopup("Choose quality", null, popupDefaultName(dl, null))) return;
     parsed.rows.forEach(function (r) {
       addQualityRow(r.label, !!r.selected, function () {
-        const name = currentPopupFilename();
-        closeQualityPopup();
-        sendCurrentDownload(btn, dl, { url: r.url, audioUrl: r.audioUrl, manifestText: capturedTextFor(r.url), filename: name, audioOnly: !!r.audioOnly });
+        pickAndSend(btn, dl, { url: r.url, audioUrl: r.audioUrl, manifestText: capturedTextFor(r.url), audioOnly: !!r.audioOnly });
       });
     });
     // Muxed master (no separate audio track to pick): offer the
@@ -1482,9 +1620,7 @@
     if (!parsed.hasAudioRows && parsed.rows.length) {
       const best = parsed.rows[0];
       addQualityRow("Audio only", false, function () {
-        const name = currentPopupFilename();
-        closeQualityPopup();
-        sendCurrentDownload(btn, dl, { url: best.url, audioUrl: undefined, manifestText: capturedTextFor(best.url), filename: name, audioOnly: true });
+        pickAndSend(btn, dl, { url: best.url, audioUrl: undefined, manifestText: capturedTextFor(best.url), audioOnly: true });
       });
     }
   }
@@ -1498,21 +1634,17 @@
     const m = /\.([a-z0-9]+)([?#]|$)/i.exec(dl.url || "");
     const container = m ? m[1].toUpperCase() : "";
     addQualityRow("Video" + (container ? " · " + container : ""), true, function () {
-      const name = currentPopupFilename();
-      closeQualityPopup();
-      sendCurrentDownload(btn, dl, { filename: name });
+      pickAndSend(btn, dl, {});
     });
     // Audio only: a paired audio sibling downloads alone (the
     // captured text belongs to the video playlist, so it is NOT
     // sent along); otherwise the engine extracts the audio from
     // the video after downloading it.
     addQualityRow("Audio only", false, function () {
-      const name = currentPopupFilename();
-      closeQualityPopup();
       if (dl.audioUrl) {
-        sendCurrentDownload(btn, dl, { url: dl.audioUrl, audioUrl: undefined, manifestText: undefined, filename: name, audioOnly: true });
+        pickAndSend(btn, dl, { url: dl.audioUrl, audioUrl: undefined, manifestText: undefined, audioOnly: true });
       } else {
-        sendCurrentDownload(btn, dl, { filename: name, audioOnly: true });
+        pickAndSend(btn, dl, { audioOnly: true });
       }
     });
   }
@@ -1521,7 +1653,19 @@
   // The server already sorts best-first; this is defence in depth
   // (and the unit under test for the ladder order).
   function sortFormatsForPopup(formats) {
-    const list = (formats || []).slice();
+    // Round 10, item 10: dedupe first — the engine dedupes by
+    // format id, and the popup does too (defence in depth: a
+    // stale bridge or a format the engine never saw must not
+    // show twice). Keyed on format id when present, else on
+    // label + kind; the first occurrence wins.
+    const seen = {};
+    const list = [];
+    for (const f of (formats || [])) {
+      const key = (f && f.format_id) ? ("id:" + f.format_id) : ("label:" + ((f && f.label) || "") + "|" + ((f && f.kind) || ""));
+      if (seen[key]) continue;
+      seen[key] = true;
+      list.push(f);
+    }
     function audioRank(f) { return f && f.kind === "audio_only" ? 1 : 0; }
     list.sort(function (a, b) {
       const ar = audioRank(a), br = audioRank(b);
@@ -1550,23 +1694,23 @@
     // state in the popup. Every path checks reqId: if the popup
     // was closed meanwhile (X, outside click, verdict change),
     // nothing is shown or sent at all.
-    function showDegradedPopup() {
+    function showDegradedPopup(reason) {
       if (reqId !== popupRequestId) return;
       floatOverlay.popupTitle.textContent = "Choose quality";
-      floatOverlay.popupSubtitle.textContent = "Quality info unavailable";
+      // Round 10, item 12: say WHY the qualities are
+      // unavailable — the bridge's reason (e.g. YouTube asked
+      // for a sign-in) instead of the bare "Quality info
+      // unavailable".
+      floatOverlay.popupSubtitle.textContent = reason ? String(reason) : "Quality info unavailable";
       floatOverlay.popupSubtitle.style.display = "block";
       floatOverlay.popupBody.textContent = "";
       popupRows = [];
       addQualityRow("Video · default quality", true, function () {
-        const name = currentPopupFilename();
-        closeQualityPopup();
-        sendCurrentDownload(btn, dl, { filename: name });
+        pickAndSend(btn, dl, {});
       });
       if (isDashUrl(dl.url)) {
         addQualityRow("Audio only", false, function () {
-          const name = currentPopupFilename();
-          closeQualityPopup();
-          sendCurrentDownload(btn, dl, { filename: name, audioOnly: true });
+          pickAndSend(btn, dl, { audioOnly: true });
         });
       }
     }
@@ -1583,7 +1727,7 @@
       settled = true;
       // Timeout: the bridge is likely busy (yt-dlp extraction is
       // slow), not down — show the degraded popup, not an error.
-      showDegradedPopup();
+      showDegradedPopup("The app took too long to list the qualities — it may be busy. Try again in a moment.");
     }, FORMATS_TIMEOUT_MS);
     sendRuntimeMessage({ type: "getFormats", url: dl.url }).then(function (resp) {
       if (settled || reqId !== popupRequestId) return;
@@ -1591,7 +1735,7 @@
       window.clearTimeout(timer);
       if (resp && resp.unreachable) { showUnreachableError(); return; }
       if (!resp || !resp.ok || !Array.isArray(resp.formats) || !resp.formats.length) {
-        showDegradedPopup();
+        showDegradedPopup(resp && resp.reason);
         return;
       }
       floatOverlay.popupTitle.textContent = "Choose quality";
@@ -1614,14 +1758,14 @@
         const selected = !anySelected && f.format_id === resp.default_format_id;
         if (selected) anySelected = true;
         addQualityRow(f.label || f.format_id, selected, function () {
-          const name = currentPopupFilename();
-          closeQualityPopup();
           // Pass captured manifest text along (a DASH .mpd the
           // hook captured from the player): signed links may fail
           // on a second fetch, so the engine uses this copy.
           // Page URLs carry no captured text — undefined there,
           // and the engine fetches normally.
-          sendCurrentDownload(btn, dl, { formatId: f.format_id, audioUrl: undefined, manifestText: dl.manifestText || dl.masterText, filename: name });
+          // Round 10, item 9: carry the audio-only flag — an
+          // audio-only pick used to arrive as a video download.
+          pickAndSend(btn, dl, { formatId: f.format_id, audioUrl: undefined, manifestText: dl.manifestText || dl.masterText, audioOnly: f.kind === "audio_only" });
         });
       });
       // No format matched default_format_id: highlight the first

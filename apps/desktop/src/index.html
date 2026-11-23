@@ -5,11 +5,22 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FetchForge</title>
 <link rel="stylesheet" href="styles.css">
+<script>
+// Round 10, item 14: apply the saved theme before first paint, so
+// the page never flashes the wrong theme. Dark is the default.
+try {
+  const t = localStorage.getItem("fetchforge-theme");
+  if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+} catch (_) { /* storage unavailable: dark default */ }
+</script>
 </head>
 <body>
 <header>
-  <h1>FetchForge</h1>
-  <p class="tag">Download anything. Share nothing.</p>
+  <div>
+    <h1>FetchForge</h1>
+    <p class="tag">Download anything. Share nothing.</p>
+  </div>
+  <button id="themeBtn" class="secondary">Light mode</button>
 </header>
 <main>
   <section class="add">
@@ -19,6 +30,7 @@
   </section>
   <section id="pairBox" class="pair-box">
     <span class="pair-label">Browser Integration</span>
+    <span id="pairedCount" class="paired-count" hidden></span>
     <button id="unpairBtn" class="secondary">Unpair all browsers</button>
     <button id="pairBtn">Pair browser</button>
     <div id="pairCodeBox" class="pair-code-box" hidden>
@@ -35,12 +47,25 @@
     <button id="fpDownloadBtn">Download</button>
     <button id="fpCancelBtn" class="secondary">Cancel</button>
   </section>
+  <section id="deleteConfirm" class="format-picker" hidden>
+    <h2>Delete download?</h2>
+    <p id="delName"></p>
+    <button id="delFilesBtn">Delete the files too</button>
+    <button id="delEntryBtn" class="secondary">Remove only the list entry</button>
+    <button id="delCancelBtn" class="secondary">Cancel</button>
+  </section>
   <nav id="tabs" class="tabs" role="tablist" aria-label="FetchForge panels">
     <button data-view="dashboard" role="tab" aria-selected="false">Dashboard</button>
     <button data-view="downloads" role="tab" aria-selected="true" class="active">Downloads</button>
     <button data-view="detector" role="tab" aria-selected="false">Media Detector</button>
     <button data-view="history" role="tab" aria-selected="false">History</button>
+    <button data-view="sites" role="tab" aria-selected="false">Sites</button>
   </nav>
+  <section id="view-sites" class="view" hidden>
+    <h2>Movie sites FetchForge works with</h2>
+    <p class="sites-note">Click a site to open it in your browser, then download with the extension. These are unofficial sites whose addresses change — the list is a convenience, not a guarantee.</p>
+    <div id="siteList" class="site-list"></div>
+  </section>
   <section id="view-dashboard" class="view" hidden>
     <div id="dashCards" class="dash-cards"></div>
     <h2>Recent activity</h2>
@@ -131,6 +156,58 @@ function fmtBytes(n) {
   return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + " " + u[i];
 }
 
+// ---- Theme (round 10, item 14) ----
+// Dark is the default; the choice persists in localStorage and is
+// applied before first paint by the script in <head>.
+function currentTheme() {
+  return document.documentElement.dataset.theme === "light" ? "light" : "dark";
+}
+function updateThemeButton() {
+  document.getElementById("themeBtn").textContent =
+    currentTheme() === "dark" ? "Light mode" : "Dark mode";
+}
+document.getElementById("themeBtn").onclick = () => {
+  const next = currentTheme() === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("fetchforge-theme", next); } catch (_) { /* storage unavailable */ }
+  updateThemeButton();
+};
+updateThemeButton();
+
+// Inline SVG icons (round 10, item 13): built with createElementNS,
+// never innerHTML — the Actions column holds icons, not buttons.
+const SVG_NS = "http://www.w3.org/2000/svg";
+function makeSvg() {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("width", "18");
+  svg.setAttribute("height", "18");
+  svg.setAttribute("aria-hidden", "true");
+  return svg;
+}
+function pauseIcon() {
+  const svg = makeSvg();
+  for (const x of [6, 14]) {
+    const r = document.createElementNS(SVG_NS, "rect");
+    r.setAttribute("x", String(x));
+    r.setAttribute("y", "5");
+    r.setAttribute("width", "4");
+    r.setAttribute("height", "14");
+    r.setAttribute("rx", "1");
+    r.setAttribute("fill", "currentColor");
+    svg.appendChild(r);
+  }
+  return svg;
+}
+function trashIcon() {
+  const svg = makeSvg();
+  const p = document.createElementNS(SVG_NS, "path");
+  p.setAttribute("d", "M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z");
+  p.setAttribute("fill", "currentColor");
+  svg.appendChild(p);
+  return svg;
+}
+
 // Percent against the best-known total (exact total, else the size
 // estimate). Capped at 100: multi-phase downloads report cumulative
 // bytes, so a stale or per-phase estimate can make the raw ratio
@@ -185,10 +262,13 @@ async function api(path, method = "GET", body) {
     if (path === "/downloads" && method === "POST") return invokeTimed("add_download", body, ADD_TIMEOUT_MS);
     if (path === "/downloads/clear-finished" && method === "POST") return invokeTimed("clear_finished_downloads");
     if (path === "/pair/status" && method === "GET") return invokeTimed("pair_status");
+    if (path === "/pair/browsers" && method === "GET") return invokeTimed("paired_browsers");
     if (path === "/media/formats" && method === "POST") return invokeTimed("media_formats", body, FORMATS_TIMEOUT_MS);
     if (path === "/media/detected" && method === "GET") return invokeTimed("list_detected_media");
     if (path === "/media/detected/clear" && method === "POST") return invokeTimed("clear_detected_media");
     if (path === "/cache/clear" && method === "POST") return invokeTimed("clear_cache");
+    const md = path.match(/^\/downloads\/(.+)\/delete$/);
+    if (md) return invokeTimed("delete_download", { id: md[1], delete_files: !!(body && body.delete_files) });
     const m = path.match(/^\/downloads\/(.+)\/(pause|resume|cancel)$/);
     if (m) return invokeTimed(m[2] + "_download", { id: m[1] });
     throw new Error("Unsupported Tauri call " + path);
@@ -236,6 +316,8 @@ function showView(v) {
   });
   document.getElementById("view-dashboard").hidden = v !== "dashboard";
   document.getElementById("view-detector").hidden = v !== "detector";
+  document.getElementById("view-sites").hidden = v !== "sites";
+  if (v === "sites") renderSites();
   document.getElementById("view-downloads").hidden =
     !(v === "downloads" || v === "history");
   // A stale status filter would hide everything in a filtered view
@@ -246,6 +328,51 @@ function showView(v) {
   refresh();
 }
 document.querySelectorAll("#tabs button").forEach((b) => { b.onclick = () => showView(b.dataset.view); });
+
+// ---- Site directory (round 10, item 16) ----
+// The WORKING sweep sites only (verified 2026-11-23). Data-driven:
+// one array, easy to update when a domain changes. No availability
+// checking — the list is a convenience, not a guarantee.
+const SITE_DIRECTORY = [
+  ["novahd", "https://novahd.cc"],
+  ["nime", "https://nime.pro"],
+  ["atlantic", "https://atlantic.bz"],
+  ["LookMovie", "https://lookmovie2.uk"],
+  ["PrimeWire", "https://primewire.mov"],
+  ["FlixTor", "https://flixtortv.im"],
+  ["Soap2Day", "https://soap2dayhd.autos"],
+  ["FMovies", "https://fmovies.co"],
+  ["Plex", "https://watch.plex.tv"],
+  ["Roku Channel", "https://therokuchannel.roku.com"],
+  ["Internet Archive", "https://archive.org"],
+  ["YouTube", "https://www.youtube.com"],
+  ["123movieseasy", "https://123movieseasy.com"],
+  ["fmovie", "https://fmovie.buzz"],
+];
+let sitesRendered = false;
+function renderSites() {
+  if (sitesRendered) return;
+  sitesRendered = true;
+  const list = document.getElementById("siteList");
+  for (const [name, url] of SITE_DIRECTORY) {
+    const b = document.createElement("button");
+    b.className = "site-link secondary";
+    b.textContent = name;
+    b.title = url;
+    b.onclick = async () => {
+      try {
+        if (isTauri) {
+          await invokeTimed("open_external_link", { url });
+        } else {
+          window.open(url, "_blank");
+        }
+      } catch (e) {
+        setError("Could not open " + name + ": " + e.message, "action");
+      }
+    };
+    list.appendChild(b);
+  }
+}
 
 function renderDashboard(all) {
   if (currentView !== "dashboard") return;
@@ -477,6 +604,14 @@ async function refresh() {
       const tdCat = document.createElement("td"); tdCat.textContent = d.category;
       const tdStatus = document.createElement("td");
       tdStatus.textContent = d.status + (d.error ? " - " + d.error : "");
+      // Round 10, item 8: when the site mislabelled the picked
+      // stream, the record says what was actually delivered.
+      if (d.quality_note) {
+        const note = document.createElement("div");
+        note.className = "quality-note";
+        note.textContent = d.quality_note;
+        tdStatus.appendChild(note);
+      }
       const tdProg = document.createElement("td");
       const prog = document.createElement("progress");
       prog.value = d.downloaded_bytes; prog.max = pctDenom || 1;
@@ -496,16 +631,35 @@ async function refresh() {
       tdProg.appendChild(document.createTextNode(progText));
       const tdSpeed = document.createElement("td"); tdSpeed.textContent = "-";
       const td = document.createElement("td");
+      td.className = "actions-cell";
       tr.append(tdName, tdCat, tdStatus, tdProg, tdSpeed, td);
-      for (const [label, action] of [["Pause", "pause"], ["Resume", "resume"], ["Cancel", "cancel"]]) {
-        const b = document.createElement("button"); b.className = "secondary"; b.textContent = label;
-        b.onclick = async () => {
+      // Round 10, item 13: the Actions column holds two icons and
+      // nothing else — one pause/resume toggle (pause glyph always;
+      // red while paused) above a recycle-bin delete icon. The
+      // toggle only exists on rows with a live job (downloading or
+      // paused); the bin is on every row.
+      if (d.status === "downloading" || d.status === "paused") {
+        const paused = d.status === "paused";
+        const toggle = document.createElement("button");
+        toggle.className = "icon-btn" + (paused ? " is-paused" : "");
+        toggle.title = paused ? "Resume download" : "Pause download";
+        toggle.setAttribute("aria-label", toggle.title);
+        toggle.appendChild(pauseIcon());
+        toggle.onclick = async () => {
+          const action = paused ? "resume" : "pause";
           try { await api(`/downloads/${d.id}/${action}`, "POST"); }
           catch (e) { setError("Could not " + action + " download: " + e.message, "action"); }
           refresh();
         };
-        td.appendChild(b); td.appendChild(document.createTextNode(" "));
+        td.appendChild(toggle);
       }
+      const del = document.createElement("button");
+      del.className = "icon-btn";
+      del.title = "Delete download";
+      del.setAttribute("aria-label", "Delete download");
+      del.appendChild(trashIcon());
+      del.onclick = () => showDeleteConfirm(d);
+      td.appendChild(del);
       tbody.appendChild(tr);
     }
     // A refresh error clears itself once refresh works again; an action
@@ -559,6 +713,42 @@ document.getElementById("clearCacheBtn").onclick = async () => {
     setError("Could not clear cache: " + e.message, "action");
   } finally { setBusy(btn, false); }
 };
+// ---- Delete confirmation (round 10, item 13) ----
+// Nothing is deleted until the user picks one of the two options:
+// delete the files from disk too, or remove only the list entry
+// and keep the files. Cancel closes without deleting anything.
+let pendingDelete = null; // { id, filename } while the dialog is open
+function showDeleteConfirm(d) {
+  pendingDelete = { id: d.id, filename: d.filename };
+  // textContent only: the filename is untrusted.
+  document.getElementById("delName").textContent = d.filename;
+  document.getElementById("deleteConfirm").hidden = false;
+}
+function hideDeleteConfirm() {
+  pendingDelete = null;
+  document.getElementById("deleteConfirm").hidden = true;
+}
+async function doDelete(deleteFiles) {
+  if (!pendingDelete) return;
+  const { id } = pendingDelete;
+  hideDeleteConfirm();
+  try {
+    const r = await api(`/downloads/${id}/delete`, "POST", { delete_files: deleteFiles });
+    // Tauri returns the file count directly; bridge mode returns
+    // {deleted, files_deleted}.
+    const files = typeof r === "number" ? r : (r && r.files_deleted) || 0;
+    await refresh();
+    clearError();
+    setStatus(deleteFiles
+      ? "Deleted download and " + files + " file" + (files === 1 ? "" : "s") + "."
+      : "Removed from the list. Files were kept.");
+  } catch (e) {
+    setError("Could not delete download: " + e.message, "action");
+  }
+}
+document.getElementById("delFilesBtn").onclick = () => doDelete(true);
+document.getElementById("delEntryBtn").onclick = () => doDelete(false);
+document.getElementById("delCancelBtn").onclick = hideDeleteConfirm;
 document.getElementById("search").oninput = refresh;
 document.getElementById("filter").onchange = refresh;
 // Add one URL through the same flow as the paste box: a media page
@@ -695,6 +885,24 @@ document.getElementById("fpDownloadBtn").onclick = async () => {
   } finally { setBusy(btn, false); }
 };
 refresh(); setInterval(refresh, 2000);
+// ---- Paired browsers count (round 10, item 15) ----
+// The real count from the bridge, refreshed when a pairing changes
+// (code claimed, unpair-all) and once at startup. On failure the
+// indicator stays hidden — it must never show a fake number.
+async function refreshPairedCount() {
+  const el = document.getElementById("pairedCount");
+  try {
+    const r = await api("/pair/browsers", "GET");
+    const n = (r && r.count) || 0;
+    el.textContent = n === 0
+      ? "No browsers paired"
+      : n + " browser" + (n === 1 ? "" : "s") + " paired";
+    el.hidden = false;
+  } catch (_) {
+    el.hidden = true;
+  }
+}
+refreshPairedCount();
 // Feat 1: Pair a browser. Code is shown as text only, never logged,
 // with a 60-second countdown. Tauri mode calls the Rust command
 // (which talks to the local bridge); bridge mode calls the bridge
@@ -727,6 +935,7 @@ function showPairCode(code) {
         box.classList.add("claimed");
         document.getElementById("pairCountdown").textContent = "Code used — browser paired.";
         setStatus("Browser paired.");
+        refreshPairedCount();
         // Keep the pill visible so the transition is seen, then hide it.
         pairHideTimer = setTimeout(() => { hidePairCode(); }, 5000);
         return;
@@ -784,6 +993,7 @@ document.getElementById("unpairBtn").onclick = async () => {
     hidePairCode();
     clearError();
     setStatus("All browsers unpaired. They must pair again.");
+    refreshPairedCount();
   } catch (e) { setError("Could not unpair browsers: " + e.message, "action"); }
   finally { setBusy(btn, false); }
 };

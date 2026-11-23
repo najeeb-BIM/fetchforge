@@ -41,6 +41,33 @@ async function getToken() {
   const s = await callApi((...a) => api.storage.local.get(...a), "token");
   return (s && s.token) || "";
 }
+// Round 10, item 15: this browser's stable instance id, generated
+// once and kept in background storage. It identifies the browser
+// install (for the app's paired-browsers count), not the user —
+// and it is sent only to the local bridge at pair time, never
+// with downloads. Never rejects: storage failure yields a fresh
+// ephemeral id instead of breaking pairing.
+async function getBrowserId() {
+  try {
+    const s = await callApi((...a) => api.storage.local.get(...a), "browserId");
+    if (s && s.browserId) return s.browserId;
+  } catch (_) {}
+  const id = (typeof crypto !== "undefined" && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : ("ff-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10));
+  try { await callApi((...a) => api.storage.local.set(...a), { browserId: id }); } catch (_) {}
+  return id;
+}
+// Browser name for the paired-browsers list, from the user agent
+// (Edge first — its UA contains "Chrome" too).
+function browserName() {
+  const ua = (typeof navigator !== "undefined" && navigator.userAgent) || "";
+  if (/Edg\//.test(ua)) return "Edge";
+  if (/Firefox\//.test(ua)) return "Firefox";
+  if (/OPR\//.test(ua)) return "Opera";
+  if (/Chrome\//.test(ua)) return "Chrome";
+  return "Browser";
+}
 // Challenge-response: before sending the stored token to a server,
 // prove that server knows it. Generate a random nonce, ask the server
 // for HMAC(token, nonce), and verify it locally with the stored token.
@@ -178,7 +205,17 @@ async function getFormats(url) {
   } catch (_) {
     const e = new Error("bridge unreachable"); e.unreachable = true; throw e;
   }
-  if (!r.ok) throw new Error("bridge-" + r.status);
+  if (!r.ok) {
+    // Round 10, item 12: the bridge returns {"error": <friendly
+    // text>} with the failure — carry it through instead of
+    // discarding it, so the degraded popup can say WHY the
+    // qualities are unavailable.
+    let reason = "";
+    try { const j = await r.json(); if (j && j.error) reason = String(j.error); } catch (_) {}
+    const e = new Error("bridge-" + r.status);
+    e.reason = reason || ("The bridge could not list this page's qualities (HTTP " + r.status + ").");
+    throw e;
+  }
   return await r.json();
 }
 api.runtime.onInstalled.addListener(() => {
@@ -455,7 +492,11 @@ function bestDownloadSource(tabId, winner) {
     const d = e.cand.duration;
     if (typeof d === "number" && isFinite(d) && d > pageVideoDuration) pageVideoDuration = d;
   }
-  return { url: s.url, filename: s.filename, audioUrl: s.audioUrl, referer: best.frameUrl, viaPage: !!s.viaPage, manifestText: s.manifestText, masterText: s.masterText, pageVideoDuration: pageVideoDuration };
+  // Round 10, item 1: carry the kind in the verdict, so the content
+  // script can route an observed playlist to the formats popup
+  // instead of one-click sending it (the kind was dropped here,
+  // and the click handler could only guess from the URL).
+  return { url: s.url, filename: s.filename, audioUrl: s.audioUrl, referer: best.frameUrl, viaPage: !!s.viaPage, manifestText: s.manifestText, masterText: s.masterText, pageVideoDuration: pageVideoDuration, kind: s.kind || (isPlaylist(best) ? "playlist" : "file") };
 }
 function electOverlay(tabId) {
   const frames = tabOverlayCandidates.get(tabId);
@@ -677,7 +718,7 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // all, and degraded rows otherwise — never a silent send.
     if (!_sender || !_sender.tab) { sendResponse({ ok: false, error: "No tab" }); return false; }
     getFormats(msg.url).then((j) => sendResponse(Object.assign({ ok: true }, j)))
-      .catch((e) => sendResponse({ ok: false, error: (e && e.message) || "formats failed", unreachable: !!(e && e.unreachable) }));
+      .catch((e) => sendResponse({ ok: false, error: (e && e.message) || "formats failed", unreachable: !!(e && e.unreachable), reason: (e && e.reason) || "" }));
     return true;
   }
   if (msg && msg.type === "overlayCandidates") {
@@ -715,10 +756,13 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // On success the bridge returns the token, which is stored here in
     // background storage only. Then challenge the server with that token
     // before trusting it; if the challenge fails, discard the token.
-    fetch(BRIDGE + "/pair/verify", {
+    // Round 10, item 15: the verify request also carries this
+    // browser's stable instance id + name, so the app can count
+    // paired browsers.
+    getBrowserId().then((browser_id) => fetch(BRIDGE + "/pair/verify", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: msg.code }),
+      body: JSON.stringify({ code: msg.code, browser_id: browser_id, browser_name: browserName() }),
     }).then(async (r) => {
       if (!r.ok) { const j = await r.json().catch(() => ({})); sendResponse({ ok: false, error: j.error || "pairing failed" }); return; }
       const j = await r.json();
@@ -727,7 +771,7 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (!ok) { sendResponse({ ok: false, error: "server challenge failed" }); return; }
       await callApi((...a) => api.storage.local.set(...a), { token: j.token });
       sendResponse({ ok: true });
-    }).catch(() => sendResponse({ ok: false, error: "bridge not reachable" }));
+    }).catch(() => sendResponse({ ok: false, error: "bridge not reachable" })));
     return true;
   }
   if (msg && msg.type === "checkBridge") {

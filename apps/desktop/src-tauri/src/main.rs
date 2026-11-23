@@ -9,14 +9,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use fetchforge_engine::{
-    category_for_filename, download, download_dash, download_gltf_bundle, download_hls_pair,
-    download_hls_variant, download_media, ensure_ffmpeg, ensure_image_extension, fetch_gltf_plan,
-    find_ytdlp, generate_download_id, is_gltf_url, is_image_content_type, list_formats,
-    plan_media_download_or_drive_fallback, probe, sanitize_filename, stop_reason, CapturedManifest,
-    DashDownloadOptions, DownloadOptions, DownloadRecord, GltfDownloadOptions,
+    category_for_filename, delete_download_files, download, download_dash, download_gltf_bundle,
+    download_hls_pair, download_hls_variant, download_media, ensure_ffmpeg,
+    ensure_image_extension, fetch_gltf_plan, find_ffmpeg, find_ytdlp, generate_download_id,
+    is_gltf_url, is_image_content_type, list_formats, plan_media_download_or_drive_fallback,
+    probe, probe_video_quality, sanitize_filename, sniff_stream_kind, stop_reason,
+    CapturedManifest, DashDownloadOptions, DownloadOptions, DownloadRecord, GltfDownloadOptions,
     MediaDownloadOptions, MediaInfo, PlanOutcome, Status, Store,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -224,12 +225,38 @@ fn download_dir() -> PathBuf {
     }
 }
 
+/// The ids this process's workers are currently running
+/// (round 10, item 6): `reload_from_disk` protects exactly these
+/// from being overwritten by disk state — every other record
+/// refreshes from disk, so bridge-driven downloads show their
+/// real progress instead of the stale values this process last
+/// saw. A worker's job leaves the map when it ends (see
+/// `remove_job_if_current`), so the set is exactly the running
+/// workers, never stale entries.
+fn active_job_ids(state: &State) -> HashSet<String> {
+    state.jobs.lock().unwrap().keys().cloned().collect()
+}
+
+/// Remove a job from the map when its worker ends — but only if
+/// the map still holds THIS job: a resume spawns a fresh job
+/// under the same id, and the old worker must not remove the new
+/// job. Mirrors the bridge's method of the same name.
+fn remove_job_if_current(state: &Arc<State>, id: &str, job: &Arc<Job>) {
+    let mut jobs = state.jobs.lock().unwrap();
+    if jobs.get(id).is_some_and(|j| Arc::ptr_eq(j, job)) {
+        jobs.remove(id);
+    }
+}
+
 #[tauri::command]
 fn list_downloads(state: tauri::State<Arc<State>>) -> Vec<DownloadRecord> {
     let mut store = state.store.lock().unwrap();
     // Pick up downloads added by the bridge (browser extension) since
     // launch; without this the list never shows them until restart.
-    store.reload_from_disk();
+    // Round 10, item 6: only this process's running workers are
+    // protected — every other record refreshes from disk, so the
+    // list shows the bridge's real progress.
+    store.reload_from_disk(&active_job_ids(&state));
     store.all().into_iter().cloned().collect()
 }
 
@@ -298,6 +325,14 @@ async fn add_download(
             if p.content_type.as_deref().is_some_and(|ct| {
                 fetchforge_engine::stream_kind_of_content_type(ct).is_some()
             }) {
+                return add_media_download(&state, &clean, filename, format_id, referer, audio_url);
+            }
+            // Round 10, item 4: some playlist endpoints serve a
+            // generic content type, so the check above misses them
+            // (MoviesJoy/NOXX/123Movies saved ~940 B of playlist
+            // text as a file). Sniff the first bytes before
+            // treating the URL as a direct file.
+            if sniff_stream_kind(&clean, &referer).is_some() {
                 return add_media_download(&state, &clean, filename, format_id, referer, audio_url);
             }
             let (mut filename, total, resumable) = (
@@ -381,6 +416,11 @@ fn failed_record(
         segments_done: 0,
         estimated_total_bytes: None,
         audio_only: false,
+        picked_height: None,
+        picked_vbr_kbps: None,
+        delivered_height: None,
+        delivered_bitrate_kbps: None,
+        quality_note: None,
     };
     state.store.lock().unwrap().upsert(rec.clone());
     let _ = state.store.lock().unwrap().save();
@@ -456,7 +496,7 @@ fn try_gltf_download(
         // loaded — a stale in-memory match would return a download
         // the user already removed instead of queueing the new one
         // (2026-11-22 incident).
-        store.reload_from_disk();
+        store.reload_from_disk(&active_job_ids(state));
         if let Some(mut existing) =
             store.find_duplicate(clean_url, &record_filename, &state.download_dir.to_string_lossy(), false)
         {
@@ -495,6 +535,11 @@ fn try_gltf_download(
         segments_done: 0,
         estimated_total_bytes: None,
         audio_only: false,
+        picked_height: None,
+        picked_vbr_kbps: None,
+        delivered_height: None,
+        delivered_bitrate_kbps: None,
+        quality_note: None,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -538,7 +583,7 @@ fn try_media_download(
         // Fresh disk state before the duplicate check (see the
         // glTF add above): a record the bridge cleared must not
         // match from stale memory.
-        store.reload_from_disk();
+        store.reload_from_disk(&active_job_ids(state));
         if let Some(mut existing) =
             store.find_duplicate(clean_url, &provisional, &state.download_dir.to_string_lossy(), false)
         {
@@ -576,6 +621,11 @@ fn try_media_download(
         segments_done: 0,
         estimated_total_bytes: None,
         audio_only: false,
+        picked_height: None,
+        picked_vbr_kbps: None,
+        delivered_height: None,
+        delivered_bitrate_kbps: None,
+        quality_note: None,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -663,7 +713,7 @@ fn plan_pending_download(
             // 2026-11-22 incident as the bridge: a new download
             // vanished when the plan matched a cleared clip in
             // stale memory).
-            store.reload_from_disk();
+            store.reload_from_disk(&active_job_ids(state));
             if store
                 .find_duplicate_except(
                     &record_url,
@@ -700,6 +750,10 @@ fn plan_pending_download(
             // UI can show "0 / N pieces" before the first segment
             // lands. yt-dlp plans carry None.
             updated.segments_total = plan.segments_total;
+            // Round 10, item 8: what the user picked, so the
+            // delivered file can be probed against it.
+            updated.picked_height = plan.picked_height;
+            updated.picked_vbr_kbps = plan.picked_vbr_kbps;
             updated.updated_unix = now_unix();
             store.upsert(updated.clone());
             let _ = store.save();
@@ -764,7 +818,7 @@ fn queue_direct_download(
         // Fresh disk state before the duplicate check (see the
         // glTF add above): a record the bridge cleared must not
         // match from stale memory.
-        store.reload_from_disk();
+        store.reload_from_disk(&active_job_ids(state));
         if let Some(mut existing) =
             store.find_duplicate(&clean, &filename, &state.download_dir.to_string_lossy(), false)
         {
@@ -801,6 +855,11 @@ fn queue_direct_download(
         segments_done: 0,
         estimated_total_bytes: None,
         audio_only: false,
+        picked_height: None,
+        picked_vbr_kbps: None,
+        delivered_height: None,
+        delivered_bitrate_kbps: None,
+        quality_note: None,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -822,7 +881,13 @@ fn spawn_download_worker(state: &Arc<State>, id: String) {
         .lock()
         .unwrap()
         .insert(id.clone(), Arc::clone(&job));
-    std::thread::spawn(move || run_download(&state2, &id, &job));
+    std::thread::spawn(move || {
+        run_download(&state2, &id, &job);
+        // Round 10, item 6: the job leaves the map when its worker
+        // ends (paused workers too — resume spawns a fresh job),
+        // so `active_job_ids` stays exactly the running workers.
+        remove_job_if_current(&state2, &id, &job);
+    });
 }
 
 /// List the qualities available for a video page (format picker).
@@ -835,6 +900,26 @@ async fn media_formats(
 ) -> Result<MediaInfo, String> {
     let clean = fetchforge_engine::validate_url(&url)?;
     list_formats(&state.data_dir, &clean)
+}
+
+/// Best-effort delivered-quality probe (round 10, item 8): probe
+/// the finished file with ffmpeg (when one is already available —
+/// never downloaded for this) and record its real resolution /
+/// bitrate, plus a mismatch note when the site mislabelled the
+/// stream. A missing ffmpeg or a failed probe leaves the record
+/// unchanged: the download already completed, and a probe failure
+/// must never fail it. Only media downloads carry picked values,
+/// so direct/gltf records skip the probe entirely. Mirrors the
+/// bridge's method of the same name.
+fn probe_delivered_quality(state: &Arc<State>, r: &mut DownloadRecord, final_path: &std::path::Path) {
+    if r.picked_height.is_none() && r.picked_vbr_kbps.is_none() {
+        return;
+    }
+    if let Ok(ffmpeg) = find_ffmpeg(&state.data_dir) {
+        if let Some(q) = probe_video_quality(&ffmpeg, final_path) {
+            r.apply_delivered_quality(q.height, q.bitrate_kbps);
+        }
+    }
 }
 
 fn set_status(state: &Arc<State>, id: &str, status: Status, error: Option<String>) {
@@ -940,22 +1025,12 @@ fn run_download(state: &Arc<State>, id: &str, job: &Job) {
     let progress = move |p: fetchforge_engine::Progress| {
         let mut store = state2.store.lock().unwrap();
         if let Some(mut r) = store.get(&id2).cloned() {
-            r.downloaded_bytes = p.downloaded;
-            r.total_bytes = p.total.or(r.total_bytes);
-            // Segment progress (HLS/DASH only): only overwrite when
-            // the report carries a value — yt-dlp and direct
-            // downloads report None here, and must never wipe
-            // the plan-time segment count.
-            if let Some(d) = p.segments_done {
-                r.segments_done = d;
-            }
-            if let Some(t) = p.segments_total {
-                r.segments_total = Some(t);
-            }
-            if let Some(e) = p.estimated_total {
-                r.estimated_total_bytes = Some(e);
-            }
-            r.updated_unix = now_unix();
+            // Round 10, items 2/6: monotonic progress — a later
+            // report never moves a counter backwards (the Plex
+            // audio phase restarted its segment counter at 0),
+            // and a report that carries no segment value never
+            // wipes the plan-time count.
+            r.apply_progress(&p);
             store.upsert(r);
             let _ = store.save();
         }
@@ -964,10 +1039,10 @@ fn run_download(state: &Arc<State>, id: &str, job: &Job) {
         Ok(final_path) => {
             let mut store = state.store.lock().unwrap();
             if let Some(mut r) = store.get(id).cloned() {
-                r.status = Status::Completed;
-                r.destination = final_path.to_string_lossy().to_string();
-                r.error = None;
-                r.updated_unix = now_unix();
+                // Round 10, item 2: completion reconciles against
+                // the real file size — the file on disk is the
+                // truth (novahd: 121 MB shown for a 3.37 GB file).
+                r.complete_with_file(&final_path);
                 store.upsert(r);
                 let _ = store.save();
             }
@@ -1032,22 +1107,12 @@ fn run_media_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
     let progress = move |p: fetchforge_engine::Progress| {
         let mut store = state2.store.lock().unwrap();
         if let Some(mut r) = store.get(&id2).cloned() {
-            r.downloaded_bytes = p.downloaded;
-            r.total_bytes = p.total.or(r.total_bytes);
-            // Segment progress (HLS/DASH only): only overwrite when
-            // the report carries a value — yt-dlp and direct
-            // downloads report None here, and must never wipe
-            // the plan-time segment count.
-            if let Some(d) = p.segments_done {
-                r.segments_done = d;
-            }
-            if let Some(t) = p.segments_total {
-                r.segments_total = Some(t);
-            }
-            if let Some(e) = p.estimated_total {
-                r.estimated_total_bytes = Some(e);
-            }
-            r.updated_unix = now_unix();
+            // Round 10, items 2/6: monotonic progress — a later
+            // report never moves a counter backwards (the Plex
+            // audio phase restarted its segment counter at 0),
+            // and a report that carries no segment value never
+            // wipes the plan-time count.
+            r.apply_progress(&p);
             store.upsert(r);
             let _ = store.save();
         }
@@ -1062,13 +1127,11 @@ fn run_media_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
         Ok(final_path) => {
             let mut store = state.store.lock().unwrap();
             if let Some(mut r) = store.get(&id).cloned() {
-                r.status = Status::Completed;
-                r.destination = final_path.to_string_lossy().to_string();
-                if let Some(name) = final_path.file_name() {
-                    r.filename = name.to_string_lossy().to_string();
-                }
-                r.error = None;
-                r.updated_unix = now_unix();
+                // Round 10, item 2: completion reconciles against
+                // the real file size — the file on disk is the
+                // truth (novahd: 121 MB shown for a 3.37 GB file).
+                r.complete_with_file(&final_path);
+                probe_delivered_quality(state, &mut r, &final_path);
                 store.upsert(r);
                 let _ = store.save();
             }
@@ -1118,22 +1181,12 @@ fn run_stream_hls_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) 
     let progress = move |p: fetchforge_engine::Progress| {
         let mut store = state2.store.lock().unwrap();
         if let Some(mut r) = store.get(&id2).cloned() {
-            r.downloaded_bytes = p.downloaded;
-            r.total_bytes = p.total.or(r.total_bytes);
-            // Segment progress (HLS/DASH only): only overwrite when
-            // the report carries a value — yt-dlp and direct
-            // downloads report None here, and must never wipe
-            // the plan-time segment count.
-            if let Some(d) = p.segments_done {
-                r.segments_done = d;
-            }
-            if let Some(t) = p.segments_total {
-                r.segments_total = Some(t);
-            }
-            if let Some(e) = p.estimated_total {
-                r.estimated_total_bytes = Some(e);
-            }
-            r.updated_unix = now_unix();
+            // Round 10, items 2/6: monotonic progress — a later
+            // report never moves a counter backwards (the Plex
+            // audio phase restarted its segment counter at 0),
+            // and a report that carries no segment value never
+            // wipes the plan-time count.
+            r.apply_progress(&p);
             store.upsert(r);
             let _ = store.save();
         }
@@ -1190,13 +1243,11 @@ fn run_stream_hls_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) 
         Ok(final_path) => {
             let mut store = state.store.lock().unwrap();
             if let Some(mut r) = store.get(&id).cloned() {
-                r.status = Status::Completed;
-                r.destination = final_path.to_string_lossy().to_string();
-                if let Some(name) = final_path.file_name() {
-                    r.filename = name.to_string_lossy().to_string();
-                }
-                r.error = None;
-                r.updated_unix = now_unix();
+                // Round 10, item 2: completion reconciles against
+                // the real file size — the file on disk is the
+                // truth (novahd: 121 MB shown for a 3.37 GB file).
+                r.complete_with_file(&final_path);
+                probe_delivered_quality(state, &mut r, &final_path);
                 store.upsert(r);
                 let _ = store.save();
             }
@@ -1241,22 +1292,12 @@ fn run_stream_dash_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job)
     let progress = move |p: fetchforge_engine::Progress| {
         let mut store = state2.store.lock().unwrap();
         if let Some(mut r) = store.get(&id2).cloned() {
-            r.downloaded_bytes = p.downloaded;
-            r.total_bytes = p.total.or(r.total_bytes);
-            // Segment progress (HLS/DASH only): only overwrite when
-            // the report carries a value — yt-dlp and direct
-            // downloads report None here, and must never wipe
-            // the plan-time segment count.
-            if let Some(d) = p.segments_done {
-                r.segments_done = d;
-            }
-            if let Some(t) = p.segments_total {
-                r.segments_total = Some(t);
-            }
-            if let Some(e) = p.estimated_total {
-                r.estimated_total_bytes = Some(e);
-            }
-            r.updated_unix = now_unix();
+            // Round 10, items 2/6: monotonic progress — a later
+            // report never moves a counter backwards (the Plex
+            // audio phase restarted its segment counter at 0),
+            // and a report that carries no segment value never
+            // wipes the plan-time count.
+            r.apply_progress(&p);
             store.upsert(r);
             let _ = store.save();
         }
@@ -1272,13 +1313,11 @@ fn run_stream_dash_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job)
         Ok(final_path) => {
             let mut store = state.store.lock().unwrap();
             if let Some(mut r) = store.get(&id).cloned() {
-                r.status = Status::Completed;
-                r.destination = final_path.to_string_lossy().to_string();
-                if let Some(name) = final_path.file_name() {
-                    r.filename = name.to_string_lossy().to_string();
-                }
-                r.error = None;
-                r.updated_unix = now_unix();
+                // Round 10, item 2: completion reconciles against
+                // the real file size — the file on disk is the
+                // truth (novahd: 121 MB shown for a 3.37 GB file).
+                r.complete_with_file(&final_path);
+                probe_delivered_quality(state, &mut r, &final_path);
                 store.upsert(r);
                 let _ = store.save();
             }
@@ -1324,22 +1363,12 @@ fn run_gltf_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
     let progress = move |p: fetchforge_engine::Progress| {
         let mut store = state2.store.lock().unwrap();
         if let Some(mut r) = store.get(&id2).cloned() {
-            r.downloaded_bytes = p.downloaded;
-            r.total_bytes = p.total.or(r.total_bytes);
-            // Segment progress (HLS/DASH only): only overwrite when
-            // the report carries a value — yt-dlp and direct
-            // downloads report None here, and must never wipe
-            // the plan-time segment count.
-            if let Some(d) = p.segments_done {
-                r.segments_done = d;
-            }
-            if let Some(t) = p.segments_total {
-                r.segments_total = Some(t);
-            }
-            if let Some(e) = p.estimated_total {
-                r.estimated_total_bytes = Some(e);
-            }
-            r.updated_unix = now_unix();
+            // Round 10, items 2/6: monotonic progress — a later
+            // report never moves a counter backwards (the Plex
+            // audio phase restarted its segment counter at 0),
+            // and a report that carries no segment value never
+            // wipes the plan-time count.
+            r.apply_progress(&p);
             store.upsert(r);
             let _ = store.save();
         }
@@ -1355,13 +1384,10 @@ fn run_gltf_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
         Ok(final_path) => {
             let mut store = state.store.lock().unwrap();
             if let Some(mut r) = store.get(&id).cloned() {
-                r.status = Status::Completed;
-                r.destination = final_path.to_string_lossy().to_string();
-                if let Some(name) = final_path.file_name() {
-                    r.filename = name.to_string_lossy().to_string();
-                }
-                r.error = None;
-                r.updated_unix = now_unix();
+                // Round 10, item 2: completion reconciles against
+                // the real file size — the file on disk is the
+                // truth (novahd: 121 MB shown for a 3.37 GB file).
+                r.complete_with_file(&final_path);
                 store.upsert(r);
                 let _ = store.save();
             }
@@ -1384,9 +1410,17 @@ fn run_gltf_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
 }
 
 #[tauri::command]
-fn pause_download(state: tauri::State<Arc<State>>, id: String) {
+async fn pause_download(state: tauri::State<'_, Arc<State>>, id: String) {
     if let Some(job) = state.jobs.lock().unwrap().get(&id).cloned() {
         job.paused.store(true, Ordering::Relaxed);
+    }
+    // Round 10, item 13: the download may be running in the bridge
+    // (extension path), not in this process — forward the pause
+    // there too, best-effort. A dead bridge must not break the
+    // local pause. Async so the loopback call runs off the IPC
+    // thread (see pair_browser).
+    if let Ok(token) = read_bridge_token(&state.data_dir) {
+        let _ = bridge_post(&state.data_dir, &token, &format!("/downloads/{id}/pause"));
     }
 }
 
@@ -1406,14 +1440,85 @@ fn resume_download(state: tauri::State<Arc<State>>, id: String) {
         .lock()
         .unwrap()
         .insert(id.clone(), Arc::clone(&job));
-    std::thread::spawn(move || run_download(&state2, &id, &job));
+    std::thread::spawn(move || {
+        run_download(&state2, &id, &job);
+        // Round 10, item 6: the job leaves the map when its worker
+        // ends (paused workers too — resume spawns a fresh job),
+        // so `active_job_ids` stays exactly the running workers.
+        remove_job_if_current(&state2, &id, &job);
+    });
 }
 
 #[tauri::command]
-fn cancel_download(state: tauri::State<Arc<State>>, id: String) {
+async fn cancel_download(state: tauri::State<'_, Arc<State>>, id: String) {
     if let Some(job) = state.jobs.lock().unwrap().get(&id).cloned() {
         job.cancelled.store(true, Ordering::Relaxed);
     }
+    // Round 10, item 13: same cross-process forward as pause —
+    // the download may be running in the bridge, not here.
+    if let Ok(token) = read_bridge_token(&state.data_dir) {
+        let _ = bridge_post(&state.data_dir, &token, &format!("/downloads/{id}/cancel"));
+    }
+}
+
+/// Delete a download from the list (round 10, item 13), on ANY
+/// row state: a running download is stopped first (cancelled in
+/// both processes, then up to ~5 s for the worker to acknowledge
+/// by leaving Downloading), the record is removed, and — when the
+/// user chose "delete the files too" — its files are deleted from
+/// disk. Returns how many files were removed (0 when only the
+/// list entry was removed). Async so the poll runs off the IPC
+/// thread. The frontend gates this behind the two-option
+/// confirmation; nothing is deleted until the user picks one.
+#[tauri::command(rename_all = "snake_case")]
+async fn delete_download(
+    state: tauri::State<'_, Arc<State>>,
+    id: String,
+    delete_files: bool,
+) -> Result<usize, String> {
+    if let Some(job) = state.jobs.lock().unwrap().get(&id).cloned() {
+        job.cancelled.store(true, Ordering::Relaxed);
+    }
+    if let Ok(token) = read_bridge_token(&state.data_dir) {
+        let _ = bridge_post(&state.data_dir, &token, &format!("/downloads/{id}/cancel"));
+    }
+    for _ in 0..50 {
+        let still_running = {
+            let mut store = state.store.lock().unwrap();
+            store.reload_from_disk(&active_job_ids(&state));
+            store
+                .get(&id)
+                .is_some_and(|r| r.status == Status::Downloading)
+        };
+        if !still_running {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let record = {
+        let mut store = state.store.lock().unwrap();
+        store.reload_from_disk(&active_job_ids(&state));
+        let rec = match store.get(&id) {
+            Some(r) => r.clone(),
+            None => return Err("Download not found.".to_string()),
+        };
+        store.remove(&id);
+        if let Err(e) = store.save() {
+            return Err(e);
+        }
+        rec
+    };
+    // The manifest sidecar is orphaned once the record is gone —
+    // set_status never runs for a removed record.
+    delete_manifest_sidecar(&state.data_dir, &id);
+    if !delete_files {
+        return Ok(0);
+    }
+    Ok(delete_download_files(
+        &record,
+        &state.download_dir,
+        &state.data_dir,
+    ))
 }
 
 /// Clear finished downloads from the list: removes Completed/Failed/
@@ -1423,7 +1528,7 @@ fn cancel_download(state: tauri::State<Arc<State>>, id: String) {
 #[tauri::command]
 fn clear_finished_downloads(state: tauri::State<Arc<State>>) -> usize {
     let mut store = state.store.lock().unwrap();
-    store.reload_from_disk();
+    store.reload_from_disk(&active_job_ids(&state));
     let removed = store.remove_finished();
     if let Err(e) = store.save() {
         eprintln!("FetchForge WARNING: could not save after clearing finished downloads: {e}");
@@ -1439,6 +1544,24 @@ struct PairStatus {
     active: bool,
     used: bool,
     seconds_left: u64,
+}
+
+/// Paired browsers for the Browser Integration section (round 10,
+/// item 15), mirrored from the bridge's GET /pair/browsers JSON:
+/// the real count of browsers paired by code, plus their names and
+/// pairing times. Browsers paired by pasting a token manually are
+/// not in the list — the count is what was recorded, never a guess.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PairedBrowser {
+    instance_id: String,
+    browser_name: String,
+    paired_unix: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PairedBrowsers {
+    count: usize,
+    browsers: Vec<PairedBrowser>,
 }
 
 /// Feat 1 (NOT VERIFIED on Windows): talk to the local bridge over
@@ -1570,6 +1693,81 @@ async fn pair_status(state: tauri::State<'_, Arc<State>>) -> Result<PairStatus, 
     serde_json::from_str(&body).map_err(|e| format!("Bridge returned bad JSON ({e})"))
 }
 
+// Async so the blocking loopback call runs off the IPC thread (see
+// pair_browser). Mirrors pair_status; the frontend hides the
+// paired-browsers indicator when this fails rather than showing a
+// fake number.
+#[tauri::command]
+async fn paired_browsers(state: tauri::State<'_, Arc<State>>) -> Result<PairedBrowsers, String> {
+    let token = read_bridge_token(&state.data_dir)?;
+    let body = bridge_get(&state.data_dir, &token, "/pair/browsers")?;
+    serde_json::from_str(&body).map_err(|e| format!("Bridge returned bad JSON ({e})"))
+}
+
+/// Site directory (round 10, item 16): the working sweep sites
+/// only. A link is opened in the user's default browser, never
+/// inside the app's webview. The URL must be https and its host
+/// must be on this allowlist — an arbitrary URL from the frontend
+/// must never reach the OS shell. This crate has no shell/opener
+/// plugin and no `url` dependency, so the check is a plain string
+/// parse: scheme, host, and no shell metacharacters anywhere.
+const SITE_DIRECTORY_HOSTS: [&str; 14] = [
+    "novahd.cc",
+    "nime.pro",
+    "atlantic.bz",
+    "lookmovie2.uk",
+    "primewire.mov",
+    "flixtortv.im",
+    "soap2dayhd.autos",
+    "fmovies.co",
+    "watch.plex.tv",
+    "therokuchannel.roku.com",
+    "archive.org",
+    "www.youtube.com",
+    "123movieseasy.com",
+    "fmovie.buzz",
+];
+
+#[tauri::command]
+fn open_external_link(url: String) -> Result<(), String> {
+    if url.contains(['&', '|', '<', '>', '^', '%', '"', '\'', '`', ';', ' ', '\\']) {
+        return Err("That link is not a valid site-directory link.".to_string());
+    }
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| "Only secure (https) links can be opened.".to_string())?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() || host.contains('@') || host.contains(':') {
+        return Err("That link is not a valid site-directory link.".to_string());
+    }
+    if !SITE_DIRECTORY_HOSTS.contains(&host) {
+        return Err("That site is not in the FetchForge site directory.".to_string());
+    }
+    // Open via the OS default browser (`cmd /C start` on Windows,
+    // `open`/`xdg-open` elsewhere). The URL was validated above,
+    // so no shell metacharacter can reach the command.
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .spawn()
+            .map_err(|e| format!("Could not open the link ({e})."))?;
+    }
+    #[cfg(not(windows))]
+    {
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        std::process::Command::new(opener)
+            .arg(&url)
+            .spawn()
+            .map_err(|e| format!("Could not open the link ({e})."))?;
+    }
+    Ok(())
+}
+
 /// What the bridge's POST /cache/clear returns: how many cached
 /// files were removed and how many bytes that freed. Serialized
 /// back to the frontend as {"removed_files": N, "freed_bytes": N}.
@@ -1638,11 +1836,14 @@ fn main() {
             pause_download,
             resume_download,
             cancel_download,
+            delete_download,
             clear_finished_downloads,
             bridge_status,
             pair_browser,
             pair_status,
-            unpair_all_browsers
+            paired_browsers,
+            unpair_all_browsers,
+            open_external_link
         ])
         .build(tauri::generate_context!())
         .expect("error while building FetchForge");

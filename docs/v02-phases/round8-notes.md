@@ -295,3 +295,37 @@ build cannot reach. Specifically unverified:
 - No location picker (future feature, explicitly out of scope).
 - No desktop Rust changes (the desktop crate cannot be
   type-checked on this VM; Windows CI is the compile gate).
+
+## 8. CI fixup (2026-11-23 13:05 PKT, after the first build failed)
+
+The first round-8 Windows build (run 45133360026) FAILED at
+step 8, "Build Tauri app, NSIS installer and portable zip":
+the test step passed, but `fetchforge-desktop` would not
+compile — 8 errors in `apps/desktop/src-tauri/src/main.rs`,
+all from the round-8 `audio_only` engine change:
+
+- E0063 (4x): `DownloadRecord` initializers missing the new
+  `audio_only` field (lines 360, 471, 552, 776).
+- E0061 (3x): `find_duplicate` calls missing the new 4th
+  `audio_only: bool` argument (lines 460, 541, 765).
+- E0061 (1x): `find_duplicate_except` call missing the new
+  5th argument (line 665).
+
+Root cause: the round-8 brief said "no desktop Rust
+changes", but the engine API change REQUIRED desktop
+call-site updates — and the desktop crate cannot be
+type-checked on this VM, so the builder never saw the
+errors. Lesson: any engine API change must grep the desktop
+crate for affected call sites, even when the round's brief
+says no desktop changes.
+
+Fix (follow-up commit on audit-round, desktop main.rs only):
+all four initializers get `audio_only: false` and the three
+`find_duplicate` calls get `false` — the desktop app has no
+audio-only path (the always-popup with the audio choice
+lives in the extension, which talks to the bridge), verified
+by grep: no `audio_only` anywhere under apps/desktop before
+the fix. The worker's post-plan `find_duplicate_except`
+passes `rec.audio_only`, mirroring the bridge. Tests
+re-verified after the fix: cargo 188 passed, harness 47
+passed. Windows CI is the real gate for this fix.

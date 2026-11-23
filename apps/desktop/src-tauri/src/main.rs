@@ -380,6 +380,7 @@ fn failed_record(
         segments_total: None,
         segments_done: 0,
         estimated_total_bytes: None,
+        audio_only: false,
     };
     state.store.lock().unwrap().upsert(rec.clone());
     let _ = state.store.lock().unwrap().save();
@@ -457,7 +458,7 @@ fn try_gltf_download(
         // (2026-11-22 incident).
         store.reload_from_disk();
         if let Some(mut existing) =
-            store.find_duplicate(clean_url, &record_filename, &state.download_dir.to_string_lossy())
+            store.find_duplicate(clean_url, &record_filename, &state.download_dir.to_string_lossy(), false)
         {
             // The caller must know nothing new was queued: flag
             // the returned clone (never the stored record) so the
@@ -493,6 +494,7 @@ fn try_gltf_download(
         segments_total: None,
         segments_done: 0,
         estimated_total_bytes: None,
+        audio_only: false,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -538,7 +540,7 @@ fn try_media_download(
         // match from stale memory.
         store.reload_from_disk();
         if let Some(mut existing) =
-            store.find_duplicate(clean_url, &provisional, &state.download_dir.to_string_lossy())
+            store.find_duplicate(clean_url, &provisional, &state.download_dir.to_string_lossy(), false)
         {
             // The caller must know nothing new was queued: flag
             // the returned clone (never the stored record) so the
@@ -573,6 +575,7 @@ fn try_media_download(
         segments_total: None,
         segments_done: 0,
         estimated_total_bytes: None,
+        audio_only: false,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -667,6 +670,7 @@ fn plan_pending_download(
                     &plan.filename,
                     &state.download_dir.to_string_lossy(),
                     &id,
+                    rec.audio_only,
                 )
                 .is_some()
             {
@@ -762,7 +766,7 @@ fn queue_direct_download(
         // match from stale memory.
         store.reload_from_disk();
         if let Some(mut existing) =
-            store.find_duplicate(&clean, &filename, &state.download_dir.to_string_lossy())
+            store.find_duplicate(&clean, &filename, &state.download_dir.to_string_lossy(), false)
         {
             // The caller must know nothing new was queued: flag
             // the returned clone (never the stored record) so the
@@ -796,6 +800,7 @@ fn queue_direct_download(
         segments_total: None,
         segments_done: 0,
         estimated_total_bytes: None,
+        audio_only: false,
     };
     {
         let mut store = state.store.lock().unwrap();

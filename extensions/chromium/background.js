@@ -323,12 +323,14 @@ function bgManifestKind(url) {
 // by playing + area alone, and a big autoplaying preview can win
 // the election while the film plays in another frame.
 // Returns { url, filename?, audioUrl?, referer?, viaPage?,
-// manifestText?, masterText? } (referer is the frame the stream
+// manifestText?, masterText?, pageVideoDuration } (referer is the frame the stream
 // came from, sent as the Referer header on segment requests;
 // viaPage marks a page URL for the formats popup; manifestText is
 // the captured text for the download URL, masterText the captured
-// text of the frame's master playlist — see content.js) or null
-// when no frame has a source.
+// text of the frame's master playlist — see content.js;
+// pageVideoDuration is the longest video duration seen in ANY
+// frame, playing or not, for the content script's clip guard) or
+// null when no frame has a source.
 function bestDownloadSource(tabId, winner) {
   const frames = tabOverlayCandidates.get(tabId);
   if (!frames) return null;
@@ -371,7 +373,17 @@ function bestDownloadSource(tabId, winner) {
   });
   const best = pool[0];
   const s = best.cand.source;
-  return { url: s.url, filename: s.filename, audioUrl: s.audioUrl, referer: best.frameUrl, viaPage: !!s.viaPage, manifestText: s.manifestText, masterText: s.masterText };
+  // Round 7 (clip guard): the longest video duration seen in ANY
+  // frame, playing or not — the content script uses it to tell a
+  // long-form watch page (a film playing) from a page whose only
+  // video is a short clip. Unlike the election's playing-only
+  // ranking, a paused film still proves the page is long-form.
+  let pageVideoDuration = 0;
+  for (const e of all) {
+    const d = e.cand.duration;
+    if (typeof d === "number" && isFinite(d) && d > pageVideoDuration) pageVideoDuration = d;
+  }
+  return { url: s.url, filename: s.filename, audioUrl: s.audioUrl, referer: best.frameUrl, viaPage: !!s.viaPage, manifestText: s.manifestText, masterText: s.masterText, pageVideoDuration: pageVideoDuration };
 }
 function electOverlay(tabId) {
   const frames = tabOverlayCandidates.get(tabId);
@@ -419,7 +431,7 @@ api.contextMenus.onClicked.addListener((info) => {
 // Popup asks the background to send a pasted URL (keeps token handling here).
 api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.type === "sendUrl") {
-    sendDownload(msg.url, msg.filename).then((r) => sendResponse({ ok: r.ok, error: r.error, duplicate: r.duplicate }));
+    sendDownload(msg.url, msg.filename).then((r) => sendResponse({ ok: r.ok, error: r.error, duplicate: r.duplicate, viaBrowser: r.viaBrowser }));
     return true;
   }
   if (msg && msg.type === "downloadMedia") {
@@ -434,7 +446,7 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // the content script captured from the player (round 6).
     if (!_sender || !_sender.tab) { sendResponse({ ok: false, error: "No tab" }); return false; }
     const referer = msg.referer || (_sender && _sender.url) || (_sender.tab && _sender.tab.url) || undefined;
-    sendDownload(msg.url, msg.filename, referer, msg.audioUrl, msg.formatId, msg.manifestText).then((r) => sendResponse({ ok: r.ok, error: r.error, duplicate: r.duplicate }));
+    sendDownload(msg.url, msg.filename, referer, msg.audioUrl, msg.formatId, msg.manifestText).then((r) => sendResponse({ ok: r.ok, error: r.error, duplicate: r.duplicate, viaBrowser: r.viaBrowser }));
     return true;
   }
   if (msg && msg.type === "getFormats") {

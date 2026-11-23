@@ -384,6 +384,20 @@ impl Store {
                 None => {
                     self.records.insert(id, disk_rec);
                 }
+                // Round 7: never let disk overwrite a record this
+                // process owns. An actively-downloading record's
+                // status and progress live in memory: a stale Paused
+                // on disk (written by a short-lived native-host
+                // launch before round 7 moved recovery behind the
+                // bind) must not flip a progressing download to
+                // Paused — that is exactly what happened to the nime
+                // DASH download on 2026-11-23 (it kept downloading
+                // while the UI said Paused). A terminal record never
+                // un-completes either: no other process can resume
+                // or re-run it, so disk can only hold an older or
+                // stomped view of it.
+                Some(ours)
+                    if ours.status == Status::Downloading || ours.status.is_terminal() => {}
                 Some(ours) if disk_rec.updated_unix > ours.updated_unix => {
                     self.records.insert(id, disk_rec);
                 }
@@ -394,12 +408,18 @@ impl Store {
         // process holds that is absent from disk was deleted by the
         // other process and saved. The grace period protects a
         // record this process just created but has not saved yet.
+        // An actively-downloading record is never pruned: its
+        // worker lives in this process, so its absence from disk
+        // can only mean the file was replaced mid-download, and
+        // dropping it from memory would orphan the worker.
         let now = now_secs();
         let stale: Vec<String> = self
             .records
             .values()
             .filter(|r| {
-                !disk_ids.contains(&r.id) && now.saturating_sub(r.updated_unix) > REMOVAL_GRACE_SECS
+                r.status != Status::Downloading
+                    && !disk_ids.contains(&r.id)
+                    && now.saturating_sub(r.updated_unix) > REMOVAL_GRACE_SECS
             })
             .map(|r| r.id.clone())
             .collect();
@@ -726,6 +746,89 @@ mod tests {
         b.reload_from_disk();
         assert!(b.get("one").is_some(), "one must survive reload");
         assert!(b.get("two").is_some(), "two must appear after reload");
+    }
+
+    #[test]
+    fn reload_from_disk_keeps_active_downloads_and_terminal_records() {
+        // Round 7: a stale Paused on disk (written by a short-lived
+        // native-host launch before round 7) must not flip a
+        // progressing download to Paused in live memory, and a
+        // terminal record must never un-complete. Other records
+        // still refresh from disk by timestamp.
+        let dir = std::env::temp_dir().join("fetchforge-test-store-reload-own");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("downloads.json");
+        let old = now_secs() - 3600;
+        let mut a = Store::load(path.clone());
+        let mut active = rec_status("active", Status::Downloading, old, old);
+        active.downloaded_bytes = 500;
+        active.segments_done = 5;
+        a.upsert(active);
+        a.upsert(rec_status("done", Status::Completed, old, old));
+        a.upsert(rec_status("paused", Status::Paused, old, old));
+        a.save().unwrap();
+        // B loads the same file, so B holds all three.
+        let mut b = Store::load(path.clone());
+        // The other process writes a NEWER Paused over "active" (the
+        // stomp), a NEWER Paused over "done", and a NEWER Failed
+        // over "paused" (a genuine status change).
+        let now = now_secs();
+        a.upsert(rec_status("active", Status::Paused, old, now));
+        a.upsert(rec_status("done", Status::Paused, old, now));
+        a.upsert(rec_status("paused", Status::Failed, old, now));
+        a.save().unwrap();
+        b.reload_from_disk();
+        let kept = b.get("active").expect("active must survive reload");
+        assert_eq!(
+            kept.status,
+            Status::Downloading,
+            "an actively-downloading record must keep its in-memory status"
+        );
+        assert_eq!(kept.downloaded_bytes, 500, "progress must survive too");
+        assert_eq!(kept.segments_done, 5);
+        assert_eq!(
+            b.get("done").unwrap().status,
+            Status::Completed,
+            "a terminal record must never un-complete"
+        );
+        assert_eq!(
+            b.get("paused").unwrap().status,
+            Status::Failed,
+            "a non-owned record must still refresh from disk"
+        );
+    }
+
+    #[test]
+    fn reload_from_disk_never_prunes_active_downloads() {
+        // An actively-downloading record absent from disk (the file
+        // was replaced mid-download) must stay in memory: dropping
+        // it would orphan the worker.
+        let dir = std::env::temp_dir().join("fetchforge-test-store-reload-noprune");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("downloads.json");
+        let old = now_secs() - 3600; // past the removal grace
+        let mut a = Store::load(path.clone());
+        a.upsert(rec_status("active", Status::Downloading, old, old));
+        a.upsert(rec_status("stale", Status::Completed, old, old));
+        a.save().unwrap();
+        let mut b = Store::load(path.clone());
+        // The other process removes both records and saves.
+        a.remove_finished();
+        // "active" is Downloading, not finished: remove it directly
+        // to simulate a disk file that lost it.
+        a.records.remove("active");
+        a.save().unwrap();
+        b.reload_from_disk();
+        assert!(
+            b.get("active").is_some(),
+            "an active download must never be pruned"
+        );
+        assert!(
+            b.get("stale").is_none(),
+            "a finished record must still be pruned"
+        );
     }
 
     #[test]

@@ -5,9 +5,12 @@
 //!   stored in the user's data dir and shown in the desktop app's Settings.
 //!   The token is never logged and never leaves the machine.
 //! * Rejects non-extension / non-loopback `Origin` headers.
-//! * `--native-host` speaks the Chrome/Firefox native-messaging framing
+//! * `native-host` speaks the Chrome/Firefox native-messaging framing
 //!   (4-byte little-endian length + JSON) on stdin/stdout. Only the
 //!   extension ID registered in the host manifest can invoke it.
+//!   Chrome launches the host with NO arguments and a pipe on stdin,
+//!   so a piped stdin with no mode argument also enters native-host
+//!   mode (see main).
 //!
 //! Usage:
 //!   fetchforge-bridge serve [--port 18443] [--data-dir DIR]
@@ -24,7 +27,7 @@ use fetchforge_engine::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -229,12 +232,15 @@ impl App {
             eprintln!("FetchForge WARNING: {w}");
         }
         let token = load_or_create_token(&data_dir);
-        let mut store = Store::load(data_dir.join("downloads.json"));
+        let store = Store::load(data_dir.join("downloads.json"));
         if let Some(w) = &store.load_warning {
             eprintln!("FetchForge WARNING: {w}");
         }
-        store.recover_interrupted();
-        let _ = store.save();
+        // NOTE: App::new deliberately does NOT recover interrupted
+        // downloads (see recover_interrupted): a short-lived
+        // native-host probe constructs an App on every extension
+        // button click, and recovery here would stomp every
+        // in-progress download to Paused on disk.
         let detected = match std::fs::read_to_string(data_dir.join("detected.json")) {
             Ok(text) => match serde_json::from_str::<Vec<DetectedItem>>(&text) {
                 Ok(items) => items.into_iter().take(MAX_DETECTED_ITEMS).collect(),
@@ -257,6 +263,22 @@ impl App {
             active: Mutex::new(0),
             detected: Mutex::new(detected),
         })
+    }
+
+    /// Mark records left Downloading by a previous run as Paused
+    /// ("Interrupted by app close or crash") and persist. Called
+    /// ONLY by the process that actually becomes the server, after
+    /// its TCP bind succeeds (see main). A short-lived native-host
+    /// probe must never do this: every extension button click
+    /// launches one, and before round 7 each click stomped every
+    /// in-progress download to Paused on disk (proven live
+    /// 2026-11-23: a nime download flipped Downloading→Paused
+    /// with no process restart, while the download itself kept
+    /// progressing).
+    fn recover_interrupted(&self) {
+        let mut store = self.store.lock().unwrap();
+        store.recover_interrupted();
+        let _ = store.save();
     }
 
     /// Store detected media items: dedupe by URL (a re-detection
@@ -2633,14 +2655,34 @@ fn main() {
         }
     }
     let app = App::new(data_dir.clone());
-    if args.iter().any(|a| a == "native-host") {
-        native_host(&app);
-        return;
-    }
+    // Mode selection, in precedence order:
+    //
+    // 1. `print-token` — explicit user action (the app reads the
+    //    token from stdout). Checked first: it must work even
+    //    when stdin is piped.
     if args.iter().any(|a| a == "print-token") {
         // Explicit user action only: this command prints the token to
         // stdout so the app can read it. Serve mode never prints it.
         println!("{}", app.token.lock().unwrap());
+        return;
+    }
+    // 2. `native-host` — explicit native-messaging mode.
+    // 3. `serve` — explicit serve mode. Checked BEFORE the stdin
+    //    test: both the desktop app and spawn_detached_bridge
+    //    spawn the bridge with `serve` and a null stdin, and null
+    //    stdin is not a terminal — without this check those
+    //    spawns would wrongly enter native-host mode.
+    // 4. Piped stdin (not a terminal), no mode argument — Chrome
+    //    launches the native host with NO arguments and a pipe on
+    //    stdin, so this IS a native-host launch. Before round 7
+    //    it fell through to serve mode, failed to bind (the
+    //    bridge was already running), and exited without
+    //    replying — so the extension's native path never worked.
+    // 5. Anything else (a terminal, a plain double-click): serve.
+    let native_arg = args.iter().any(|a| a == "native-host");
+    let serve_arg = args.iter().any(|a| a == "serve");
+    if native_arg || (!serve_arg && !std::io::stdin().is_terminal()) {
+        native_host(&app);
         return;
     }
     // Default: serve.
@@ -2652,6 +2694,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Only the process that actually becomes the server recovers
+    // interrupted downloads — after the bind succeeds, so a second
+    // process that fails to bind never touches downloads.json.
+    app.recover_interrupted();
     eprintln!("FetchForge bridge listening on 127.0.0.1:{port} (loopback only)");
     eprintln!("Data dir: {}", data_dir.display());
     eprintln!(

@@ -1453,7 +1453,44 @@ pub struct MediaPlan {
 }
 
 fn stem_for_title(title: &str) -> String {
-    let clean = sanitize_filename(title);
+    let mut t = title.trim();
+    // Strip leading "(N)" notification counts: a spam notification
+    // overlay can rewrite the tab title to "(1) New Message!" and
+    // the file would be named after the spam, not the movie
+    // (2026-11-23: a nime download was literally saved as
+    // "(1) New Message!.mp4"). Only 1-3 digits count, so a year
+    // like "(2026) Dune" survives. Loop: badges can stack.
+    loop {
+        let stripped = t.strip_prefix('(').and_then(|rest| {
+            let close = rest.find(')')?;
+            let num = &rest[..close];
+            if !num.is_empty()
+                && num.len() <= 3
+                && num.bytes().all(|b| b.is_ascii_digit())
+            {
+                Some(rest[close + 1..].trim_start())
+            } else {
+                None
+            }
+        });
+        match stripped {
+            Some(s) => t = s,
+            None => break,
+        }
+    }
+    // Strip a leading "Watch "/"Watching " prefix: streaming sites
+    // wrap titles ("Watching The Odyssey — Atlantic" became the
+    // filename on 2026-11-23). "Watching" first — it starts with
+    // "Watch" but has no space after it.
+    for prefix in ["watching ", "watch "] {
+        if let Some(head) = t.get(..prefix.len()) {
+            if head.eq_ignore_ascii_case(prefix) {
+                t = t[prefix.len()..].trim_start();
+                break;
+            }
+        }
+    }
+    let clean = sanitize_filename(t);
     let stem = Path::new(&clean)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -3319,6 +3356,30 @@ exit 0
         assert!(plan_media_download(&dir, &url, Some("nope"), None, &None, None).is_err());
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn stem_for_title_strips_notification_counts_and_watch_prefixes() {
+        // Round 7: a spam notification overlay rewrote a tab title
+        // to "(1) New Message!" and the file was saved under that
+        // name; atlantic's title started with "Watching ".
+        assert_eq!(stem_for_title("(1) New Message!"), "New Message!");
+        assert_eq!(stem_for_title("(12) The Odyssey"), "The Odyssey");
+        assert_eq!(stem_for_title("(1) (2) Stacked"), "Stacked");
+        assert_eq!(stem_for_title("Watching The Odyssey"), "The Odyssey");
+        assert_eq!(stem_for_title("WATCHING Dune"), "Dune");
+        assert_eq!(stem_for_title("Watch The Odyssey"), "The Odyssey");
+        assert_eq!(
+            stem_for_title("(3) Watching The Odyssey"),
+            "The Odyssey"
+        );
+        // A 4-digit parenthesised year is NOT a notification count.
+        assert_eq!(stem_for_title("(2026) Dune"), "(2026) Dune");
+        // Existing behaviour: sanitisation, empty fallback, cap.
+        assert_eq!(stem_for_title("A<B>C"), "A_B_C");
+        assert_eq!(stem_for_title(""), "download");
+        assert_eq!(stem_for_title("(1)"), "download");
+        assert_eq!(stem_for_title("The Odyssey"), "The Odyssey");
     }
 
     #[test]

@@ -131,6 +131,20 @@ function fmtBytes(n) {
   return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + " " + u[i];
 }
 
+// Percent against the best-known total (exact total, else the size
+// estimate). Capped at 100: multi-phase downloads report cumulative
+// bytes, so a stale or per-phase estimate can make the raw ratio
+// exceed 100% (a nime DASH download showed 1324% on 2026-11-23);
+// the engine now sends a combined estimate, and the cap is the
+// safety net for any estimate that still runs low. Pure function —
+// covered by the node harness in extensions/harness (see
+// progress-percent.test.js), which extracts it from this file.
+function progressPercent(downloadedBytes, totalBytes, estimatedTotalBytes) {
+  const denom = totalBytes || estimatedTotalBytes;
+  if (!denom) return 0;
+  return Math.min(100, Math.round(downloadedBytes / denom * 100));
+}
+
 // ---- Busy state: every button shows it is working ----
 // While an invoke is in flight the button is disabled and labelled,
 // so a click is always visibly answered (with the :active/:disabled
@@ -455,7 +469,7 @@ async function refresh() {
       // fully read; the size estimate (when present) stands in so the
       // percentage and the bar move instead of sitting at 0%.
       const pctDenom = d.total_bytes || d.estimated_total_bytes;
-      const pct = pctDenom ? Math.round(d.downloaded_bytes / pctDenom * 100) : 0;
+      const pct = progressPercent(d.downloaded_bytes, d.total_bytes, d.estimated_total_bytes);
       // textContent only: filenames and server error strings are untrusted
       // and must never be parsed as HTML (a file named <img src=x onerror=…>
       // used to be injected via innerHTML before this fix).

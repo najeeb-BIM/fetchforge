@@ -137,14 +137,24 @@
   // the original XHR behaviour are always preserved.
   function manifestHookMain(token) {
     var MAX_TEXT = 262144; // 256 KB cap, mirrored in the content script
-    function isPlaylistUrl(u) { return /\.m3u8([?#]|$)/i.test(u) || /\.mpd([?#]|$)/i.test(u); }
+    // Round 7: match .m3u8/.mpd ANYWHERE in the URL, not just
+    // before ?/# or at the end. Proxy-wrapped playlists
+    // (frappe.hybrows.workers.dev/?url=https://cdn/...m3u8&...)
+    // carry the extension mid-URL, followed by & — the old
+    // anchored test missed them entirely, which is why the hook
+    // captured nothing on any of the three movie sites
+    // (2026-11-23). The text-shape gate (looksLikePlaylist)
+    // still guards against false positives: a URL that merely
+    // mentions .m3u8 is only forwarded when its BODY is a
+    // playlist.
+    function isPlaylistUrl(u) { return /\.m3u8/i.test(u) || /\.mpd/i.test(u); }
     function isPlaylistType(ct) {
       ct = String(ct || "").toLowerCase();
       return ct.indexOf("mpegurl") !== -1 || ct.indexOf("dash+xml") !== -1;
     }
     function looksLikePlaylist(text, url) {
-      if (/\.m3u8([?#]|$)/i.test(url)) return text.indexOf("#EXTM3U") !== -1;
-      if (/\.mpd([?#]|$)/i.test(url)) return text.indexOf("<MPD") !== -1;
+      if (/\.m3u8/i.test(url)) return text.indexOf("#EXTM3U") !== -1;
+      if (/\.mpd/i.test(url)) return text.indexOf("<MPD") !== -1;
       // URL gave no hint (matched by content-type only): accept
       // either playlist shape.
       return text.indexOf("#EXTM3U") !== -1 || text.indexOf("<MPD") !== -1;
@@ -181,7 +191,19 @@
                 var ct = "";
                 try { ct = clone.headers.get("content-type") || ""; } catch (_) {}
                 if (isPlaylistUrl(absUrl(url)) || isPlaylistType(ct)) {
-                  clone.text().then(function (t) { maybeForward(url, t, ct); }).catch(function () {});
+                  // Skip the read when the body is known to be far
+                  // larger than any playlist: with the widened URL
+                  // test (round 7), a segment URL that happens to
+                  // contain ".m3u8" must never trigger a multi-MB
+                  // text read. Chunked responses carry no
+                  // Content-Length and still read (playlists are
+                  // small; the forward cap drops anything over
+                  // 256 KB anyway).
+                  var len = 0;
+                  try { len = parseInt(clone.headers.get("content-length") || "0", 10) || 0; } catch (_) {}
+                  if (!len || len <= MAX_TEXT) {
+                    clone.text().then(function (t) { maybeForward(url, t, ct); }).catch(function () {});
+                  }
                 }
               }
             } catch (_) {}
@@ -943,12 +965,23 @@
   function pageTitleStem() {
     let title = (document.title || "").trim();
     if (!title) return "";
+    // A spam notification overlay can rewrite the tab title to
+    // "(1) New Message!" — strip a leading "(N)" badge (1–3
+    // digits, looped for stacked badges) so the file is not named
+    // after the spam (2026-11-23: a nime download was literally
+    // saved as "(1) New Message!.mp4"). A 4-digit parenthesised
+    // year like "(2026) Dune" is NOT a badge and survives.
+    while (/^\(\d{1,3}\)\s*/.test(title)) title = title.replace(/^\(\d{1,3}\)\s*/, "").trim();
+    if (!title) return "";
     // Streaming sites wrap the title: "Watch The Odyssey (2026) |
-    // NovaHD". Strip a leading "Watch " and a trailing " | <site>"
-    // suffix — both guarded so a real title is never emptied. A
+    // NovaHD", or "Watching The Odyssey — Atlantic" (the
+    // "Watching " prefix became a filename on 2026-11-23). Strip
+    // a leading "Watching "/"Watch " and a trailing " | <site>"
+    // suffix — all guarded so a real title is never emptied. A
     // " - " suffix is NOT stripped: real titles contain hyphens
     // ("Spider-Man - Homecoming"). Whatever survives, the user can
     // still edit it in the popup's filename field.
+    title = title.replace(/^watching\s+/i, "").trim();
     title = title.replace(/^watch\s+/i, "").trim();
     if (!title) return "";
     title = title.replace(/\s*\|\s*[^|]*$/, "").trim();
@@ -979,6 +1012,85 @@
   // scope; calling it threw a ReferenceError that silently killed
   // the one-click send (caught by the popup harness, 2026-11-22).
   function isManifestUrl(url) { return /\.(m3u8|mpd)([?#]|$)/i.test(String(url || "")); }
+  function isDashUrl(url) { return /\.mpd([?#]|$)/i.test(String(url || "")); }
+  function isMp4FamilyUrl(url) { return /\.(mp4|mov|m4v)([?#]|$)/i.test(String(url || "")); }
+
+  // ---- Direct-file clip guard (round 7, Fix 6) ----
+  //
+  // The verdict can still be a short ad clip when the movie's
+  // playlist is invisible (novahd 2026-11-23: a 15-second
+  // /assets/p/*.mp4 clip was sent as "the movie" three times).
+  // Before a one-click send of a direct file on a long-form watch
+  // page, probe the file's duration from its moov/mvhd boxes; a
+  // known-short clip is refused honestly on the button. Any probe
+  // failure fails OPEN (the send proceeds) — the button must
+  // never break a legitimate download. Same-origin only in
+  // practice: a cross-origin fetch without CORS fails and
+  // returns null (fail open). No host permissions are added.
+  function parseMp4Duration(bytes) {
+    // Minimal moov/mvhd walk, mirroring the engine's
+    // mp4_duration_secs (crates/engine/src/extract.rs): top-level
+    // boxes to moov, then mvhd. Returns seconds, or null when
+    // unknown (moov at end of file, truncated boxes, non-mp4).
+    // Null is "unknown", never "short".
+    try {
+      if (!bytes || bytes.length < 8) return null;
+      const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const boxType = function (off) {
+        return String.fromCharCode(bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7]);
+      };
+      let off = 0;
+      while (off + 8 <= bytes.length) {
+        const size = dv.getUint32(off);
+        if (size < 8) return null;
+        if (boxType(off) === "moov") {
+          const end = Math.min(off + size, bytes.length);
+          let inner = off + 8;
+          while (inner + 8 <= end) {
+            const isize = dv.getUint32(inner);
+            if (isize < 8) return null;
+            if (boxType(inner) === "mvhd") {
+              const payload = inner + 8;
+              const mvhdEnd = Math.min(inner + isize, end);
+              const version = bytes[payload];
+              if (version === 0) {
+                if (payload + 20 > mvhdEnd) return null;
+                const timescale = dv.getUint32(payload + 12);
+                const duration = dv.getUint32(payload + 16);
+                if (!timescale) return null;
+                return duration / timescale;
+              }
+              if (version === 1) {
+                if (payload + 32 > mvhdEnd) return null;
+                const timescale = dv.getUint32(payload + 20);
+                const duration = Number(dv.getBigUint64(payload + 24));
+                if (!timescale) return null;
+                return duration / timescale;
+              }
+              return null;
+            }
+            inner += isize;
+          }
+          return null;
+        }
+        off += size;
+      }
+      return null;
+    } catch (_) { return null; }
+  }
+  async function probeDirectFileDuration(url) {
+    // Range-probe the first 64 KB (same window as the engine's
+    // HTML-fallback probe) with a 5 s timeout.
+    const ctrl = new AbortController();
+    const timer = setTimeout(function () { try { ctrl.abort(); } catch (_) {} }, 5000);
+    try {
+      const r = await fetch(url, { headers: { "Range": "bytes=0-65535" }, signal: ctrl.signal });
+      if (!r.ok && r.status !== 206) return null;
+      const buf = new Uint8Array(await r.arrayBuffer());
+      return parseMp4Duration(buf);
+    } catch (_) { return null; }
+    finally { clearTimeout(timer); }
+  }
   function defaultFilenameFor(dl) {
     // One-click fallback name (no popup). Page URLs (YouTube etc.)
     // keep the verdict's filename — usually none, so the app names
@@ -1013,6 +1125,14 @@
         // while no download was created at all).
         btn.textContent = "Already downloaded";
         btn.title = "This file is already in your downloads.";
+      } else if (resp && resp.viaBrowser) {
+        // The app could not be reached at all, so the browser
+        // downloaded the file itself — say so honestly instead of
+        // claiming the app got it (2026-11-23: files landed in
+        // Chrome's Downloads folder while the button said "Sent
+        // to FetchForge").
+        btn.textContent = "Downloaded by browser";
+        btn.title = "The FetchForge app could not be reached, so your browser downloaded this file instead.";
       } else if (resp && resp.ok) {
         btn.textContent = "Sent to FetchForge";
       } else {
@@ -1059,9 +1179,36 @@
     // Page URL (viaPage, e.g. YouTube): ask the app for the
     // page's formats and let the user pick a quality.
     if (dl.viaPage) { openFormatsPopup(btn, dl); return; }
+    // DASH manifest (nime's VidLink index_web.mpd): ask the app
+    // for the manifest's formats and let the user pick a quality,
+    // like a page URL. The bridge fetches the .mpd itself; if it
+    // cannot, the popup falls back to the one-click send.
+    if (isDashUrl(dl.url)) { openFormatsPopup(btn, dl); return; }
     // Direct files (image/3D/PDF/direct .mp4) and single-variant
     // streams keep the current one-click send: no popup, no choice
-    // to make.
+    // to make. EXCEPT a direct mp4-family file on a long-form
+    // watch page (a video over 10 minutes is playing somewhere on
+    // the page): probe its duration first — a known-short clip is
+    // refused honestly instead of being sent as the movie.
+    if (!isManifestUrl(dl.url) && isMp4FamilyUrl(dl.url) && (dl.pageVideoDuration || 0) > 600) {
+      btn.disabled = true;
+      btn.textContent = "Checking…";
+      btn.title = "";
+      probeDirectFileDuration(dl.url).then(function (secs) {
+        if (secs != null && secs < 60) {
+          btn.textContent = "Only a short clip was found";
+          btn.title = "The file behind this button is a short clip (" + Math.round(secs) + "s), not the full video.";
+          window.setTimeout(function () {
+            btn.disabled = false;
+            btn.textContent = "↓ FetchForge";
+            btn.title = "";
+          }, 5000);
+        } else {
+          sendCurrentDownload(btn, dl, {});
+        }
+      }).catch(function () { sendCurrentDownload(btn, dl, {}); });
+      return;
+    }
     sendCurrentDownload(btn, dl, {});
   }
 
@@ -1303,6 +1450,14 @@
         fallbackOneClick();
         return;
       }
+      // A single format is not a real choice — fall through to the
+      // one-click send at that quality instead of showing a popup
+      // with one row (same rule as the HLS master path, and the
+      // DASH single-representation case).
+      if (resp.formats.length < 2) {
+        fallbackOneClick();
+        return;
+      }
       floatOverlay.popupTitle.textContent = "Choose quality";
       if (resp.title) {
         floatOverlay.popupSubtitle.textContent = resp.title;
@@ -1323,7 +1478,12 @@
         addQualityRow(f.label || f.format_id, selected, function () {
           const name = currentPopupFilename();
           closeQualityPopup();
-          sendCurrentDownload(btn, dl, { formatId: f.format_id, audioUrl: undefined, manifestText: undefined, filename: name });
+          // Pass captured manifest text along (a DASH .mpd the
+          // hook captured from the player): signed links may fail
+          // on a second fetch, so the engine uses this copy.
+          // Page URLs carry no captured text — undefined there,
+          // and the engine fetches normally.
+          sendCurrentDownload(btn, dl, { formatId: f.format_id, audioUrl: undefined, manifestText: dl.manifestText || dl.masterText, filename: name });
         });
       });
       // No format matched default_format_id: highlight the first

@@ -900,7 +900,7 @@ fn write_seg_meta(seg_dir: &Path, segments: &[Segment]) {
 /// Download `segments` into `part_path`, in parallel over the
 /// download's shared client (see [`hls_client`]).
 ///
-/// Parallelism (study §A5): `HLS_SEGMENT_WORKERS` workers pull
+/// Parallelism (study §A5): `workers` workers pull
 /// segment indices from a shared counter, each fetching its
 /// segment with the same 3-attempt retry rule as the old
 /// sequential engine, writing it to its own file in the segment
@@ -910,7 +910,9 @@ fn write_seg_meta(seg_dir: &Path, segments: &[Segment]) {
 /// order into the `.part` file — the output is byte-identical to
 /// the sequential engine's, verified by test. Progress reports
 /// carry the segment counts and the running size estimate (see
-/// [`estimate_total_bytes`]).
+/// [`estimate_total_bytes`]). With `workers == 1` this is the
+/// round-7 sequential fallback: same code, same segment dir, one
+/// connection at a time.
 ///
 /// Resume: a segment dir whose meta still matches the manifest
 /// (same count, same first segment) keeps its completed pieces;
@@ -972,7 +974,7 @@ fn download_segments(
             stall_timeout,
         );
     }
-    download_segments_parallel(
+    match download_segments_parallel(
         client,
         segments,
         part_path,
@@ -982,7 +984,62 @@ fn download_segments(
         paused,
         cancelled,
         stall_timeout,
-    )
+        HLS_SEGMENT_WORKERS,
+    ) {
+        Ok(n) => Ok(n),
+        Err(e) if should_fallback_sequential(&e, paused, cancelled) => {
+            // Round 7: a parallel run that fails a segment on a
+            // TIMEOUT gets one sequential retry. totallyacdn
+            // (atlantic, 2026-11-23) timed out segment 2 with 4
+            // parallel workers + browser headers + HTTP/1.1 — the
+            // CDN appears to throttle concurrent connections from
+            // one client. The retry reuses the same segment dir,
+            // so pieces the parallel pass already landed are not
+            // re-fetched, and it is bounded by the same fail-fast
+            // and stall rules as any other pass. If the retry also
+            // fails, the ORIGINAL error stands: the sequential pass
+            // was a rescue attempt, and it must never rewrite the
+            // failure's diagnosis (e.g. a server that died between
+            // passes would otherwise turn a timeout into a
+            // "connection refused").
+            match download_segments_parallel(
+                client,
+                segments,
+                part_path,
+                referer,
+                progress_base,
+                progress,
+                paused,
+                cancelled,
+                stall_timeout,
+                1,
+            ) {
+                Ok(n) => Ok(n),
+                Err(_) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Retry a failed parallel segment run sequentially? Only for a
+/// SEGMENT timeout: the server stopped answering mid-run, which a
+/// single connection may survive (a CDN throttling concurrency).
+/// Never for pause/cancel (the user asked to stop), a stall (the
+/// run already burned the whole stall timeout — a second pass
+/// would just burn it again), or a fast refusal (HTTP 4xx/5xx, DNS
+/// — sequential will fail the same way, so fail at once).
+fn should_fallback_sequential(err: &str, paused: &AtomicBool, cancelled: &AtomicBool) -> bool {
+    if paused.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
+        return false;
+    }
+    if err == "__PAUSED__" || err == "__CANCELLED__" {
+        return false;
+    }
+    // Segment failures are phrased "Segment N of M could not be
+    // downloaded..."; anything else (stall, assembly, IO) is not a
+    // segment timeout and gets no retry.
+    err.starts_with("Segment ") && looks_like_timeout(err)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -996,6 +1053,7 @@ fn download_segments_parallel(
     paused: &AtomicBool,
     cancelled: &AtomicBool,
     stall_timeout: Duration,
+    workers: usize,
 ) -> Result<u64, String> {
     let total = segments.len() as u64;
     let seg_dir = seg_dir_for(part_path);
@@ -1036,7 +1094,14 @@ fn download_segments_parallel(
             bytes_per_sec: dl as f64 / elapsed,
             segments_done: Some(dn),
             segments_total: Some(total),
-            estimated_total: estimate_total_bytes(dl, dn, total),
+            // The estimate is COMBINED: completed phases contribute
+            // their exact bytes (progress_base) and the current
+            // phase its measured estimate. A per-phase estimate
+            // here made the UI show 1324% on a nime DASH download
+            // (2.2 GB cumulative bytes against a ~166 MB
+            // audio-phase estimate, 2026-11-23).
+            estimated_total: estimate_total_bytes(dl, dn, total)
+                .map(|e| progress_base.saturating_add(e)),
         });
     };
     // Report the resumed state at once, so a resumed download
@@ -1054,7 +1119,11 @@ fn download_segments_parallel(
     let seg_dir = &seg_dir;
     let report = &report;
     std::thread::scope(|scope| {
-        for _ in 0..HLS_SEGMENT_WORKERS {
+        // `workers` is HLS_SEGMENT_WORKERS normally; the round-7
+        // sequential fallback re-runs this same function with 1
+        // worker over the same segment dir (completed pieces are
+        // reused, never re-fetched).
+        for _ in 0..workers.max(1) {
             let client = client.clone();
             scope.spawn(move || loop {
                 if stop.load(Ordering::Relaxed) {
@@ -1224,8 +1293,25 @@ fn download_segments_parallel(
         out.flush().map_err(|e| e.to_string())?;
     }
     let total_bytes = downloaded.load(Ordering::Relaxed);
-    let _ = std::fs::remove_dir_all(&seg_dir);
+    // The segment dir is KEPT after a successful assembly: a
+    // multi-phase download (HLS pair, DASH video+audio) can still
+    // fail in a LATER phase, and its resume must not re-fetch this
+    // completed phase (nime DASH, 2026-11-23: the video phase was
+    // re-downloaded in full after the audio phase failed with
+    // HTTP 429, because the old code deleted the pieces here).
+    // The caller removes the dir when the final file is produced
+    // (see remove_seg_dir); "Clear cache" sweeps orphaned dirs.
     Ok(total_bytes)
+}
+
+/// Best-effort removal of one phase's segment dir, called when
+/// the final file is produced (rename or merge): the pieces are
+/// no longer needed, and leaving thousands of files behind per
+/// download would litter the destination. Called only on
+/// SUCCESS — if the merge fails, the pieces stay so a resume
+/// re-assembles locally instead of re-downloading.
+fn remove_seg_dir(part_path: &Path) {
+    let _ = std::fs::remove_dir_all(seg_dir_for(part_path));
 }
 
 /// The pre-round-6 sequential engine, kept for one purpose:
@@ -1366,7 +1452,12 @@ fn download_segments_sequential(
             bytes_per_sec: downloaded as f64 / elapsed,
             segments_done: Some(done_now),
             segments_total: Some(total),
-            estimated_total: estimate_total_bytes(downloaded, done_now, total),
+            // Combined estimate, as in the parallel path: the
+            // completed phases' exact bytes plus this phase's
+            // measured estimate, so the percent never exceeds 100%
+            // on a multi-phase download.
+            estimated_total: estimate_total_bytes(downloaded, done_now, total)
+                .map(|e| progress_base.saturating_add(e)),
         });
     }
     drop(out);
@@ -1528,6 +1619,7 @@ pub fn download_hls_variant(
     )?;
     let Some(audio_segments) = audio_segments else {
         std::fs::rename(&video_part, &final_path).map_err(|e| e.to_string())?;
+        remove_seg_dir(&video_part);
         return Ok(final_path);
     };
     // Separate audio: download it, then merge (stream copy, no
@@ -1536,6 +1628,7 @@ pub fn download_hls_variant(
     // flags on the next worker run.
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = std::fs::remove_file(&video_part);
+        remove_seg_dir(&video_part);
         return Err("__CANCELLED__".to_string());
     }
     if paused.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1561,6 +1654,8 @@ pub fn download_hls_variant(
     let _ = std::fs::remove_file(&video_part);
     let _ = std::fs::remove_file(&audio_part);
     merged?;
+    remove_seg_dir(&video_part);
+    remove_seg_dir(&audio_part);
     Ok(final_path)
 }
 
@@ -1630,6 +1725,7 @@ pub fn download_hls_pair(
     )?;
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = std::fs::remove_file(&video_part);
+        remove_seg_dir(&video_part);
         return Err("__CANCELLED__".to_string());
     }
     if paused.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1654,6 +1750,8 @@ pub fn download_hls_pair(
     let _ = std::fs::remove_file(&video_part);
     let _ = std::fs::remove_file(&audio_part);
     merged?;
+    remove_seg_dir(&video_part);
+    remove_seg_dir(&audio_part);
     Ok(final_path)
 }
 
@@ -2655,10 +2753,12 @@ pub fn download_dash_with(
     )?;
     let Some(audio_rep) = audio else {
         std::fs::rename(&video_part, &final_path).map_err(|e| e.to_string())?;
+        remove_seg_dir(&video_part);
         return Ok(final_path);
     };
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = std::fs::remove_file(&video_part);
+        remove_seg_dir(&video_part);
         return Err("__CANCELLED__".to_string());
     }
     if paused.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2689,6 +2789,8 @@ pub fn download_dash_with(
     let _ = std::fs::remove_file(&video_part);
     let _ = std::fs::remove_file(&audio_part);
     merged?;
+    remove_seg_dir(&video_part);
+    remove_seg_dir(&audio_part);
     Ok(final_path)
 }
 
@@ -3611,7 +3713,10 @@ mod tests {
             err.contains("after 3 tries"),
             "error: {err}"
         );
-        assert_eq!(hits.lock().unwrap().len(), 3, "hits: {:?}", hits.lock().unwrap());
+        // Bind the guard once: locking twice in one assert deadlocks
+        // (the first guard lives until the end of the statement).
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.len(), 3, "hits: {hits:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4118,6 +4223,195 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `serve_map` with a file map the test can mutate between
+    /// runs (same port, so segment URLs — and the resume meta —
+    /// stay identical): models a CDN that 404s a segment on the
+    /// first run and serves it on the retry.
+    fn serve_map_shared(
+        files: std::sync::Arc<std::sync::RwLock<HashMap<String, Vec<u8>>>>,
+        hits: std::sync::Arc<Mutex<Vec<String>>>,
+        stop: std::sync::Arc<AtomicBool>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    hits.lock().unwrap().push(path.clone());
+                    let body = files.read().unwrap().get(&path).cloned();
+                    match body {
+                        Some(body) => {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(&body);
+                        }
+                        None => {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn dash_resume_skips_completed_video_phase() {
+        // Round 7, Finding A, end to end: the nime DASH download
+        // failed in the AUDIO phase (HTTP 429 at audio segment
+        // 121) after the video phase had fully completed — and the
+        // resume re-downloaded all 1,768 video segments from
+        // scratch. A resume must reuse the completed video phase
+        // (and the partial audio phase) and fetch only the missing
+        // pieces. Needs a real ffmpeg; skip where none exists.
+        let ffmpeg = match crate::ffmpeg::find_on_path("ffmpeg") {
+            Some(p) => p,
+            None => return,
+        };
+        let dir = unique_temp_dir("dash-resume");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |args: &[&str]| {
+            use std::process::{Command, Stdio};
+            Command::new(&ffmpeg)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let vmp4 = dir.join("v.mp4");
+        let am4a = dir.join("a.m4a");
+        assert!(mk(&[
+            "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", vmp4.to_str().unwrap()
+        ]));
+        assert!(mk(&[
+            "-y", "-f", "lavfi", "-i", "sine=frequency=440:d=1",
+            "-c:a", "aac", am4a.to_str().unwrap()
+        ]));
+        let vbytes = std::fs::read(&vmp4).unwrap();
+        let abytes = std::fs::read(&am4a).unwrap();
+        // 2 s manifest, 1 s segments: init + 2 media segments per
+        // track. Split each real file into 3 parts so the
+        // concatenation is the valid original.
+        let (v_init, v_rest) = vbytes.split_at(vbytes.len() / 3);
+        let (v_1, v_2) = v_rest.split_at(v_rest.len() / 2);
+        let (a_init, a_rest) = abytes.split_at(abytes.len() / 3);
+        let (a_1, a_2) = a_rest.split_at(a_rest.len() / 2);
+        let mpd = r#"<MPD type="static" mediaPresentationDuration="PT2S" xmlns="urn:mpeg:dash:schema:mpd:2011">
+ <Period>
+  <AdaptationSet mimeType="video/mp4" contentType="video">
+   <SegmentTemplate duration="1" timescale="1" media="v_$Number$.m4v" startNumber="1" initialization="v_init.m4v"/>
+   <Representation id="v1" bandwidth="1000000" width="64" height="64"/>
+  </AdaptationSet>
+  <AdaptationSet mimeType="audio/mp4" contentType="audio">
+   <SegmentTemplate duration="1" timescale="1" media="a_$Number$.m4a" startNumber="1" initialization="a_init.m4a"/>
+   <Representation id="a1" bandwidth="64000"/>
+  </AdaptationSet>
+ </Period></MPD>"#;
+        let files = std::sync::Arc::new(std::sync::RwLock::new(HashMap::new()));
+        {
+            let mut m = files.write().unwrap();
+            m.insert("/v.mpd".to_string(), mpd.as_bytes().to_vec());
+            m.insert("/v_init.m4v".to_string(), v_init.to_vec());
+            m.insert("/v_1.m4v".to_string(), v_1.to_vec());
+            m.insert("/v_2.m4v".to_string(), v_2.to_vec());
+            m.insert("/a_init.m4a".to_string(), a_init.to_vec());
+            m.insert("/a_1.m4a".to_string(), a_1.to_vec());
+            // NOTE: no /a_2.m4a yet — the audio phase fails on it.
+        }
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map_shared(files.clone(), hits.clone(), stop.clone());
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let opts = DashDownloadOptions {
+            manifest_url: format!("http://127.0.0.1:{port}/v.mpd"),
+            representation_id: Some("v1".to_string()),
+            destination_dir: dir.clone(),
+            filename: "merged.mp4".to_string(),
+            referer: None,
+        };
+        // Run 1: video completes, audio fails on its last segment.
+        let err =
+            download_dash_with(Some(&ffmpeg), &opts, &|_| {}, &paused, &cancelled, None)
+                .unwrap_err();
+        assert!(err.contains("Segment 3 of 3"), "error: {err}");
+        let video_part = dir.join("merged.mp4.part");
+        let video_seg_dir = dir.join("merged.mp4.part.seg");
+        let audio_seg_dir = dir.join("merged.mp4.audio.part.seg");
+        assert_eq!(std::fs::read(&video_part).unwrap(), vbytes);
+        assert!(
+            video_seg_dir.is_dir(),
+            "a completed phase keeps its pieces for resume"
+        );
+        assert_eq!(
+            std::fs::read_dir(&audio_seg_dir).unwrap().count(),
+            3, // meta + 2 downloaded audio pieces
+            "the partial audio phase keeps its pieces"
+        );
+        // The CDN recovers: the missing segment is servable now.
+        files
+            .write()
+            .unwrap()
+            .insert("/a_2.m4a".to_string(), a_2.to_vec());
+        hits.lock().unwrap().clear();
+        // Run 2 (resume): must fetch ONLY the missing audio
+        // segment — no video piece, no already-downloaded audio
+        // piece — then merge and clean up.
+        let out =
+            download_dash_with(Some(&ffmpeg), &opts, &|_| {}, &paused, &cancelled, None)
+                .expect("resume must complete from the saved pieces");
+        assert!(out.is_file());
+        assert!(std::fs::metadata(&out).unwrap().len() > 0);
+        let hits = hits.lock().unwrap().clone();
+        assert!(
+            !hits.iter().any(|h| h.starts_with("/v_")),
+            "resume re-fetched video segments: {hits:?}"
+        );
+        assert!(
+            !hits.iter().any(|h| h == "/a_init.m4a" || h == "/a_1.m4a"),
+            "resume re-fetched completed audio pieces: {hits:?}"
+        );
+        assert_eq!(
+            hits.iter().filter(|h| h.as_str() == "/a_2.m4a").count(),
+            1,
+            "only the missing audio segment is fetched: {hits:?}"
+        );
+        assert!(
+            !video_seg_dir.exists() && !audio_seg_dir.exists(),
+            "segment dirs are cleaned up once the final file exists"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn download_dash_with_refuses_drm() {
         let mpd = "<MPD type=\"static\" xmlns=\"urn:mpeg:dash:schema:mpd:2011\"><Period><AdaptationSet><ContentProtection schemeIdUri=\"urn:uuid:edef8ba9\"/></AdaptationSet></Period></MPD>";
@@ -4398,6 +4692,224 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Stub CDN that stalls the first `stall_first` requests (each
+    /// handled on its own thread, so concurrent requests stall in
+    /// parallel like a real throttling CDN) and serves the rest
+    /// instantly. Models totallyacdn (atlantic, 2026-11-23): the
+    /// parallel pass times out, the sequential retry succeeds.
+    fn serve_stall_first_n(
+        files: HashMap<String, Vec<u8>>,
+        stall_first: usize,
+        stall: Duration,
+        hits: std::sync::Arc<Mutex<Vec<String>>>,
+        stop: std::sync::Arc<AtomicBool>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let files = std::sync::Arc::new(files);
+        let handle = std::thread::spawn(move || loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let files = files.clone();
+                    let hits = hits.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 8192];
+                        let len = stream.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..len]).to_string();
+                        let path = req
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/")
+                            .to_string();
+                        hits.lock().unwrap().push(path.clone());
+                        if n < stall_first {
+                            // Stalled past the client's timeout: the
+                            // client gives up; the write below fails
+                            // silently on the closed socket.
+                            std::thread::sleep(stall);
+                        }
+                        if let Some(body) = files.get(&path) {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(body);
+                            let _ = stream.flush();
+                        }
+                    });
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn parallel_timeout_falls_back_to_sequential_and_succeeds() {
+        // Round 7: the parallel pass times out (a throttling CDN),
+        // the sequential retry over the same segment dir completes
+        // the download. Without the fallback this fails outright.
+        let bodies: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("SEGMENT-{i}-").repeat(i + 1).into_bytes())
+            .collect();
+        let mut files = HashMap::new();
+        for (i, b) in bodies.iter().enumerate() {
+            files.insert(format!("/seg{i}.ts"), b.clone());
+        }
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        // The first 4 requests (the parallel pass, 4 workers) stall
+        // past the 300 ms client timeout; later requests serve.
+        let (port, server) = serve_stall_first_n(
+            files,
+            4,
+            Duration::from_secs(2),
+            hits.clone(),
+            stop.clone(),
+        );
+        let segments: Vec<Segment> = (0..8)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
+                range: None,
+            })
+            .collect();
+        let expected: Vec<u8> = bodies.concat();
+        let client = hls_client_with_timeout(Duration::from_millis(300)).unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let dir = unique_temp_dir("seg-fallback-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let start = Instant::now();
+        let n = download_segments(
+            &client,
+            &segments,
+            &part,
+            &None,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .expect("the sequential fallback must rescue the download");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(n as usize, expected.len());
+        assert_eq!(std::fs::read(&part).unwrap(), expected);
+        // 4 timed-out parallel attempts + 8 sequential fetches: the
+        // retry really ran (a bare parallel success would be 8).
+        // Bind the guard once: locking twice in one assert deadlocks
+        // (the first guard lives until the end of the statement).
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.len(), 12, "hits: {hits:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "fallback took {:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parallel_timeout_fallback_still_fails_with_timeout_reason() {
+        // Both passes time out: the record fails with the ORIGINAL
+        // timeout error (the rescue attempt never rewrites the
+        // diagnosis), quickly, and the hit count proves the
+        // sequential attempt really ran.
+        let mut files = HashMap::new();
+        files.insert("/seg0.ts".to_string(), b"SEGMENT".to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_stall_first_n(
+            files,
+            usize::MAX,
+            Duration::from_secs(2),
+            hits.clone(),
+            stop.clone(),
+        );
+        let segments = vec![Segment {
+            url: format!("http://127.0.0.1:{port}/seg0.ts"),
+            range: None,
+        }];
+        let client = hls_client_with_timeout(Duration::from_millis(300)).unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let dir = unique_temp_dir("seg-fallback-fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let start = Instant::now();
+        let err = download_segments(
+            &client,
+            &segments,
+            &part,
+            &None,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .unwrap_err();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(err.contains("timed out"), "error: {err}");
+        assert!(err.contains("after 1 try"), "error: {err}");
+        // 1 parallel attempt + 1 sequential attempt: the fallback
+        // ran exactly once. (With a single segment only one worker
+        // fetches per pass — the other workers claim indices past
+        // the end and return without a request.) Bind the guard
+        // once: locking twice in one assert deadlocks.
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.len(), 2, "hits: {hits:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "bounded failure took {:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_fallback_sequential_gates_on_segment_timeouts() {
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        assert!(should_fallback_sequential(
+            "Segment 2 of 1730 could not be downloaded after 1 try. (error decoding response body: operation timed out)",
+            &paused,
+            &cancelled
+        ));
+        assert!(!should_fallback_sequential(
+            "Segment 1 of 8 could not be downloaded after 3 tries. (HTTP 404)",
+            &paused,
+            &cancelled
+        ));
+        assert!(!should_fallback_sequential(
+            "The download stalled: no progress for 5 minutes.",
+            &paused,
+            &cancelled
+        ));
+        assert!(!should_fallback_sequential("__PAUSED__", &paused, &cancelled));
+        assert!(!should_fallback_sequential("__CANCELLED__", &paused, &cancelled));
+        paused.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(!should_fallback_sequential(
+            "Segment 2 of 1730 could not be downloaded after 1 try. (operation timed out)",
+            &paused,
+            &cancelled
+        ));
+    }
+
     #[test]
     fn parallel_resume_skips_completed_segments() {
         // A segment dir with a matching meta and two of four
@@ -4540,6 +5052,142 @@ mod tests {
             (1_800_000_000..2_000_000_000).contains(&est),
             "estimate {est} is not ~1.8 GB"
         );
+    }
+
+    #[test]
+    fn download_segments_reuses_completed_phase_without_refetch() {
+        // Round 7, Finding A: a phase that assembled successfully
+        // keeps its segment dir, so a later run over the same part
+        // path (a resume after a LATER phase failed) fetches
+        // nothing — it re-assembles locally. The old code deleted
+        // the dir on assembly, so a DASH resume re-downloaded the
+        // whole video phase (1,768 segments) after the audio phase
+        // failed with HTTP 429.
+        let bodies: Vec<Vec<u8>> = (0..4)
+            .map(|i| format!("PIECE-{i}-").repeat(3).into_bytes())
+            .collect();
+        let mut files = HashMap::new();
+        for (i, b) in bodies.iter().enumerate() {
+            files.insert(format!("/seg{i}.ts"), b.clone());
+        }
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits.clone(), stop.clone());
+        let segments: Vec<Segment> = (0..4)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
+                range: None,
+            })
+            .collect();
+        let expected: Vec<u8> = bodies.concat();
+        let client = hls_client().unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let dir = unique_temp_dir("seg-reuse");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let run = |hits: &std::sync::Arc<Mutex<Vec<String>>>| {
+            hits.lock().unwrap().clear();
+            download_segments(
+                &client,
+                &segments,
+                &part,
+                &None,
+                0,
+                &|_| {},
+                &paused,
+                &cancelled,
+                DOWNLOAD_STALL_TIMEOUT,
+            )
+            .unwrap()
+        };
+        let n = run(&hits);
+        assert_eq!(n as usize, expected.len());
+        assert_eq!(std::fs::read(&part).unwrap(), expected);
+        assert_eq!(hits.lock().unwrap().len(), 4, "first run fetches all");
+        assert!(
+            seg_dir_for(&part).is_dir(),
+            "the segment dir must survive a successful assembly"
+        );
+        // Second run: same part path, same segments — zero HTTP
+        // requests, same bytes, same assembled file.
+        let n = run(&hits);
+        assert_eq!(n as usize, expected.len());
+        assert_eq!(std::fs::read(&part).unwrap(), expected);
+        // Bind the guard once: locking twice in one assert deadlocks
+        // (the first guard lives until the end of the statement).
+        let hits = hits.lock().unwrap();
+        assert!(
+            hits.is_empty(),
+            "resume re-fetched segments: {hits:?}"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn progress_estimate_includes_completed_phases() {
+        // Round 7, Finding B: during the second phase of a
+        // multi-phase download, downloaded_bytes is cumulative
+        // (progress_base + this phase) but the estimate used to be
+        // per-phase only — the UI showed 1324% on a nime DASH
+        // download (2.2 GB against a ~166 MB audio estimate). The
+        // reported estimate must be the COMBINED total.
+        let bodies: Vec<Vec<u8>> = (0..4).map(|_| vec![b'x'; 100]).collect();
+        let mut files = HashMap::new();
+        for (i, b) in bodies.iter().enumerate() {
+            files.insert(format!("/seg{i}.ts"), b.clone());
+        }
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let segments: Vec<Segment> = (0..4)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
+                range: None,
+            })
+            .collect();
+        let client = hls_client().unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let dir = unique_temp_dir("seg-est-base");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("audio.ts.part");
+        let reports = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let reports_clone = reports.clone();
+        // progress_base = 1,000,000 (a completed video phase).
+        download_segments(
+            &client,
+            &segments,
+            &part,
+            &None,
+            1_000_000,
+            &move |p| reports_clone.lock().unwrap().push((p.downloaded, p.estimated_total)),
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let reports = reports.lock().unwrap();
+        let (dl, est) = reports.last().copied().expect("at least one report");
+        assert_eq!(dl, 1_000_400, "cumulative bytes");
+        assert_eq!(
+            est,
+            Some(1_000_400),
+            "combined estimate: completed phase + this phase"
+        );
+        for (_, e) in reports.iter() {
+            if let Some(e) = e {
+                assert!(
+                    *e >= 1_000_000,
+                    "no estimate may fall below the completed phases: {e}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

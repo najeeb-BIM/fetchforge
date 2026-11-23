@@ -35,6 +35,14 @@ goes further and evaluates the whole `background.js` with a stubbed
 - `progress-percent.test.js` — round 7 Finding B: the desktop app's
   `progressPercent` (extracted from `apps/desktop/src/index.html`),
   capped at 100% against multi-phase totals.
+- `round9.test.js` — round 9 hidden-stream detection: the MAIN-world
+  hook file + manifest wiring (no inline injection remains), the
+  hook forwarding a captured playlist (and queueing it until the
+  token appears), the timing scan finding an extensionless playlist
+  and a playlist with no `<video>` element, the webRequest observer
+  classifying by Content-Type, the embedded-data scan finding stream
+  URLs in page JSON, widened URL tests, and the election merging
+  observed findings.
 - `run-all.js` — runs every `*.test.js` here and exits non-zero on
   any failure.
 

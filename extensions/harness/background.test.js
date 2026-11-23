@@ -150,10 +150,11 @@ test("Round 8: downloadMedia audioOnly reaches the native host end to end", asyn
 const ctxB = makeContext(
   {},
   [
-    "const tabOverlayCandidates = new Map();\n",
+    "const tabOverlayCandidates = new Map();\nconst tabObserved = new Map();\n",
     extractConst(bgSrc, "BG_STREAM_EXT_RE", 0) + "\n"
     + extractConst(bgSrc, "BG_MASTER_STEM_RE", 0) + "\n"
-    + extractConst(bgSrc, "BG_AUDIO_STEM_RE", 0) + "\n",
+    + extractConst(bgSrc, "BG_AUDIO_STEM_RE", 0) + "\n"
+    + extractConst(bgSrc, "OBSERVED_TTL_MS", 0) + "\n",
     extractMany(bgSrc, ["bgManifestKind", "bestDownloadSource"], 0),
   ]
 );

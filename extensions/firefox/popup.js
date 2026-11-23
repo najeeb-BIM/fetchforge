@@ -172,6 +172,49 @@ document.getElementById("adBlock").onchange = async (e) => {
   await setStorage({ adBlockEnabled: enabled });
   applyAdBlock(enabled);
 };
+// Full stream detection (round 9, Tier 1): the observe-only
+// webRequest layer needs the optional <all_urls> host permission,
+// requested here at runtime (a user gesture is required, so the
+// popup button is the only place it can happen). Without it the
+// listeners never fire for CDN origins and detection falls back
+// to the page-side layers. The permission is observe-only: the
+// extension watches request URLs + response Content-Types, never
+// blocks, modifies, or sends anything anywhere.
+const STREAM_DETECT_ORIGINS = ["<all_urls>"];
+function permissionsContains(perm) {
+  if (!api.permissions || !api.permissions.contains) return Promise.resolve(false);
+  if (isFirefox) return api.permissions.contains(perm);
+  return new Promise((resolve) => api.permissions.contains(perm, resolve));
+}
+function permissionsRequest(perm) {
+  if (!api.permissions || !api.permissions.request) return Promise.resolve(false);
+  if (isFirefox) return api.permissions.request(perm);
+  return new Promise((resolve) => api.permissions.request(perm, resolve));
+}
+async function refreshStreamDetect() {
+  const statusEl = document.getElementById("streamDetectStatus");
+  const btn = document.getElementById("streamDetectEnable");
+  if (!statusEl || !btn) return;
+  let granted = false;
+  try { granted = await permissionsContains({ origins: STREAM_DETECT_ORIGINS }); } catch (_) { granted = false; }
+  if (granted) {
+    statusEl.textContent = "Full stream detection: on. Hidden streams (workers, blob players) are detected.";
+    btn.style.display = "none";
+  } else {
+    statusEl.textContent = "Full stream detection: off. Some players hide their stream; enabling lets FetchForge observe network requests to find it (read-only, nothing leaves this machine).";
+    btn.style.display = "block";
+  }
+}
+document.getElementById("streamDetectEnable").onclick = async () => {
+  const btn = document.getElementById("streamDetectEnable");
+  btn.disabled = true;
+  let granted = false;
+  try { granted = await permissionsRequest({ origins: STREAM_DETECT_ORIGINS }); } catch (_) { granted = false; }
+  btn.disabled = false;
+  status.textContent = granted ? "Full stream detection enabled." : "Full stream detection stayed off — detection still works, but some hidden streams may be missed.";
+  refreshStreamDetect();
+};
 refresh();
 refreshMedia();
 refreshAdBlock();
+refreshStreamDetect();

@@ -14,16 +14,26 @@
 // Round 6 adds a MAIN-world fetch/XHR hook (see the manifest-hook
 // section below) that captures playlist TEXT the player itself
 // received — the playlist body, never cookies, credentials, or page
-// content — so a single-use signed playlist still downloads. The hook
-// is best-effort: a strict page CSP may block its inline script, in
-// which case the resource-timing fallback below still applies.
+// content — so a single-use signed playlist still downloads. Round 9
+// moved the hook into hook-main.js, a manifest-declared content
+// script ("world": "MAIN") that page CSP cannot block; the hook is
+// still best-effort, and the resource-timing fallback below still
+// applies when it misses.
 //
 // It never runs on chrome://, about:, or extension pages: the manifest
 // matches http(s) only, and the protocol check below is a second line
 // of defence.
 //
-// Detection is DOM-based only (no webRequest observation): the extension
-// deliberately keeps no <all_urls> host permission. blob: sources (e.g.
+// Detection layers (round 9): DOM elements, the resource-timing
+// log (including extensionless playlists, identified by
+// Content-Type, and playlists in frames with no <video> element),
+// the MAIN-world hook, stream URLs declared in the page's embedded
+// data (JSON-LD, application/json blobs, player configs), plus an
+// observe-only webRequest layer in the background script, which
+// sees worker- and service-worker-fetched streams the page layers
+// cannot. The webRequest layer needs the optional <all_urls> host
+// permission, requested at runtime from the popup; without it,
+// detection falls back to the page-side layers. blob: sources (e.g.
 // YouTube's MSE player) cannot be downloaded directly, so for those the
 // button sends the PAGE URL and the desktop app extracts the media
 // server-side — unless the resource-timing log reveals the real stream
@@ -80,22 +90,28 @@
   // Privacy: only playlist text + its URL are captured — never
   // cookies, credentials, headers, or page content. A worker-loaded
   // playlist is NOT seen by this hook (workers have their own
-  // fetch); the timing-log fallback below still covers those.
+  // fetch) — and NOT by the timing log either: per the W3C
+  // Resource Timing spec, worker fetches go to the worker's own
+  // timeline, not the document's. Only the background's
+  // observe-only webRequest layer (round 9, Tier 1) sees them.
   //
-  // CSP caveat: a strict page CSP (script-src without
-  // 'unsafe-inline') blocks the injected inline script, so the hook
-  // never runs on such pages. That is fine: the hook is best-effort
-  // and its failure must NEVER break the button or the timing-log
-  // fallback — injection and every hook step are wrapped so a
-  // failure is silent and the rest of this script runs unchanged.
+  // Round 9: the hook is a manifest-declared content script
+  // (hook-main.js, "world": "MAIN"), NOT an injected inline
+  // <script> — manifest content scripts are not subject to the
+  // page's CSP, so a strict script-src no longer kills the hook
+  // (that is what blocked it on novahd). The hook is still
+  // best-effort: its failure must NEVER break the button or the
+  // timing-log fallback — every hook step is guarded, and a
+  // failure is silent.
   //
-  // Anti-spoof token: the injected code gets a random per-page-load
-  // token and echoes it in every message; the listener below only
-  // accepts messages carrying it, so a page script cannot forge a
-  // fake manifest into the download path. (Not a security boundary
-  // — a page observing DOM mutations could read the token from the
-  // script element before it is removed — but it stops casual
-  // postMessage spoofing.)
+  // Anti-spoof token: a random per-page-load token, published on
+  // <html> as data-fetchforge-hook-token (see publishHookToken
+  // below); the hook reads it from there and echoes it in every
+  // message, and the listener below only accepts messages carrying
+  // it, so a page script cannot forge a fake manifest into the
+  // download path. (Not a security boundary — a page script can
+  // read the attribute — but it stops casual postMessage
+  // spoofing, and the token never leaves the page.)
   const HOOK_TOKEN = (function () {
     try {
       const b = new Uint8Array(16);
@@ -128,138 +144,36 @@
     // re-scan and re-report to the election promptly.
     scheduleScan();
   });
-  // The hook itself. NEVER called in this (isolated) world: it is
-  // stringified and injected as an inline <script> into the page's
-  // MAIN world, where it runs with the page's own fetch/XHR. It
-  // must therefore be fully self-contained (no outer references
-  // except its `token` argument) and must never throw into page
-  // code: every step is guarded, the original fetch promise and
-  // the original XHR behaviour are always preserved.
-  function manifestHookMain(token) {
-    var MAX_TEXT = 262144; // 256 KB cap, mirrored in the content script
-    // Round 7: match .m3u8/.mpd ANYWHERE in the URL, not just
-    // before ?/# or at the end. Proxy-wrapped playlists
-    // (frappe.hybrows.workers.dev/?url=https://cdn/...m3u8&...)
-    // carry the extension mid-URL, followed by & — the old
-    // anchored test missed them entirely, which is why the hook
-    // captured nothing on any of the three movie sites
-    // (2026-11-23). The text-shape gate (looksLikePlaylist)
-    // still guards against false positives: a URL that merely
-    // mentions .m3u8 is only forwarded when its BODY is a
-    // playlist.
-    function isPlaylistUrl(u) { return /\.m3u8/i.test(u) || /\.mpd/i.test(u); }
-    function isPlaylistType(ct) {
-      ct = String(ct || "").toLowerCase();
-      return ct.indexOf("mpegurl") !== -1 || ct.indexOf("dash+xml") !== -1;
-    }
-    function looksLikePlaylist(text, url) {
-      if (/\.m3u8/i.test(url)) return text.indexOf("#EXTM3U") !== -1;
-      if (/\.mpd/i.test(url)) return text.indexOf("<MPD") !== -1;
-      // URL gave no hint (matched by content-type only): accept
-      // either playlist shape.
-      return text.indexOf("#EXTM3U") !== -1 || text.indexOf("<MPD") !== -1;
-    }
-    function absUrl(u) {
-      try { return new URL(String(u), window.location.href).href; } catch (_) { return String(u || ""); }
-    }
-    function forward(url, text) {
-      if (typeof text !== "string" || text.length > MAX_TEXT) return;
-      try { window.postMessage({ type: "ff-manifest", token: token, url: url, text: text }, "*"); } catch (_) {}
-    }
-    function maybeForward(url, text, contentType) {
-      var u = absUrl(url);
-      if (!u) return;
-      if (!isPlaylistUrl(u) && !isPlaylistType(contentType)) return;
-      if (!looksLikePlaylist(text, u)) return;
-      forward(u, text);
-    }
-    try {
-      var origFetch = window.fetch;
-      if (typeof origFetch === "function") {
-        window.fetch = function (input) {
-          var url = "";
-          try {
-            if (typeof input === "string") url = input;
-            else if (input && typeof input.url === "string") url = input.url;
-          } catch (_) {}
-          var p = origFetch.apply(this, arguments);
-          if (!url) return p;
-          return p.then(function (resp) {
-            try {
-              if (resp && resp.ok) {
-                var clone = resp.clone();
-                var ct = "";
-                try { ct = clone.headers.get("content-type") || ""; } catch (_) {}
-                if (isPlaylistUrl(absUrl(url)) || isPlaylistType(ct)) {
-                  // Skip the read when the body is known to be far
-                  // larger than any playlist: with the widened URL
-                  // test (round 7), a segment URL that happens to
-                  // contain ".m3u8" must never trigger a multi-MB
-                  // text read. Chunked responses carry no
-                  // Content-Length and still read (playlists are
-                  // small; the forward cap drops anything over
-                  // 256 KB anyway).
-                  var len = 0;
-                  try { len = parseInt(clone.headers.get("content-length") || "0", 10) || 0; } catch (_) {}
-                  if (!len || len <= MAX_TEXT) {
-                    clone.text().then(function (t) { maybeForward(url, t, ct); }).catch(function () {});
-                  }
-                }
-              }
-            } catch (_) {}
-            return resp;
-          });
-        };
-      }
-    } catch (_) {}
-    try {
-      var origOpen = XMLHttpRequest.prototype.open;
-      var origSend = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.open = function (method, url) {
-        try { this.__ffManifestUrl = url; } catch (_) {}
-        return origOpen.apply(this, arguments);
-      };
-      XMLHttpRequest.prototype.send = function () {
-        var xhr = this;
-        try {
-          xhr.addEventListener("load", function () {
-            try {
-              if (xhr.status >= 200 && xhr.status < 300 && typeof xhr.responseText === "string") {
-                var ct = "";
-                try { ct = xhr.getResponseHeader("Content-Type") || ""; } catch (_) {}
-                maybeForward(xhr.__ffManifestUrl || "", xhr.responseText, ct);
-              }
-            } catch (_) {}
-          });
-        } catch (_) {}
-        return origSend.apply(this, arguments);
-      };
-    } catch (_) {}
-  }
-  let manifestHookInjected = false;
-  function injectManifestHook() {
-    if (manifestHookInjected) return true;
+  // The hook itself lives in hook-main.js, a manifest-declared
+  // content script running in the page's MAIN world ("world":
+  // "MAIN" in manifest.json). This script only publishes the
+  // anti-spoof token where the hook can read it: a DOM attribute
+  // on <html>. The hook forwards captured playlists only with
+  // this token (and queues captures until the token appears, so
+  // an early playlist is never lost when the attribute lands
+  // after the hook runs — see hook-main.js).
+  const HOOK_TOKEN_ATTR = "data-fetchforge-hook-token";
+  let hookTokenPublished = false;
+  function publishHookToken() {
+    if (hookTokenPublished) return true;
     const root = document.documentElement;
     if (!root) return false;
     try {
-      const s = document.createElement("script");
-      s.textContent = "(" + manifestHookMain.toString() + ")(" + JSON.stringify(HOOK_TOKEN) + ");";
-      root.appendChild(s);
-      s.remove();
-      manifestHookInjected = true;
+      root.setAttribute(HOOK_TOKEN_ATTR, HOOK_TOKEN);
+      hookTokenPublished = true;
       return true;
-    } catch (_) { return false; } // CSP or DOM failure: best-effort only
+    } catch (_) { return false; }
   }
-  if (!injectManifestHook()) {
+  if (!publishHookToken()) {
     // documentElement does not exist yet at document_start: retry
     // as soon as it appears, with DOMContentLoaded as a backstop.
-    const hookObserver = new MutationObserver(function () {
-      if (injectManifestHook()) hookObserver.disconnect();
+    const tokenObserver = new MutationObserver(function () {
+      if (publishHookToken()) tokenObserver.disconnect();
     });
-    try { hookObserver.observe(document, { childList: true }); } catch (_) {}
+    try { tokenObserver.observe(document, { childList: true }); } catch (_) {}
     document.addEventListener("DOMContentLoaded", function () {
-      hookObserver.disconnect();
-      injectManifestHook();
+      tokenObserver.disconnect();
+      publishHookToken();
     }, { once: true });
   }
 
@@ -417,8 +331,18 @@
   // observed, the best video variant is sent TOGETHER with its
   // sibling audio variant, so the app downloads both and merges
   // them instead of delivering half a movie.
-  const STREAM_EXT_RE = /\.(m3u8|mpd)([?#]|$)/i;
-  const MEDIA_FILE_EXT_RE = /\.(mp4|webm|mov|mkv)([?#]|$)/i;
+  // Round 9: match .m3u8/.mpd ANYWHERE in the URL, as the MAIN-world
+  // hook has since round 7. Proxy-wrapped playlists (a worker URL
+  // with ?url=https://cdn/...m3u8&... mid-URL) carry the extension
+  // followed by &, which the old anchored test missed entirely.
+  const STREAM_EXT_RE = /\.(m3u8|mpd)/i;
+  const MEDIA_FILE_EXT_RE = /\.(mp4|webm|mov|mkv)/i;
+  // Playlist Content-Types, for extensionless playlist URLs
+  // (novahd's /api/gs-hls): identified by what the server says the
+  // response is, not by the URL's shape. Used on timing-log
+  // entries (PerformanceResourceTiming.contentType, Chrome 109+)
+  // and by the background's webRequest observer.
+  const PLAYLIST_MIME_RE = /(?:vnd\.apple\.mpegurl|x-mpegurl|dash\+xml)/i;
   const MASTER_STEM_RE = /^(master|index|playlist|manifest)$/i;
   const AUDIO_STEM_RE = /audio/i;
   function manifestKind(url) {
@@ -461,7 +385,12 @@
       const name = e && e.name;
       if (!name || !/^https?:\/\//i.test(name)) continue;
       const cand = { url: name, rank: rankOf(e), startTime: typeof e.startTime === "number" ? e.startTime : 0 };
-      if (STREAM_EXT_RE.test(name)) {
+      // Extensionless playlist, identified by Content-Type
+      // (round 9): a playlist endpoint like /api/gs-hls carries
+      // no .m3u8/.mpd in its URL. contentType is undefined on
+      // older browsers — the URL tests below still apply.
+      const isPlaylistMime = !!(e.contentType && PLAYLIST_MIME_RE.test(e.contentType));
+      if (isPlaylistMime || STREAM_EXT_RE.test(name)) {
         const kind = manifestKind(name);
         if (kind === "master") {
           if (better(cand, out.master)) out.master = cand;
@@ -541,6 +470,70 @@
   function findStreamUrlFromResources() {
     const s = scanResourceStreams();
     return pickPlaylist(s) || (s.file ? { url: s.file.url } : null);
+  }
+
+  // ---- Embedded-data scan (round 9, yt-dlp GenericIE idea) ----
+  //
+  // Some players never request their stream through a URL the
+  // page layers can observe (the manifest URL is assembled in JS
+  // from pieces, or the player has not fetched it yet), but the
+  // page DECLARES the stream in its embedded data: JSON-LD, a
+  // <script type="application/json"> blob (Next.js/Nuxt payloads),
+  // or a player-config object in an inline script. Scan those for
+  // stream URLs as an additional detection source, feeding the
+  // same election as the timing log. Conservative: only URL
+  // shapes the extension already accepts as playlists or direct
+  // media files (MEDIA_FILE_EXT_RE, which excludes .ts/.m2ts —
+  // segments are never downloadable files), only inline scripts
+  // (src scripts have no inline text), and scripts over the
+  // 256 KB cap are skipped outright (a bundle that big is not a
+  // player config). The result is cached for 10 s — the scan runs
+  // on the same schedule as the candidate re-report, and
+  // re-reading every inline script on every mutation would be
+  // wasteful. Returns { at, playlist, file } (URLs or null).
+  const EMBEDDED_URL_RE = /https?:\/\/[^\s"'<>\\]+/g;
+  const EMBEDDED_TEXT_MAX = 262144;
+  const EMBEDDED_CACHE_MS = 10000;
+  let embeddedCache = { at: 0, playlist: null, file: null };
+  function scanEmbeddedData() {
+    const now = Date.now();
+    if (now - embeddedCache.at < EMBEDDED_CACHE_MS) return embeddedCache;
+    const result = { at: now, playlist: null, file: null };
+    embeddedCache = result;
+    const consider = function (text) {
+      if (!text || (result.playlist && result.file)) return;
+      const urls = String(text).match(EMBEDDED_URL_RE);
+      if (!urls) return;
+      for (const raw of urls) {
+        const u = resolveUrl(raw);
+        if (!u || !/^https?:\/\//i.test(u)) continue;
+        if (!result.playlist && isManifestUrl(u)) { result.playlist = u; continue; }
+        if (!result.file && MEDIA_FILE_EXT_RE.test(u)) result.file = u;
+      }
+    };
+    let scripts = [];
+    try { scripts = document.querySelectorAll("script"); } catch (_) { scripts = []; }
+    for (const s of scripts) {
+      if (result.playlist && result.file) break;
+      if (s.src) continue;
+      const type = (s.type || "").trim().toLowerCase();
+      if (type && type !== "text/javascript" && type !== "application/javascript"
+          && type !== "application/json" && type !== "application/ld+json") continue;
+      const text = s.textContent || "";
+      if (!text || text.length > EMBEDDED_TEXT_MAX) continue;
+      consider(text);
+    }
+    if (!result.playlist && !result.file) {
+      // OpenGraph video URL: a page-level declaration of its video.
+      let metas = [];
+      try { metas = document.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"]'); } catch (_) { metas = []; }
+      for (const m of metas) {
+        const content = m.getAttribute && m.getAttribute("content");
+        if (content) consider(content);
+        if (result.playlist || result.file) break;
+      }
+    }
+    return result;
   }
 
   // Filename for a resolved media source: none for a page URL (the
@@ -736,11 +729,37 @@
   registerDetector({ kind: "document", selector: "a[href]", overlay: false, extract: extractDocumentLink });
 
   // Full media list for the popup and for reporting, deduplicated by URL.
+  // querySelectorAll that also looks inside OPEN shadow roots
+  // (round 9): players built with web components render their
+  // <video> inside a shadow tree, where document.querySelectorAll
+  // never sees it. Closed roots are unreachable by design and
+  // stay invisible. Each root is visited once; the light DOM is
+  // queried first, then each open shadow root found.
+  function querySelectorAllDeep(selector) {
+    const out = [];
+    const roots = [document];
+    const seenRoots = new Set(roots);
+    while (roots.length) {
+      const root = roots.pop();
+      let found;
+      try { found = root.querySelectorAll(selector); } catch (_) { found = []; }
+      for (const el of found) out.push(el);
+      let all;
+      try { all = root.querySelectorAll("*"); } catch (_) { all = []; }
+      for (const el of all) {
+        let sr = null;
+        try { sr = el.shadowRoot; } catch (_) { sr = null; }
+        if (sr && !seenRoots.has(sr)) { seenRoots.add(sr); roots.push(sr); }
+      }
+    }
+    return out;
+  }
+
   function collectMedia() {
     const items = [];
     const seen = new Set();
     for (const detector of detectors) {
-      const els = document.querySelectorAll(detector.selector);
+      const els = querySelectorAllDeep(detector.selector);
       for (const el of els) {
         const item = detector.extract(el);
         if (!item) continue;
@@ -1008,15 +1027,18 @@
     return "download";
   }
   // NOTE: do NOT use isPlaylistUrl here — that helper lives inside
-  // manifestHookMain (the MAIN-world hook) and is invisible to this
+  // hook-main.js (the MAIN-world hook) and is invisible to this
   // scope; calling it threw a ReferenceError that silently killed
   // the one-click send (caught by the popup harness, 2026-11-22).
-  function isManifestUrl(url) { return /\.(m3u8|mpd)([?#]|$)/i.test(String(url || "")); }
-  function isDashUrl(url) { return /\.mpd([?#]|$)/i.test(String(url || "")); }
-  function isMp4FamilyUrl(url) { return /\.(mp4|mov|m4v)([?#]|$)/i.test(String(url || "")); }
+  // Round 9: same anywhere-match as STREAM_EXT_RE — a wrapped
+  // playlist/file URL is still a manifest/file (the popup must
+  // open for it, not one-click send).
+  function isManifestUrl(url) { return /\.(m3u8|mpd)/i.test(String(url || "")); }
+  function isDashUrl(url) { return /\.mpd/i.test(String(url || "")); }
+  function isMp4FamilyUrl(url) { return /\.(mp4|mov|m4v)/i.test(String(url || "")); }
   // Any direct video file (round 8): every download click on one
   // shows the popup — no silent one-click sends for video.
-  function isVideoFileUrl(url) { return /\.(mp4|mov|m4v|mkv|webm|avi|ts|m2ts)([?#]|$)/i.test(String(url || "")); }
+  function isVideoFileUrl(url) { return /\.(mp4|mov|m4v|mkv|webm|avi|ts|m2ts)/i.test(String(url || "")); }
 
   // ---- Direct-file clip guard (round 7, Fix 6) ----
   //
@@ -1915,6 +1937,55 @@
       }
       cands.push(cand);
     }
+    // Round 9 — decoupled playlist scan: the playlist is a stream
+    // even when NO <video> element exists to attach it to (a
+    // shadow-DOM video, a blob:-iframe player, a player that has
+    // not created its element yet). findPlaylistFromResources used
+    // to run only inside mediaSource, so those frames never
+    // reported. If no reported candidate carries a playlist, add
+    // a synthetic one from the timing log (preferred: observed
+    // reality) or from the page's embedded data (declared).
+    // playing: true — the playlist is the stream the player
+    // fetched; duration 0 — unknown, so a real playing video
+    // still outranks it on duration inside the playlist pool.
+    // An embedded direct file only fills the gap when NO
+    // candidate has any source at all: a real video's own source
+    // always beats a declared one.
+    const hasPlaylist = cands.some(function (c) {
+      return c.source && c.source.url && isManifestUrl(c.source.url);
+    });
+    if (!hasPlaylist) {
+      const pl = findPlaylistFromResources();
+      if (pl) {
+        cands.push({
+          key: "playlist",
+          playing: true,
+          area: 0,
+          duration: 0,
+          source: { url: pl.url, viaPage: false, filename: undefined, audioUrl: pl.audioUrl, manifestText: pl.manifestText, masterText: pl.masterText },
+        });
+      } else {
+        const hasAnySource = cands.some(function (c) { return c.source && c.source.url; });
+        const emb = scanEmbeddedData();
+        if (emb.playlist) {
+          cands.push({
+            key: "playlist",
+            playing: true,
+            area: 0,
+            duration: 0,
+            source: { url: emb.playlist, viaPage: false, filename: undefined, audioUrl: undefined, manifestText: undefined, masterText: undefined },
+          });
+        } else if (!hasAnySource && emb.file) {
+          cands.push({
+            key: "file",
+            playing: false,
+            area: 0,
+            duration: 0,
+            source: { url: emb.file, viaPage: false, filename: fileNameFromUrl(emb.file), audioUrl: undefined, manifestText: undefined, masterText: undefined },
+          });
+        }
+      }
+    }
     // The source is part of the key, so a stream appearing in the
     // timing log (the player starts, the manifest arrives)
     // re-reports even when the candidate set itself is unchanged.
@@ -1980,7 +2051,7 @@
   function scan() {
     for (const detector of detectors) {
       if (!detector.overlay) continue;
-      const els = document.querySelectorAll(detector.selector);
+      const els = querySelectorAllDeep(detector.selector);
       const candidates = [];
       for (const el of els) {
         if (!detector.extract(el)) continue; // no usable source yet; caught later

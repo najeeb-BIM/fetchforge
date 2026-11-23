@@ -309,7 +309,11 @@ function sendToFrame(tabId, frameId, msg) {
 // that is playing; a master playlist is the whole stream (video
 // AND audio), a video variant is one track, an audio variant is
 // audio only.
-const BG_STREAM_EXT_RE = /\.(m3u8|mpd)([?#]|$)/i;
+// Round 9: match .m3u8/.mpd ANYWHERE in the URL, as content.js
+// does — proxy-wrapped playlists carry the extension mid-URL.
+const BG_STREAM_EXT_RE = /\.(m3u8|mpd)/i;
+const BG_MEDIA_FILE_EXT_RE = /\.(mp4|webm|mov|mkv)/i;
+const BG_PLAYLIST_MIME_RE = /(?:vnd\.apple\.mpegurl|x-mpegurl|dash\+xml)/i;
 const BG_MASTER_STEM_RE = /^(master|index|playlist|manifest)$/i;
 const BG_AUDIO_STEM_RE = /audio/i;
 function bgManifestKind(url) {
@@ -352,19 +356,68 @@ function bgManifestKind(url) {
 // null when no frame has a source.
 function bestDownloadSource(tabId, winner) {
   const frames = tabOverlayCandidates.get(tabId);
-  if (!frames) return null;
   const all = [];
-  for (const [fid, entry] of frames.entries()) {
-    for (const c of entry.candidates) {
-      if (!c.source || !c.source.url) continue;
-      all.push({ frameId: fid, frameUrl: entry.frameUrl, cand: c });
+  if (frames) {
+    for (const [fid, entry] of frames.entries()) {
+      for (const c of entry.candidates) {
+        if (!c.source || !c.source.url) continue;
+        all.push({ frameId: fid, frameUrl: entry.frameUrl, cand: c });
+      }
+    }
+  }
+  // Round 9 (Tier 1): merge webRequest observations as
+  // additional pool entries. An observed playlist carries its
+  // kind (playlist vs file) from classification, so it does not
+  // depend on the URL matching BG_STREAM_EXT_RE (extensionless
+  // playlists would fail that test). playing: true — the
+  // browser requested it, so the stream is live; duration 0 —
+  // unknown, so a real playing video still outranks it on
+  // duration inside the playlist pool. Stale findings from a
+  // previous page on the same tab are filtered out: an entry
+  // only counts when its initiator origin matches a frame the
+  // tab currently has (when no frame has reported yet, nothing
+  // is filtered — the observation may precede the first report).
+  const observed = tabObserved.get(tabId);
+  if (observed && observed.size) {
+    const now = Date.now();
+    const frameOrigins = new Set();
+    if (frames) {
+      for (const entry of frames.values()) {
+        try { frameOrigins.add(new URL(entry.frameUrl || "").origin); } catch (_) {}
+      }
+    }
+    for (const rec of observed.values()) {
+      if (now - rec.at > OBSERVED_TTL_MS) continue;
+      if (frameOrigins.size && rec.initiator) {
+        let origin = "";
+        try { origin = new URL(rec.initiator).origin; } catch (_) { origin = ""; }
+        if (origin && !frameOrigins.has(origin)) continue;
+      }
+      all.push({
+        frameId: -1,
+        frameUrl: rec.initiator || "",
+        cand: {
+          key: "observed",
+          playing: true,
+          area: 0,
+          duration: 0,
+          source: { url: rec.url, viaPage: false, filename: undefined, audioUrl: undefined, manifestText: undefined, masterText: undefined, kind: rec.kind },
+        },
+      });
     }
   }
   if (!all.length) return null;
   const isWinner = function (e) {
     return !!winner && e.frameId === winner.frameId && e.cand.key === winner.key;
   };
-  const isPlaylist = function (e) { return BG_STREAM_EXT_RE.test(e.cand.source.url); };
+  const isPlaylist = function (e) {
+    // Observed findings carry their kind from classification
+    // (an extensionless playlist has no .m3u8/.mpd in its URL);
+    // frame candidates are classified by URL.
+    if (e.cand.source.kind === "playlist") return true;
+    if (e.cand.source.kind === "file") return false;
+    return BG_STREAM_EXT_RE.test(e.cand.source.url);
+  };
   const playlistRank = function (e) {
     if (!isPlaylist(e)) return 0;
     const k = bgManifestKind(e.cand.source.url);
@@ -406,13 +459,20 @@ function bestDownloadSource(tabId, winner) {
 }
 function electOverlay(tabId) {
   const frames = tabOverlayCandidates.get(tabId);
-  if (!frames) return;
+  const observed = tabObserved.get(tabId);
+  // Round 9: run the election on observed findings alone too —
+  // a tab whose frames never reported a candidate (no <video>
+  // element anywhere) can still have a stream the observer saw.
+  if (!frames && !(observed && observed.size)) return;
   const now = Date.now();
-  for (const [fid, entry] of Array.from(frames.entries())) {
-    if (now - entry.at > OVERLAY_CANDIDATE_TTL_MS) frames.delete(fid);
+  if (frames) {
+    for (const [fid, entry] of Array.from(frames.entries())) {
+      if (now - entry.at > OVERLAY_CANDIDATE_TTL_MS) frames.delete(fid);
+    }
   }
   let winner = null; // { frameId, key, playing, area }
-  for (const [fid, entry] of frames.entries()) {
+  const frameEntries = frames ? Array.from(frames.entries()) : [];
+  for (const [fid, entry] of frameEntries) {
     for (const c of entry.candidates) {
       const cand = { frameId: fid, key: c.key, playing: !!c.playing, area: c.area || 0 };
       if (!winner) { winner = cand; continue; }
@@ -427,10 +487,150 @@ function electOverlay(tabId) {
   // it downloads this stream. Every frame gets the verdict; only
   // the top frame acts on `download`.
   const download = bestDownloadSource(tabId, winner);
-  for (const fid of frames.keys()) {
+  // Every known frame gets the verdict; when no frame has
+  // reported yet, frame 0 (the top frame) still gets it — it is
+  // the one that shows the button, and its content script is
+  // running even before its first report.
+  const targets = frames ? Array.from(frames.keys()) : [];
+  if (!targets.length) targets.push(0);
+  for (const fid of targets) {
     const winnerKey = winner && winner.frameId === fid ? winner.key : null;
     sendToFrame(tabId, fid, { type: "overlayVerdict", winnerKey: winnerKey, download: download });
   }
+}
+
+// ---- Tier 1: observe-only webRequest stream sniffing (round 9) ----
+//
+// The page-side layers (hook, timing log, embedded scan) cannot
+// see streams fetched by a worker or a service worker, or by a
+// player that assembles its requests off the main thread. The
+// webRequest observer sees EVERY request the browser makes, in
+// every world, and classifies it by URL + response Content-Type —
+// the same technique cat-catch uses (GPL-3.0, techniques only,
+// reimplemented here). OBSERVE-ONLY: the listener never blocks,
+// modifies, or redirects anything, never reads request/response
+// bodies, never touches cookies or auth headers, and nothing
+// leaves the machine — findings feed only the local election,
+// consistent with "Download anything. Share nothing."
+//
+// The observer only sees origins the extension has host
+// permission for. The <all_urls> host permission is OPTIONAL
+// (optional_host_permissions in the manifest) and is requested
+// at runtime from the popup, with an explanation — without it,
+// the listeners simply never fire for CDN origins, and detection
+// falls back to the Tier 0 layers. No error, no nagging.
+//
+// Findings live in memory only (tabObserved): a service-worker
+// restart loses them until the next matching request, and the
+// Tier 0 layers cover the same streams in most cases. No
+// keep-alive hack: waking the worker on a timer drains battery
+// for an insurance layer.
+const tabObserved = new Map(); // tabId -> Map(url -> { url, kind, initiator, at })
+const OBSERVED_PER_TAB_MAX = 100;
+const OBSERVED_TTL_MS = 30 * 60 * 1000; // 30 min: a film's playlist stays valid for the watch session
+// Classify one observed response: { kind: "playlist"|"file", url }
+// or null. Playlist by URL or Content-Type (extensionless
+// endpoints like /api/gs-hls); file by URL, by a media
+// resourceType, or by a video/audio Content-Type. video/mp2t is
+// a TS segment, never a downloadable file.
+function classifyObservedRequest(url, contentType, resourceType) {
+  if (!url || !/^https?:\/\//i.test(url)) return null;
+  const ct = String(contentType || "").toLowerCase().split(";")[0].trim();
+  if (BG_STREAM_EXT_RE.test(url) || BG_PLAYLIST_MIME_RE.test(ct)) {
+    return { kind: "playlist", url: url };
+  }
+  if (ct === "video/mp2t") return null; // segment, not a file
+  if (BG_MEDIA_FILE_EXT_RE.test(url) || resourceType === "media"
+      || ct.indexOf("video/") === 0 || ct.indexOf("audio/") === 0) {
+    return { kind: "file", url: url };
+  }
+  return null;
+}
+function storeObserved(tabId, url, kind, initiator) {
+  let perTab = tabObserved.get(tabId);
+  if (!perTab) { perTab = new Map(); tabObserved.set(tabId, perTab); }
+  const now = Date.now();
+  // Prune stale entries first (keeps the cap meaningful).
+  for (const [u, rec] of Array.from(perTab.entries())) {
+    if (now - rec.at > OBSERVED_TTL_MS) perTab.delete(u);
+  }
+  if (perTab.has(url)) {
+    perTab.get(url).at = now;
+    return;
+  }
+  // Cap: drop the oldest entry (Map iteration is insertion order).
+  if (perTab.size >= OBSERVED_PER_TAB_MAX) {
+    const oldest = perTab.keys().next().value;
+    if (oldest !== undefined) perTab.delete(oldest);
+  }
+  perTab.set(url, { url: url, kind: kind, initiator: initiator || "", at: now });
+  // A new finding may change the election (a playlist observed
+  // here beats any direct file): re-elect promptly so the
+  // button appears without waiting for the next frame report.
+  electOverlay(tabId);
+}
+// A request from a service worker (or the extension itself) has
+// tabId -1: attribute it to a tab whose URL shares the request's
+// initiator origin, else the active tab, else drop it.
+function resolveObservedTab(initiator) {
+  return new Promise(function (resolve) {
+    if (!api.tabs || !api.tabs.query) { resolve(null); return; }
+    let origin = "";
+    try { origin = new URL(initiator || "").origin; } catch (_) { origin = ""; }
+    const done = function (tabs) {
+      if (!tabs || !tabs.length) { resolve(null); return; }
+      if (origin) {
+        for (const t of tabs) {
+          try {
+            if (t.url && new URL(t.url).origin === origin) { resolve(t.id); return; }
+          } catch (_) {}
+        }
+      }
+      for (const t of tabs) {
+        if (t.active) { resolve(t.id); return; }
+      }
+      resolve(null);
+    };
+    try {
+      const p = api.tabs.query({});
+      if (p && typeof p.then === "function") p.then(done).catch(function () { resolve(null); });
+      else api.tabs.query({}, done);
+    } catch (_) { resolve(null); }
+  });
+}
+function handleObservedResponse(details) {
+  if (!details || !details.url) return;
+  let contentType = "";
+  const headers = details.responseHeaders || [];
+  for (const h of headers) {
+    if (h && h.name && h.name.toLowerCase() === "content-type") { contentType = h.value || ""; break; }
+  }
+  const found = classifyObservedRequest(details.url, contentType, details.type);
+  if (!found) return;
+  const tabId = details.tabId;
+  if (typeof tabId === "number" && tabId >= 0) {
+    storeObserved(tabId, found.url, found.kind, details.initiator || "");
+    return;
+  }
+  resolveObservedTab(details.initiator || "").then(function (resolved) {
+    if (resolved !== null && resolved !== undefined) {
+      storeObserved(resolved, found.url, found.kind, details.initiator || "");
+    }
+  }).catch(function () {});
+}
+// Observe-only: no "blocking" extraInfoSpec (removed for standard
+// MV3 extensions anyway), no request headers, no bodies — the
+// URL and the response Content-Type are all classification needs.
+// onResponseStarted fires for redirects too, so a playlist URL
+// that 302s is still classified by its own URL.
+if (api.webRequest && api.webRequest.onResponseStarted) {
+  try {
+    api.webRequest.onResponseStarted.addListener(
+      handleObservedResponse,
+      { urls: ["http://*/*", "https://*/*"] },
+      ["responseHeaders"]
+    );
+  } catch (_) { /* webRequest unavailable (old browser): Tier 0 only */ }
 }
 
 if (api.tabs && api.tabs.onRemoved) {
@@ -438,6 +638,7 @@ if (api.tabs && api.tabs.onRemoved) {
     tabFrames.delete(tabId);
     tabLastPosted.delete(tabId);
     tabOverlayCandidates.delete(tabId);
+    tabObserved.delete(tabId);
     if (tabPostTimers.has(tabId)) { clearTimeout(tabPostTimers.get(tabId)); tabPostTimers.delete(tabId); }
     delete mediaCounts[tabId];
     saveMediaCounts();

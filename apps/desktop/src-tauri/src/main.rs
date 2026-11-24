@@ -1410,7 +1410,7 @@ fn run_gltf_download(state: &Arc<State>, rec: &DownloadRecord, job: &Job) {
 }
 
 #[tauri::command]
-async fn pause_download(state: tauri::State<'_, Arc<State>>, id: String) {
+async fn pause_download(state: tauri::State<'_, Arc<State>>, id: String) -> Result<(), String> {
     if let Some(job) = state.jobs.lock().unwrap().get(&id).cloned() {
         job.paused.store(true, Ordering::Relaxed);
     }
@@ -1418,10 +1418,13 @@ async fn pause_download(state: tauri::State<'_, Arc<State>>, id: String) {
     // (extension path), not in this process — forward the pause
     // there too, best-effort. A dead bridge must not break the
     // local pause. Async so the loopback call runs off the IPC
-    // thread (see pair_browser).
+    // thread (see pair_browser). Returns Result because Tauri
+    // requires async commands taking references to return one
+    // (CI run 45314495234 failed on the () return).
     if let Ok(token) = read_bridge_token(&state.data_dir) {
         let _ = bridge_post(&state.data_dir, &token, &format!("/downloads/{id}/pause"));
     }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1450,15 +1453,17 @@ fn resume_download(state: tauri::State<Arc<State>>, id: String) {
 }
 
 #[tauri::command]
-async fn cancel_download(state: tauri::State<'_, Arc<State>>, id: String) {
+async fn cancel_download(state: tauri::State<'_, Arc<State>>, id: String) -> Result<(), String> {
     if let Some(job) = state.jobs.lock().unwrap().get(&id).cloned() {
         job.cancelled.store(true, Ordering::Relaxed);
     }
     // Round 10, item 13: same cross-process forward as pause —
     // the download may be running in the bridge, not here.
+    // Returns Result for the same Tauri rule as pause_download.
     if let Ok(token) = read_bridge_token(&state.data_dir) {
         let _ = bridge_post(&state.data_dir, &token, &format!("/downloads/{id}/cancel"));
     }
+    Ok(())
 }
 
 /// Delete a download from the list (round 10, item 13), on ANY

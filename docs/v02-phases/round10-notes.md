@@ -645,3 +645,25 @@ live test:
 - (B) Pairing README text with complete steps.
 
 Neither was built in this round.
+
+## CI fixup (2026-11-24, after run 45314495234 failed)
+
+The first Windows build of this round FAILED in the "Build
+Tauri app" step: 6 compile errors in `fetchforge-desktop`,
+all from one cause. Round 10 made `pause_download` and
+`cancel_download` async (item 13, to forward pause/cancel to
+the bridge), but left their return type as `()` — and Tauri
+requires async commands that take references as inputs
+(`tauri::State<'_, ...>`) to return a `Result`. The
+`#[tauri::command]` macro rejected both functions, so
+`generate_handler!` then failed with 4 "cannot find macro"
+errors for the two missing commands. Every other async
+command in the file already returned a `Result`; only these
+two were missing it.
+
+Fix (this commit): both functions now return
+`Result<(), String>` with `Ok(())` at the end. No behaviour
+change — the frontend invoke calls resolve the same way.
+Lesson (extends round-8 notes §8): any command made async
+must return a `Result` — grep the async commands' signatures,
+not just the engine call sites, before pushing.

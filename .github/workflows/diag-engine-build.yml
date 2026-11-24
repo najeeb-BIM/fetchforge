@@ -1,0 +1,39 @@
+name: Diagnostic engine release build
+# TEMPORARY DIAGNOSTIC (2026-11-25): nine main-workflow runs died with
+# the Engine step stuck and zero logs. This isolates the release build
+# from every other step (no tests, no Tauri CLI, no NSIS, no free-disk
+# step) and wraps it in a 10-minute timeout so a hang produces logs
+# instead of a stuck step. Outcomes:
+# - step succeeds -> the release build is fine standalone; something
+#   in the main workflow's earlier steps kills the runner.
+# - step fails WITH logs -> cargo hangs; the tail shows where.
+# - step stuck, no logs -> the runner itself dies (not cargo hanging).
+# Remove this file after the cause is found.
+on:
+  workflow_dispatch:
+jobs:
+  diag:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Release build with 10-minute timeout
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath "cargo" -ArgumentList "build","--release","-p","fetchforge-engine","-p","fetchforge-bridge","-j","2" -NoNewWindow -PassThru -RedirectStandardOutput "build-out.log" -RedirectStandardError "build-err.log"
+          if (-not $proc.WaitForExit(600000)) {
+            $proc.Kill()
+            Write-Host "=== stdout tail ==="
+            Get-Content build-out.log -Tail 50 -ErrorAction SilentlyContinue
+            Write-Host "=== stderr tail ==="
+            Get-Content build-err.log -Tail 50 -ErrorAction SilentlyContinue
+            throw "TIMEOUT: release build did not finish within 10 minutes (local Linux: 2m45s)"
+          }
+          Write-Host "=== stdout tail ==="
+          Get-Content build-out.log -Tail 20 -ErrorAction SilentlyContinue
+          if ($proc.ExitCode -ne 0) {
+            Write-Host "=== stderr tail ==="
+            Get-Content build-err.log -Tail 50 -ErrorAction SilentlyContinue
+            throw "cargo build failed with exit code $($proc.ExitCode)"
+          }
+          Write-Host "Release build finished OK"

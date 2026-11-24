@@ -24,6 +24,16 @@ jobs:
         run: cargo install tauri-cli --locked
       - name: Run tests
         run: cargo test
+      - name: Free disk space for the release build
+        shell: pwsh
+        run: |
+          # The test run leaves ~3 GB of dev artifacts in target/debug that
+          # the release build never uses. Two round-11 runs died ~58 min in
+          # with the build step stuck and no logs — consistent with the
+          # runner running out of disk mid-build. Reclaim the dev artifacts
+          # and report free space so the log shows the headroom.
+          if (Test-Path target/debug) { Remove-Item -Recurse -Force target/debug }
+          "Free space on C: $([math]::Round((Get-PSDrive C).Free / 1GB, 2)) GB"
       - name: Build Tauri app, NSIS installer and portable zip
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1

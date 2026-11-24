@@ -13,8 +13,14 @@ if (-not (Get-Command cargo-tauri -ErrorAction SilentlyContinue)) {
   throw "Tauri CLI not found. Install it first with: cargo install tauri-cli --locked"
 }
 cargo --version; node --version; npm --version
+# Free-space report: two round-11 runs died ~58 min in with this step stuck
+# and no logs at all — consistent with the runner running out of disk
+# mid-build. This line puts the headroom in the log for the next run.
+"Free space on C: $([math]::Round((Get-PSDrive C).Free / 1GB, 2)) GB"
 cargo build --release -p fetchforge-engine -p fetchforge-bridge
-cargo test
+# NOTE: no `cargo test` here — the workflow already runs the full test
+# suite in its own step, and re-running it would rebuild the dev
+# artifacts that the workflow just deleted to free disk space.
 # Tauri app (needs WebView2; see docs/BUILD.md if this step fails).
 # P07 (final round): --no-bundle skips Tauri's own bundling step even
 # though tauri.conf.json has bundle.active=true. Tauri's own NSIS bundle

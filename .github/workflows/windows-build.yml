@@ -9,7 +9,13 @@ on:
   workflow_dispatch:
 jobs:
   windows:
-    runs-on: windows-latest
+    # DIAGNOSTIC (2026-11-25): eight round-11 runs failed identically on
+    # windows-latest (windows-2025 image) — runner dies in the Engine
+    # phase, zero logs — while the same code builds in 2m45s locally
+    # and round 10 passed on windows-2025 at 03:08Z. Testing whether the
+    # windows-2025 runner pool/image is the cause. Revisit once the
+    # build passes or the image is ruled out.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

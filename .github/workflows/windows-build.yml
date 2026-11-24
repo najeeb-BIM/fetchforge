@@ -36,6 +36,17 @@ jobs:
           "Free space on C: $([math]::Round((Get-PSDrive C).Free / 1GB, 2)) GB"
       - name: Build Tauri app, NSIS installer and portable zip
         shell: pwsh
+        # Four round-11 runs died identically ~45 min into this step
+        # (runner unresponsive, no logs). Disk and LTO were ruled out by
+        # fixups that changed nothing. Remaining build-side cause: peak
+        # memory of parallel rustc codegen — cargo runs 4 rustc jobs on
+        # the 4-vCPU runner, and the grown engine crate pushes the
+        # deterministic parallel peak past the runner's 7 GB. Halve the
+        # parallel jobs to cut peak memory; the build takes longer but
+        # stays well within limits. If this also fails identically, the
+        # cause is on GitHub's side (capacity/window), not the build.
+        env:
+          CARGO_BUILD_JOBS: 2
         run: powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
       - name: Print SHA-256 of each output file
         shell: pwsh

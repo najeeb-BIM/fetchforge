@@ -7,20 +7,29 @@
 #           installer/stage/FetchForge.exe, installer/stage/fetchforge-bridge.exe,
 #           installer/stage/yt-dlp.exe
 # Usage: powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
+#   [-Phase All|Engine|Tauri|Package] (default All; CI runs one phase per
+#   workflow step so a runner failure shows exactly which phase died).
+param(
+  [ValidateSet("All", "Engine", "Tauri", "Package")]
+  [string]$Phase = "All"
+)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot\..
 if (-not (Get-Command cargo-tauri -ErrorAction SilentlyContinue)) {
   throw "Tauri CLI not found. Install it first with: cargo install tauri-cli --locked"
 }
 cargo --version; node --version; npm --version
-# Free-space report: two round-11 runs died ~58 min in with this step stuck
-# and no logs at all — consistent with the runner running out of disk
-# mid-build. This line puts the headroom in the log for the next run.
+# Free-space report: round-11 runs died ~58 min in with the build step
+# stuck and no logs at all — consistent with the runner running out of
+# disk mid-build. This line puts the headroom in the log for the next run.
 "Free space on C: $([math]::Round((Get-PSDrive C).Free / 1GB, 2)) GB"
-cargo build --release -p fetchforge-engine -p fetchforge-bridge
+if ($Phase -eq "All" -or $Phase -eq "Engine") {
+  cargo build --release -p fetchforge-engine -p fetchforge-bridge
+}
 # NOTE: no `cargo test` here — the workflow already runs the full test
 # suite in its own step, and re-running it would rebuild the dev
 # artifacts that the workflow just deleted to free disk space.
+if ($Phase -eq "All" -or $Phase -eq "Tauri") {
 # Tauri app (needs WebView2; see docs/BUILD.md if this step fails).
 # P07 (final round): --no-bundle skips Tauri's own bundling step even
 # though tauri.conf.json has bundle.active=true. Tauri's own NSIS bundle
@@ -33,6 +42,8 @@ Push-Location apps/desktop/src-tauri
 cargo tauri build --no-bundle
 if ($LASTEXITCODE -ne 0) { throw "Tauri build failed" }
 Pop-Location
+}
+if ($Phase -eq "All" -or $Phase -eq "Package") {
 # Stage installer inputs (staged copies only; source manifests are never overwritten).
 $stage = "installer/stage"; New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item target/release/fetchforge-bridge.exe "$stage/fetchforge-bridge.exe" -Force
@@ -80,3 +91,4 @@ Copy-Item "$stage/FetchForge.exe", "$stage/fetchforge-bridge.exe", "$stage/yt-dl
 Copy-Item README.md $port -Force
 Compress-Archive -Path "$port/*" -DestinationPath "dist/FetchForge-portable-x64.zip" -Force
 Write-Host "Done. Installer: installer/FetchForge-Setup-0.2.0-x64.exe ; Portable: dist/FetchForge-portable-x64.zip"
+}

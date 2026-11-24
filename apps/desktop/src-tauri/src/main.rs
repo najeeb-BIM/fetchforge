@@ -12,10 +12,11 @@ use fetchforge_engine::{
     category_for_filename, delete_download_files, download, download_dash, download_gltf_bundle,
     download_hls_pair, download_hls_variant, download_media, ensure_ffmpeg,
     ensure_image_extension, fetch_gltf_plan, find_ffmpeg, find_ytdlp, generate_download_id,
-    is_gltf_url, is_image_content_type, list_formats, plan_media_download_or_drive_fallback,
+    is_gltf_url, is_image_content_type, list_formats_with_referer,
+    plan_media_download_or_drive_fallback,
     probe, probe_video_quality, sanitize_filename, sniff_stream_kind, stop_reason,
     CapturedManifest, DashDownloadOptions, DownloadOptions, DownloadRecord, GltfDownloadOptions,
-    MediaDownloadOptions, MediaInfo, PlanOutcome, Status, Store,
+    MediaDownloadOptions, MediaInfo, PlanOutcome, SizeKind, Status, Store,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -421,6 +422,8 @@ fn failed_record(
         delivered_height: None,
         delivered_bitrate_kbps: None,
         quality_note: None,
+        speed_bps: None,
+        size_kind: None,
     };
     state.store.lock().unwrap().upsert(rec.clone());
     let _ = state.store.lock().unwrap().save();
@@ -540,6 +543,8 @@ fn try_gltf_download(
         delivered_height: None,
         delivered_bitrate_kbps: None,
         quality_note: None,
+        speed_bps: None,
+        size_kind: None,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -626,6 +631,8 @@ fn try_media_download(
         delivered_height: None,
         delivered_bitrate_kbps: None,
         quality_note: None,
+        speed_bps: None,
+        size_kind: None,
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -741,6 +748,9 @@ fn plan_pending_download(
             updated.filename = plan.filename.clone();
             updated.category = category_for_filename(&plan.filename).to_string();
             updated.total_bytes = plan.total_bytes;
+            // Round 11, item 10: how the plan total was
+            // determined — the UI shows the marker.
+            updated.size_kind = plan.size_kind;
             updated.format_id = Some(plan.format_id);
             updated.needs_merge = plan.needs_merge;
             updated.format_selector = Some(plan.selector);
@@ -860,6 +870,10 @@ fn queue_direct_download(
         delivered_height: None,
         delivered_bitrate_kbps: None,
         quality_note: None,
+        speed_bps: None,
+        // Round 11, item 10: a probed Content-Length is the
+        // exact total.
+        size_kind: total.map(|_| SizeKind::Exact),
     };
     {
         let mut store = state.store.lock().unwrap();
@@ -892,14 +906,20 @@ fn spawn_download_worker(state: &Arc<State>, id: String) {
 
 /// List the qualities available for a video page (format picker).
 /// Async so the yt-dlp extraction (up to 90 s on a slow site) does not
-/// block the IPC thread.
+/// block the IPC thread. The optional referer is the page the
+/// stream came from (round 11, item 5): the engine forwards it as
+/// the Referer header on the manifest fetch — vidrift-class hosts
+/// 403 without it. The desktop's own listing calls pass None
+/// (a pasted link has no page context); the bridge endpoint is
+/// the one the extension's popup uses.
 #[tauri::command]
 async fn media_formats(
     state: tauri::State<'_, Arc<State>>,
     url: String,
+    referer: Option<String>,
 ) -> Result<MediaInfo, String> {
     let clean = fetchforge_engine::validate_url(&url)?;
-    list_formats(&state.data_dir, &clean)
+    list_formats_with_referer(&state.data_dir, &clean, referer)
 }
 
 /// Best-effort delivered-quality probe (round 10, item 8): probe

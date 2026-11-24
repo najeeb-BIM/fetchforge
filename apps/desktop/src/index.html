@@ -20,7 +20,17 @@ try {
     <h1>FetchForge</h1>
     <p class="tag">Download anything. Share nothing.</p>
   </div>
-  <button id="themeBtn" class="secondary">Light mode</button>
+  <!-- Round 11, item 6: the theme toggle is a pill/slider switch
+       — moon for dark (left), bulb for light (right); the knob
+       slides side to side. Same id as before (themeBtn), so the
+       toggle script and the DevTools checks still find it. -->
+  <button id="themeBtn" class="theme-switch" role="switch" aria-checked="false" aria-label="Dark mode">
+    <span class="theme-track">
+      <svg class="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      <svg class="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.4 1 2.3h6c0-.9.4-1.8 1-2.3A7 7 0 0 0 12 2z"/></svg>
+      <span class="theme-knob"></span>
+    </span>
+  </button>
 </header>
 <main>
   <section class="add">
@@ -33,6 +43,10 @@ try {
     <span id="pairedCount" class="paired-count" hidden></span>
     <button id="unpairBtn" class="secondary">Unpair all browsers</button>
     <button id="pairBtn">Pair browser</button>
+    <!-- Round 11, item 12: Chrome cannot auto-install an unpacked
+         extension, so the app carries the complete layman steps
+         instead — this button opens them. -->
+    <button id="extHelpBtn" class="secondary" title="How to add the FetchForge extension to your browser">Extension setup</button>
     <div id="pairCodeBox" class="pair-code-box" hidden>
       <span class="pair-code-label">Current pairing code</span>
       <span id="pairCode"></span>
@@ -53,6 +67,26 @@ try {
     <button id="delFilesBtn">Delete the files too</button>
     <button id="delEntryBtn" class="secondary">Remove only the list entry</button>
     <button id="delCancelBtn" class="secondary">Cancel</button>
+  </section>
+  <!-- Round 11, item 12: the complete layman steps for adding the
+       extension. Chrome only installs unpacked extensions by hand
+       (Developer Mode + Load unpacked) — there is no automatic
+       way — so these steps are the fallback the app ships. The
+       extension files live in C:\Users\<your name>\ff-extension,
+       put there when FetchForge was installed. -->
+  <section id="extHelp" class="format-picker" hidden>
+    <h2>Add the FetchForge extension to your browser</h2>
+    <p>Chrome cannot install the extension by itself — it takes about a minute by hand, once:</p>
+    <ol class="ext-help-steps">
+      <li>Open Chrome (or Edge, or Brave) and type <code>chrome://extensions</code> in the address bar, then press Enter.</li>
+      <li>Turn on <b>Developer mode</b> — the switch at the top right of that page.</li>
+      <li>Click <b>Load unpacked</b> (top left).</li>
+      <li>In the folder window, click the address bar at the top, paste <code>%USERPROFILE%\ff-extension</code>, press Enter, then click <b>Select Folder</b>.</li>
+      <li>FetchForge appears in the extensions list. Click the puzzle-piece icon in the toolbar and pin FetchForge so its button is always visible.</li>
+      <li>Then pair it: click <b>Pair browser</b> in this app and enter the code in the extension popup.</li>
+    </ol>
+    <p>If the <code>ff-extension</code> folder is missing, the extension files were not copied during install — ask for them to be copied to that folder first.</p>
+    <button id="extHelpCloseBtn" class="secondary">Close</button>
   </section>
   <nav id="tabs" class="tabs" role="tablist" aria-label="FetchForge panels">
     <button data-view="dashboard" role="tab" aria-selected="false">Dashboard</button>
@@ -156,15 +190,89 @@ function fmtBytes(n) {
   return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + " " + u[i];
 }
 
-// ---- Theme (round 10, item 14) ----
+// Round 11, item 8: a live download speed (bytes per second) as
+// "1.2 MB/s" — same rounding as fmtBytes.
+function fmtSpeed(bps) {
+  if (bps == null || bps <= 0) return "-";
+  const u = ["B/s", "KB/s", "MB/s", "GB/s"]; let i = 0; let v = bps;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + " " + u[i];
+}
+
+// Round 11, items 10/11: the total the UI shows for a row, with
+// its ladder marker — the plan total with its kind (exact plain,
+// average "≈", peak/measured "~"), else the measured estimate
+// with "~". Null when no total is known at all. Pure function.
+function displayTotal(d) {
+  if (d.total_bytes != null) {
+    const marker = d.size_kind === "average" ? "≈"
+      : (d.size_kind === "peak" || d.size_kind === "measured") ? "~" : "";
+    return { bytes: d.total_bytes, text: marker + fmtBytes(d.total_bytes) };
+  }
+  if (d.estimated_total_bytes != null) {
+    return { bytes: d.estimated_total_bytes, text: "~" + fmtBytes(d.estimated_total_bytes) };
+  }
+  return null;
+}
+
+// Round 11, item 7: resizable downloads-table columns — a drag
+// handle on the right edge of every header cell except the last
+// (which takes the remaining width). Minimum 60px; widths persist
+// in localStorage and are restored on load, so a long filename
+// can be given room once instead of pushing the other columns
+// to the far end on every refresh.
+const COL_WIDTHS_KEY = "fetchforge-col-widths";
+function initColumnResize() {
+  const table = document.querySelector(".table-wrap table");
+  if (!table) return;
+  const ths = table.querySelectorAll("thead th");
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(COL_WIDTHS_KEY) || "{}") || {}; } catch (_) { /* ignore */ }
+  ths.forEach((th, i) => {
+    if (saved[i] != null && saved[i] >= 60) th.style.width = saved[i] + "px";
+    if (i === ths.length - 1) return;
+    const handle = document.createElement("span");
+    handle.className = "col-resize";
+    handle.title = "Drag to resize column";
+    handle.addEventListener("mousedown", (ev) => {
+      ev.preventDefault();
+      const startX = ev.clientX;
+      const startW = th.getBoundingClientRect().width;
+      const onMove = (e) => {
+        th.style.width = Math.max(60, Math.round(startW + (e.clientX - startX))) + "px";
+      };
+      const onUp = () => {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        try {
+          const widths = {};
+          ths.forEach((t, j) => { if (t.style.width) widths[j] = parseInt(t.style.width, 10); });
+          localStorage.setItem(COL_WIDTHS_KEY, JSON.stringify(widths));
+        } catch (_) { /* storage unavailable */ }
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+    th.appendChild(handle);
+  });
+}
+initColumnResize();
+
+// ---- Theme (round 10, item 14; switch UI in round 11, item 6) ----
 // Dark is the default; the choice persists in localStorage and is
-// applied before first paint by the script in <head>.
+// applied before first paint by the script in <head>. The switch
+// is a pill with a sliding knob (moon = dark, bulb = light); the
+// knob position follows [data-theme] in CSS, so this only keeps
+// the switch's accessible state in sync.
 function currentTheme() {
   return document.documentElement.dataset.theme === "light" ? "light" : "dark";
 }
 function updateThemeButton() {
-  document.getElementById("themeBtn").textContent =
-    currentTheme() === "dark" ? "Light mode" : "Dark mode";
+  const btn = document.getElementById("themeBtn");
+  const dark = currentTheme() === "dark";
+  btn.setAttribute("aria-checked", dark ? "true" : "false");
+  btn.setAttribute("aria-label", dark ? "Dark mode" : "Light mode");
+  btn.title = dark ? "Switch to light mode" : "Switch to dark mode";
 }
 document.getElementById("themeBtn").onclick = () => {
   const next = currentTheme() === "dark" ? "light" : "dark";
@@ -616,28 +724,38 @@ async function refresh() {
       const prog = document.createElement("progress");
       prog.value = d.downloaded_bytes; prog.max = pctDenom || 1;
       tdProg.appendChild(prog);
-      let progText = ` ${pct}% (${fmtBytes(d.downloaded_bytes)} / ${d.total_bytes ? fmtBytes(d.total_bytes) : "?"})`;
-      // HLS/DASH piece progress + size estimate: old records lack
-      // these fields entirely, so every access is null-guarded.
-      if (d.stream_kind === "hls" || d.stream_kind === "dash") {
-        if (d.segments_total != null) {
-          progText += " · " + (d.segments_done != null ? d.segments_done : 0).toLocaleString()
-            + " / " + d.segments_total.toLocaleString() + " pieces";
-        }
-        if (d.estimated_total_bytes != null) {
-          progText += ", ~" + fmtBytes(d.estimated_total_bytes) + " est.";
-        }
+      // Round 11, item 11: downloaded/total plus the remaining
+      // amount — "87% (459 MB of 4.9 GB, 3.9 GB left)". No
+      // pieces/segments anywhere in the UI (they stay in the
+      // record/JSON for the engine); no ", ~X est." suffix — the
+      // total itself carries its ladder marker. When no total is
+      // known, only the downloaded amount shows.
+      const total = displayTotal(d);
+      let progText = ` ${pct}% (${fmtBytes(d.downloaded_bytes)}`;
+      if (total) {
+        progText += " of " + total.text;
+        const remaining = total.bytes - d.downloaded_bytes;
+        if (remaining > 0) progText += ", " + fmtBytes(remaining) + " left";
+      } else {
+        progText += " downloaded";
       }
+      progText += ")";
       tdProg.appendChild(document.createTextNode(progText));
-      const tdSpeed = document.createElement("td"); tdSpeed.textContent = "-";
+      // Round 11, item 8: real download speed — Downloading rows
+      // only. A paused row keeps its last speed in the record,
+      // but showing it would be a stale speed.
+      const tdSpeed = document.createElement("td");
+      tdSpeed.textContent = (d.status === "downloading" && d.speed_bps != null && d.speed_bps > 0)
+        ? fmtSpeed(d.speed_bps) : "-";
       const td = document.createElement("td");
       td.className = "actions-cell";
       tr.append(tdName, tdCat, tdStatus, tdProg, tdSpeed, td);
-      // Round 10, item 13: the Actions column holds two icons and
-      // nothing else — one pause/resume toggle (pause glyph always;
-      // red while paused) above a recycle-bin delete icon. The
-      // toggle only exists on rows with a live job (downloading or
-      // paused); the bin is on every row.
+      // Round 10, item 13 + round 11, item 9: the Actions column
+      // holds two icons and nothing else — one pause/resume
+      // toggle (pause glyph always; red while paused) FIRST, a
+      // recycle-bin delete icon SECOND, side by side in one row.
+      // The toggle only exists on rows with a live job
+      // (downloading or paused); the bin is on every row.
       if (d.status === "downloading" || d.status === "paused") {
         const paused = d.status === "paused";
         const toggle = document.createElement("button");
@@ -749,6 +867,15 @@ async function doDelete(deleteFiles) {
 document.getElementById("delFilesBtn").onclick = () => doDelete(true);
 document.getElementById("delEntryBtn").onclick = () => doDelete(false);
 document.getElementById("delCancelBtn").onclick = hideDeleteConfirm;
+// ---- Extension setup help (round 11, item 12) ----
+// A plain show/hide panel: the button opens the complete steps,
+// Close hides them again. No state, no server call.
+document.getElementById("extHelpBtn").onclick = () => {
+  document.getElementById("extHelp").hidden = false;
+};
+document.getElementById("extHelpCloseBtn").onclick = () => {
+  document.getElementById("extHelp").hidden = true;
+};
 document.getElementById("search").oninput = refresh;
 document.getElementById("filter").onchange = refresh;
 // Add one URL through the same flow as the paste box: a media page

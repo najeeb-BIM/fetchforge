@@ -21,10 +21,10 @@ use fetchforge_engine::{
     category_for_filename, download, download_dash, download_gltf_bundle, download_hls_audio_only,
     download_hls_pair, download_hls_variant, download_media, ensure_ffmpeg, ensure_image_extension,
     extract_audio, fetch_gltf_plan, find_ytdlp, generate_download_id, generate_secure_token,
-    is_gltf_url, is_image_content_type, list_formats, plan_media_download_or_drive_fallback, probe,
-    sanitize_filename, stop_reason, unique_path, CapturedManifest, DashDownloadOptions,
-    DownloadOptions, DownloadRecord, GltfDownloadOptions, MediaDownloadOptions, PlanOutcome,
-    Status, Store, MAX_CAPTURED_MANIFEST_BYTES,
+    is_gltf_url, is_image_content_type, list_formats_with_referer,
+    plan_media_download_or_drive_fallback, probe, sanitize_filename, stop_reason, unique_path,
+    CapturedManifest, DashDownloadOptions, DownloadOptions, DownloadRecord, GltfDownloadOptions,
+    MediaDownloadOptions, PlanOutcome, SizeKind, Status, Store, MAX_CAPTURED_MANIFEST_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -644,6 +644,8 @@ impl App {
                     delivered_height: None,
                     delivered_bitrate_kbps: None,
                     quality_note: None,
+                    speed_bps: None,
+                    size_kind: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -714,6 +716,8 @@ impl App {
                     delivered_height: None,
                     delivered_bitrate_kbps: None,
                     quality_note: None,
+                    speed_bps: None,
+                    size_kind: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -796,6 +800,8 @@ impl App {
                         delivered_height: None,
                         delivered_bitrate_kbps: None,
                         quality_note: None,
+                        speed_bps: None,
+                        size_kind: None,
                     };
                     store.upsert(rec.clone());
                     let _ = store.save();
@@ -835,6 +841,8 @@ impl App {
                     delivered_height: None,
                     delivered_bitrate_kbps: None,
                     quality_note: None,
+                    speed_bps: None,
+                    size_kind: None,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -948,6 +956,8 @@ impl App {
                 delivered_height: None,
                 delivered_bitrate_kbps: None,
                 quality_note: None,
+                speed_bps: None,
+                size_kind: None,
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -1075,6 +1085,9 @@ impl App {
                 updated.filename = plan.filename.clone();
                 updated.category = category_for_filename(&plan.filename).to_string();
                 updated.total_bytes = plan.total_bytes;
+                // Round 11, item 10: how the plan total was
+                // determined — the UI shows the marker.
+                updated.size_kind = plan.size_kind;
                 updated.format_id = Some(plan.format_id);
                 updated.needs_merge = plan.needs_merge;
                 updated.format_selector = Some(plan.selector);
@@ -1220,6 +1233,10 @@ impl App {
                 delivered_height: None,
                 delivered_bitrate_kbps: None,
                 quality_note: None,
+                speed_bps: None,
+                // Round 11, item 10: a probed Content-Length is
+                // the exact total.
+                size_kind: total.map(|_| SizeKind::Exact),
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -2191,6 +2208,13 @@ struct AddRequest {
 #[derive(Deserialize)]
 struct FormatsRequest {
     url: String,
+    /// The page the stream came from (round 11, item 5): the
+    /// extension sends the verdict's referer, and the engine
+    /// forwards it as the Referer header on the manifest fetch —
+    /// vidrift-class hosts 403 without it. Absent for old
+    /// extension versions and the desktop's own listing calls.
+    #[serde(default)]
+    referer: Option<String>,
 }
 
 /// One media item the extension detected on a page (Phase 4/8).
@@ -2668,7 +2692,7 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
     if method == "POST" && path == "/media/formats" {
         let req: Result<FormatsRequest, _> = serde_json::from_str(&body);
         match req {
-            Ok(r) => match list_formats(&app.data_dir, &r.url) {
+            Ok(r) => match list_formats_with_referer(&app.data_dir, &r.url, r.referer) {
                 Ok(info) => {
                     let b = serde_json::to_string(&info).unwrap();
                     let _ = stream.write_all(http_response(200, &b).as_bytes());
@@ -3906,6 +3930,8 @@ mod tests {
             delivered_height: None,
             delivered_bitrate_kbps: None,
             quality_note: None,
+            speed_bps: None,
+            size_kind: None,
         }
     }
 

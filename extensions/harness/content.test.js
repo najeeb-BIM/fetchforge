@@ -136,7 +136,7 @@ const ctx2 = makeContext(
     // revert timer; the harness provides it as a context global.
     sendRevertTimer: null,
   },
-  [extractMany(contentSrc, ["sendCurrentDownload", "defaultFilenameFor", "pageTitleStem", "pageNameHint", "isJunkTitle", "stemOfFilename", "sanitizeFilenameStem", "isManifestUrl", "shortFailureReason"], 2)]
+  [extractMany(contentSrc, ["sendCurrentDownload", "defaultFilenameFor", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename", "sanitizeFilenameStem", "isManifestUrl", "shortFailureReason"], 2)]
 );
 function clickSend(reply, dl) {
   nextReply = reply;
@@ -194,7 +194,7 @@ const ctx3 = makeContext(
     + "function openFormatsPopup(btn, dl) { __calls.formats.push({ btn: btn, dl: dl }); popupOpen = true; }\n"
     + "function openSimplePopup(btn, dl) { __calls.simple.push({ btn: btn, dl: dl }); popupOpen = true; }\n"
     + "function sendCurrentDownload(btn, dl, opts) { __calls.send.push({ btn: btn, dl: dl, opts: opts }); }\n",
-    extractMany(contentSrc, ["onOverlayClick", "parseHlsMaster", "parseHlsAttrs", "resolveAgainst", "friendlyCodec", "formatBandwidth", "hlsVariantHeight", "probeDirectFileDuration", "parseMp4Duration", "isManifestUrl", "isDashUrl", "isMp4FamilyUrl", "isVideoFileUrl"], 2),
+    extractMany(contentSrc, ["onOverlayClick", "parseHlsMaster", "parseHlsAttrs", "resolveAgainst", "friendlyCodec", "formatBandwidth", "hlsVariantHeight", "probeDirectFileDuration", "parseMp4Duration", "isManifestUrl", "isDashUrl", "isMp4FamilyUrl", "isVideoFileUrl", "isOneClickFileUrl"], 2),
   ]
 );
 function clickOverlay(dl, behaviour) {
@@ -361,7 +361,7 @@ const ctx4 = makeContext(
     + "globalThis.__popupRows = function () { return popupRows; };\n"
     + "globalThis.__popupOpen = function () { return popupOpen; };\n"
     + "function pickAndSend(btn, dl, opts) { opts = opts || {}; if (!opts.filename) opts.filename = currentPopupFilename(); globalThis.__sendCalls.push({ btn: btn, dl: dl, opts: opts }); return Promise.resolve({ ok: true }); }\n",
-    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "stemOfFilename", "sortFormatsForPopup", "isDashUrl"], 2),
+    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename", "sortFormatsForPopup", "isDashUrl"], 2),
   ]
 );
 ctx4.__sendCalls = sendCalls4;
@@ -572,7 +572,7 @@ const ctx6 = makeContext(
     + "globalThis.__popupRows = function () { return popupRows; };\n"
     + "function capturedTextFor(url) { return undefined; }\n"
     + "function pickAndSend(btn, dl, opts) { opts = opts || {}; if (!opts.filename) opts.filename = currentPopupFilename(); globalThis.__sendCalls.push({ btn: btn, dl: dl, opts: opts }); return Promise.resolve({ ok: true }); }\n",
-    extractMany(contentSrc, ["openHlsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "stemOfFilename"], 2),
+    extractMany(contentSrc, ["openHlsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename"], 2),
   ]
 );
 ctx6.__sendCalls = sendCalls6;

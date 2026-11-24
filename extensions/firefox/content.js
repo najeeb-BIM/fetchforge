@@ -254,7 +254,13 @@
   // outranks a bitrate hint (512kb), and a bigger number wins
   // within a kind. 0 when the URL carries no hint.
   function qualityHintScore(url) {
-    const lower = url.toLowerCase();
+    // Round 11, item 4: score the FILENAME only, not the whole
+    // URL — the Internet Archive's item directory is named
+    // "Night.Of.The.Living.Dead_1080p", so scoring the full URL
+    // made every file in it look 1080p and the standard mp4 tied
+    // the real 1080p mkv. A hint in a shared directory says
+    // nothing about which file is better.
+    const lower = String(url || "").split(/[?#]/)[0].split("/").pop().toLowerCase();
     if (/\b4k\b/.test(lower)) return 10000 + 2160;
     let m = lower.match(/(\d{3,4})p\b/);
     if (m) return 10000 + parseInt(m[1], 10);
@@ -263,6 +269,31 @@
     m = lower.match(/(\d+)kb/);
     if (m) return parseInt(m[1], 10);
     return 0;
+  }
+
+  // Round 11, item 4: when no source is playing, the page may
+  // list better encodes of the same file next to it (the Internet
+  // Archive's file list: the 1080p mkv sits beside the standard
+  // mp4 under /download/<item>/). Same-directory <a> links to
+  // media files join the ranking pool — the same directory is a
+  // strong signal they are encodes of the same item, not other
+  // videos. Only called when nothing is playing: a playing
+  // currentSrc always wins (round 10, item 8's rule stands).
+  function sameDirectoryEncodes(fileUrl) {
+    const out = [];
+    try {
+      const dir = String(fileUrl || "").split(/[?#]/)[0].replace(/\/[^/]*$/, "/");
+      if (!dir) return out;
+      const links = document.querySelectorAll ? document.querySelectorAll("a[href]") : [];
+      for (const a of links) {
+        const href = (a.getAttribute && a.getAttribute("href")) || a.href;
+        const u = resolveUrl(href);
+        if (!u || u.indexOf(dir) !== 0) continue;
+        if (!/\.(mp4|mkv|webm|m2ts|mov|ts)$/i.test(u.split(/[?#]/)[0])) continue;
+        out.push(u);
+      }
+    } catch (_) { /* DOM unavailable */ }
+    return out;
   }
 
   function mediaSource(el) {
@@ -323,7 +354,20 @@
       // encode wins over the first in document order (Internet
       // Archive: the 512kb mp4 was first, the 1080p file ranked
       // higher). Ties and hint-less URLs keep document order.
-      const file = (!hasPlayingSrc && bestRanked) ? bestRanked.url : directFile;
+      // Round 11, item 4: same-directory file links join the
+      // ranking too — the Archive's 1080p mkv is a file-list
+      // link, not a <source> element, so ranking <source>
+      // elements alone never saw it (the pick stopped at the
+      // standard mp4 on 2026-11-24).
+      let file = directFile;
+      if (!hasPlayingSrc) {
+        let best = bestRanked;
+        for (const u of sameDirectoryEncodes(directFile)) {
+          const score = qualityHintScore(u);
+          if (!best || score > best.score) best = { url: u, score: score };
+        }
+        if (best) file = best.url;
+      }
       return { url: file, viaPage: false };
     }
     if (sawBlob) {
@@ -1033,6 +1077,24 @@
       || lower.indexOf("movies & tv") !== -1
       || lower.indexOf("movies and tv") !== -1;
   }
+  // Round 11, item 2: a server title that looks like a URL token
+  // or hash names no film — it must not overwrite a good filename
+  // pre-fill. Novahd's yt-dlp title for an extensionless playlist
+  // URL is the URL's hash segment (a 60-character alphanumeric
+  // token), and it replaced the good pre-fill "The Odyssey · NOVA"
+  // in the popup (2026-11-24). A single token of 20+ characters
+  // drawn from [A-Za-z0-9_-+=] with no spaces, dots or slashes:
+  // real titles always contain spaces or punctuation a token
+  // lacks, and the 20-character minimum keeps short single-word
+  // titles ("Dune", "Inception") safe. Dots are excluded so a
+  // dotted release name ("The.Odyssey.2026.1080p") is not
+  // mistaken for a hash.
+  function isHashLikeTitle(title) {
+    const t = String(title || "").trim();
+    if (t.length < 20) return false;
+    if (/\s/.test(t)) return false;
+    return /^[A-Za-z0-9_\-+=]+$/.test(t);
+  }
   function pageTitleStem() {
     let title = (document.title || "").trim();
     if (!title) return "";
@@ -1092,17 +1154,23 @@
   function stemOfFilename(filename) {
     // The verdict filename ("index_287.ts", "movie.mp4") without
     // its extension — the fallback name when no page title or
-    // server title is available.
+    // server title is available. A hash-like stem (a URL token
+    // carried as the filename, e.g. novahd's 60-character token)
+    // names no film: return "" so the caller falls through to
+    // "download" instead of saving the hash (round 11, item 13).
     const base = String(filename || "").split(/[/\\]/).pop() || "";
     const dot = base.lastIndexOf(".");
     const stem = dot > 0 ? base.slice(0, dot) : base;
+    if (isHashLikeTitle(stem)) return "";
     return sanitizeFilenameStem(stem);
   }
   function popupDefaultName(dl, serverTitle) {
     // Best name known for the popup's filename field: the server's
     // title (the formats response carries yt-dlp's clean title),
-    // then the page title, then the verdict filename's stem.
-    if (serverTitle) { const s = sanitizeFilenameStem(serverTitle); if (s) return s; }
+    // then the page title, then the verdict filename's stem. A
+    // hash-like server title is skipped (round 11, item 2) — it
+    // names no film and must not beat a real page title.
+    if (serverTitle && !isHashLikeTitle(serverTitle)) { const s = sanitizeFilenameStem(serverTitle); if (s) return s; }
     const t = pageTitleStem();
     if (t) return t;
     const hint = pageNameHint();
@@ -1121,6 +1189,16 @@
   function isManifestUrl(url) { return /\.(m3u8|mpd)/i.test(String(url || "")); }
   function isDashUrl(url) { return /\.mpd/i.test(String(url || "")); }
   function isMp4FamilyUrl(url) { return /\.(mp4|mov|m4v)/i.test(String(url || "")); }
+  // Round 11, item 1: a direct file the overlay button still
+  // one-click sends — an image, a 3D model, a document, or a
+  // direct audio file. The URL names the kind, and there is no
+  // quality or audio choice to make. Video files are NOT here:
+  // they open the simple popup above. An extensionless URL is
+  // NOT here either: on a video page it is a stream the URL
+  // cannot name, and it routes to the formats popup.
+  function isOneClickFileUrl(url) {
+    return /\.(png|jpe?g|gif|webp|svg|bmp|avif|glb|gltf|obj|fbx|stl|usdz|usd|pdf|docx?|xlsx?|pptx?|zip|rar|7z|txt|epub|mobi|mp3|m4a|flac|ogg|oga|wav|opus)$/i.test(String(url || "").split(/[?#]/)[0]);
+  }
   // Any direct video file (round 8): every download click on one
   // shows the popup — no silent one-click sends for video.
   function isVideoFileUrl(url) { return /\.(mp4|mov|m4v|mkv|webm|avi|ts|m2ts)/i.test(String(url || "")); }
@@ -1395,9 +1473,24 @@
     // silent one-click sends for video) with the one known quality
     // plus the audio choice.
     if (isManifestUrl(dl.url) || isVideoFileUrl(dl.url)) { openSimplePopup(btn, dl); return; }
-    // Images, 3D models, PDFs and documents keep the one-click
-    // send: there is no quality or audio choice to make.
-    sendCurrentDownload(btn, dl, {});
+    // Round 11, item 1: kind-based fallthrough — a video verdict
+    // must NEVER one-click send. An extensionless playlist whose
+    // response Content-Type did not classify as a playlist MIME
+    // (NOXX / 123Movies, 2026-11-24) reaches here as kind "file"
+    // with no recognisable extension and used to send silently.
+    // The overlay election only ever holds video/audio streams
+    // (frame candidates come from <video> elements; observed
+    // findings are classified video/audio media; embedded-scan
+    // fallbacks are stream links), so an extensionless verdict
+    // reaching here is a stream the URL cannot name — route it
+    // to the formats popup, where the bridge sniffs the URL
+    // (round 10, item 4) and lists its qualities, or degrades
+    // to the single known quality. Images, 3D models, documents
+    // and direct audio files keep the one-click send: the URL
+    // names the kind, and there is no quality or audio choice
+    // to make.
+    if (isOneClickFileUrl(dl.url)) { sendCurrentDownload(btn, dl, {}); return; }
+    openFormatsPopup(btn, dl);
   }
 
   // ---- HLS master parsing (round 6, study C2/C3) ----
@@ -1653,17 +1746,33 @@
   // The server already sorts best-first; this is defence in depth
   // (and the unit under test for the ladder order).
   function sortFormatsForPopup(formats) {
-    // Round 10, item 10: dedupe first — the engine dedupes by
-    // format id, and the popup does too (defence in depth: a
-    // stale bridge or a format the engine never saw must not
-    // show twice). Keyed on format id when present, else on
-    // label + kind; the first occurrence wins.
+    // Round 11, item 3: dedupe on visible identity — the same
+    // stream can arrive under several format ids (YouTube lists
+    // the same m4a audio as both 140 and 140-drc, identical
+    // label/bitrate/size), so id-only dedupe showed it twice
+    // (and merged video rows twice, 144p three times). Keyed on
+    // label + kind + bitrate + size; the first occurrence wins.
+    // A format with NO measurement at all (no bitrate, no size)
+    // skips the visible dedupe: its identity is too thin to
+    // prove two entries are the same stream — YouTube's HLS
+    // audio entries 233/234 are both "Audio only · mp4" with no
+    // bitrate or size yet different qualities, and must both
+    // survive. The id dedupe stays as a first pass for every
+    // format: the same id is the same stream by definition.
     const seen = {};
     const list = [];
     for (const f of (formats || [])) {
-      const key = (f && f.format_id) ? ("id:" + f.format_id) : ("label:" + ((f && f.label) || "") + "|" + ((f && f.kind) || ""));
-      if (seen[key]) continue;
-      seen[key] = true;
+      const idKey = (f && f.format_id) ? ("id:" + f.format_id) : "";
+      if (idKey && seen[idKey]) continue;
+      if (idKey) seen[idKey] = true;
+      const hasMeasure = f && (f.abr != null || f.vbr != null || f.filesize != null);
+      if (hasMeasure) {
+        const visKey = "vis:" + ((f && f.label) || "") + "|" + ((f && f.kind) || "")
+          + "|" + ((f && f.abr != null) ? f.abr : "") + "|" + ((f && f.vbr != null) ? f.vbr : "")
+          + "|" + ((f && f.filesize != null) ? f.filesize : "");
+        if (seen[visKey]) continue;
+        seen[visKey] = true;
+      }
       list.push(f);
     }
     function audioRank(f) { return f && f.kind === "audio_only" ? 1 : 0; }
@@ -1729,7 +1838,14 @@
       // slow), not down — show the degraded popup, not an error.
       showDegradedPopup("The app took too long to list the qualities — it may be busy. Try again in a moment.");
     }, FORMATS_TIMEOUT_MS);
-    sendRuntimeMessage({ type: "getFormats", url: dl.url }).then(function (resp) {
+    // Round 11, item 5: the verdict's referer (the page the
+    // stream came from) goes with the formats request — the
+    // bridge forwards it as the Referer header when it fetches
+    // the manifest, and vidrift-class hosts 403 requests without
+    // the page Referer they expect (MoviesJoy, 2026-11-24: the
+    // listing 403'd while the engine's plan fetch, which carries
+    // the referer, worked).
+    sendRuntimeMessage({ type: "getFormats", url: dl.url, referer: dl.referer }).then(function (resp) {
       if (settled || reqId !== popupRequestId) return;
       settled = true;
       window.clearTimeout(timer);
@@ -1739,7 +1855,13 @@
         return;
       }
       floatOverlay.popupTitle.textContent = "Choose quality";
-      if (resp.title) {
+      // Round 11, item 2: a hash-like server title (novahd's
+      // yt-dlp title for an extensionless playlist URL is the
+      // URL's hash segment) is not shown as the subtitle and
+      // must not overwrite the filename field's good pre-fill —
+      // the page title it was filled from names the film, the
+      // hash does not.
+      if (resp.title && !isHashLikeTitle(resp.title)) {
         floatOverlay.popupSubtitle.textContent = resp.title;
         floatOverlay.popupSubtitle.style.display = "block";
         // Upgrade the filename field to the server's clean title

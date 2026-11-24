@@ -38,6 +38,59 @@ impl StreamKind {
     }
 }
 
+/// How a total size was determined (round 11, item 10 — the
+/// study's XDM-style estimate ladder). The UI shows the marker,
+/// so the user can tell an exact total from an estimate at a
+/// glance: exact plain, average `≈`, peak `~`, measured `~`.
+/// Serialized lowercase ("exact"/"average"/"peak"/"measured") on
+/// records and format listings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SizeKind {
+    /// Byte-range sum, a server Content-Length, or an
+    /// extractor-provided length: the true total.
+    Exact,
+    /// `AVERAGE-BANDWIDTH × duration`: the mean bitrate the
+    /// manifest declares, usually within ~1%.
+    Average,
+    /// Peak `BANDWIDTH × duration` (or yt-dlp's
+    /// `filesize_approx` from tbr): a rough upper bound, often
+    /// 2–4× high for VBR content.
+    Peak,
+    /// Measured during the download (average segment size so
+    /// far × segment count): converges on the true total as
+    /// segments land.
+    Measured,
+}
+
+impl SizeKind {
+    /// The marker the UI prefixes the size with ("" for exact).
+    pub fn marker(self) -> &'static str {
+        match self {
+            SizeKind::Exact => "",
+            SizeKind::Average => "≈",
+            SizeKind::Peak | SizeKind::Measured => "~",
+        }
+    }
+
+    /// The weaker (less precise) of two kinds — for a merged
+    /// total, the estimate dominates: an exact video plus an
+    /// estimated audio is an estimated total.
+    pub fn weaker(self, other: SizeKind) -> SizeKind {
+        let rank = |k: SizeKind| match k {
+            SizeKind::Exact => 0,
+            SizeKind::Average => 1,
+            SizeKind::Peak => 2,
+            SizeKind::Measured => 3,
+        };
+        if rank(self) >= rank(other) {
+            self
+        } else {
+            other
+        }
+    }
+}
+
 /// The protocol of a URL, by its path extension (query strings and
 /// fragments ignored, case-insensitive). Extension-less manifests
 /// are detected by content type instead (see
@@ -169,6 +222,9 @@ pub struct StreamFormat {
     pub vbr_kbps: Option<f64>,
     pub fps: Option<f64>,
     pub filesize: Option<u64>,
+    /// How `filesize` was determined (round 11, item 10 — the
+    /// estimate ladder). None when there is no size at all.
+    pub size_kind: Option<SizeKind>,
     /// True when the download must merge this stream with a
     /// separate audio stream (needs ffmpeg).
     pub needs_merge: bool,
@@ -703,6 +759,12 @@ pub struct HlsVariant {
     /// Absolute URL of the variant (media) playlist.
     pub uri: String,
     pub bandwidth: Option<u64>,
+    /// Mean bitrate of the whole variant, when the master
+    /// declares `AVERAGE-BANDWIDTH` (round 11, item 10): the
+    /// estimate ladder's second rung — peak `BANDWIDTH` can be
+    /// 4× the average on VBR content, so the average is the
+    /// estimate to use when present.
+    pub average_bandwidth: Option<u64>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub codecs: Option<String>,
@@ -787,6 +849,7 @@ pub fn parse_hls_master(text: &str, base_url: &str) -> HlsMaster {
             master.variants.push(HlsVariant {
                 uri,
                 bandwidth: map.get("BANDWIDTH").and_then(|v| v.parse().ok()),
+                average_bandwidth: map.get("AVERAGE-BANDWIDTH").and_then(|v| v.parse().ok()),
                 width,
                 height,
                 codecs: map.get("CODECS").map(|s| s.to_string()),
@@ -997,6 +1060,14 @@ fn pick_default_variant<'a>(variants: &'a [HlsVariant]) -> Option<&'a HlsVariant
 /// read from the default variant's playlist when it can be
 /// fetched; a failure there leaves the duration unknown rather
 /// than failing the whole listing.
+///
+/// Sizes (round 11, item 10 — the estimate ladder): each format
+/// carries the best size the manifest supports, with its kind —
+/// the exact byte-range sum when the (default) variant's playlist
+/// declares every segment's range, else `AVERAGE-BANDWIDTH ×
+/// duration` (≈), else peak `BANDWIDTH × duration` (~). No
+/// size at all when the manifest declares neither bandwidth nor
+/// ranges (the download's measured estimate takes over then).
 pub fn list_hls_formats(
     manifest_url: &str,
     referer: &Option<String>,
@@ -1015,7 +1086,14 @@ pub fn list_hls_formats(
     let title = title_from_manifest_url(&manifest_url);
     if master.variants.is_empty() {
         // Media playlist: validate it has segments, then one format.
+        // A byte-ranged playlist (Atlantic-style) yields the exact
+        // total from its ranges — the only size a media playlist
+        // can offer, since it declares no bandwidth.
         let playlist = parse_hls_segments(&text, &manifest_base_url(&manifest_url))?;
+        let (filesize, size_kind) = match exact_total_bytes(&playlist.clone().into_segments()) {
+            Some(total) => (Some(total), Some(SizeKind::Exact)),
+            None => (None, None),
+        };
         return Ok(StreamInfo {
             kind: StreamKind::Hls,
             title,
@@ -1031,17 +1109,61 @@ pub fn list_hls_formats(
                 abr_kbps: None,
                 vbr_kbps: None,
                 fps: None,
-                filesize: None,
+                filesize,
+                size_kind,
                 needs_merge: false,
             }],
             segment_count: Some(playlist.piece_count() as u64),
         });
     }
+    // Duration + segment count from the default variant's
+    // playlist (best effort): one fetch serves both, so the plan
+    // knows the piece count before the download starts — and the
+    // formats below need the duration for the size ladder, so
+    // this fetch happens BEFORE the formats are built.
+    let default_uri = pick_default_variant(&master.variants).map(|v| v.uri.clone());
+    let default_text = default_uri
+        .as_deref()
+        .and_then(|uri| manifest_text(&client, uri, referer, captured).ok());
+    let duration_secs = default_text.as_deref().and_then(hls_duration_secs);
+    let default_playlist = match (&default_uri, &default_text) {
+        (Some(uri), Some(text)) => {
+            parse_hls_segments(text, &manifest_base_url(uri)).ok()
+        }
+        _ => None,
+    };
+    let segment_count = default_playlist
+        .as_ref()
+        .map(|p| p.piece_count() as u64);
+    // The default variant's exact total, when its playlist is
+    // byte-ranged (Atlantic-style): the first ladder rung, and
+    // the only one that is exact. Other variants keep the
+    // bandwidth estimate — fetching every variant's playlist to
+    // total its ranges would multiply manifest requests for a
+    // listing the user may not even pick from.
+    let default_exact = default_playlist
+        .as_ref()
+        .and_then(|p| exact_total_bytes(&p.clone().into_segments()));
     let formats = master
         .variants
         .iter()
         .map(|v| {
             let separate_audio = v.audio_group.is_some();
+            // The estimate ladder (round 11, item 10): exact
+            // byte-range sum for the default variant, else
+            // AVERAGE-BANDWIDTH × duration, else peak BANDWIDTH ×
+            // duration. Separate audio adds nothing to a bitrate
+            // estimate: BANDWIDTH covers the whole combination
+            // including separate audio (RFC 8216 §4.3.4.2).
+            let (filesize, size_kind) = if Some(&v.uri) == default_uri.as_ref() {
+                if let Some(total) = default_exact {
+                    (Some(total), Some(SizeKind::Exact))
+                } else {
+                    variant_size_estimate(v, duration_secs)
+                }
+            } else {
+                variant_size_estimate(v, duration_secs)
+            };
             StreamFormat {
                 id: v.uri.clone(),
                 // A variant merged with separate audio lands as mp4;
@@ -1054,25 +1176,12 @@ pub fn list_hls_formats(
                 abr_kbps: None,
                 vbr_kbps: v.bandwidth.map(|b| b as f64 / 1000.0),
                 fps: v.fps,
-                filesize: None,
+                filesize,
+                size_kind,
                 needs_merge: separate_audio,
             }
         })
         .collect();
-    // Duration + segment count from the default variant's
-    // playlist (best effort): one fetch serves both, so the plan
-    // knows the piece count before the download starts.
-    let default_uri = pick_default_variant(&master.variants).map(|v| v.uri.clone());
-    let default_text = default_uri
-        .as_deref()
-        .and_then(|uri| manifest_text(&client, uri, referer, captured).ok());
-    let duration_secs = default_text.as_deref().and_then(hls_duration_secs);
-    let segment_count = match (&default_uri, &default_text) {
-        (Some(uri), Some(text)) => parse_hls_segments(text, &manifest_base_url(uri))
-            .ok()
-            .map(|p| p.piece_count() as u64),
-        _ => None,
-    };
     Ok(StreamInfo {
         kind: StreamKind::Hls,
         title,
@@ -1081,6 +1190,36 @@ pub fn list_hls_formats(
         formats,
         segment_count,
     })
+}
+
+/// Bitrate-based size estimate for one HLS variant (round 11,
+/// item 10): `AVERAGE-BANDWIDTH × duration` when the master
+/// declares the average (usually within ~1%), else peak
+/// `BANDWIDTH × duration` (a rough upper bound, often 2–4× high
+/// for VBR content). None when the duration is unknown or the
+/// variant declares no bandwidth at all.
+fn variant_size_estimate(v: &HlsVariant, duration_secs: Option<u64>) -> (Option<u64>, Option<SizeKind>) {
+    let Some(d) = duration_secs else {
+        return (None, None);
+    };
+    if d == 0 {
+        return (None, None);
+    }
+    if let Some(avg) = v.average_bandwidth {
+        let bytes = (avg as u128 * d as u128) / 8;
+        return (
+            Some(u64::try_from(bytes).unwrap_or(u64::MAX)),
+            Some(SizeKind::Average),
+        );
+    }
+    if let Some(peak) = v.bandwidth {
+        let bytes = (peak as u128 * d as u128) / 8;
+        return (
+            Some(u64::try_from(bytes).unwrap_or(u64::MAX)),
+            Some(SizeKind::Peak),
+        );
+    }
+    (None, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -3334,6 +3473,16 @@ fn choose_dash_representation<'a>(
 /// representation. Video representations in a manifest with a
 /// separate audio track are video-only (merged with the best audio
 /// on download); audio representations are audio-only.
+///
+/// Sizes (round 11, item 10 — the estimate ladder): each format
+/// carries `BANDWIDTH × duration` (~, peak bitrate) when the
+/// manifest declares both; the default representation carries the
+/// exact byte-range sum when its segments are all ranged
+/// (SegmentList with `@mediaRange`, the Atlantic pattern). A
+/// video representation's estimate covers the video only — the
+/// merged audio's size is added by the plan (see
+/// [`crate::extract::plan_from_info`]), which combines kinds
+/// with worst-kind-wins.
 pub fn list_dash_formats(
     manifest_url: &str,
     referer: &Option<String>,
@@ -3353,12 +3502,51 @@ pub fn list_dash_formats(
         .representations
         .iter()
         .any(|r| r.is_audio());
+    // Segment count + exact total from the default representation
+    // (best effort): the template/timeline expands to a concrete
+    // list, so the plan can show the piece count up front like
+    // HLS — and a fully ranged list yields the exact total. The
+    // init segment counts too — it is a piece the worker
+    // downloads.
+    let default_segments = choose_dash_representation(&manifest, None)
+        .ok()
+        .and_then(|(chosen, _)| {
+            dash_segments(chosen, &manifest_url, manifest.duration_secs).ok()
+        });
+    let segment_count = default_segments
+        .as_ref()
+        .map(|(init, segments)| segments.len() as u64 + init.is_some() as u64);
+    let default_exact = default_segments.as_ref().and_then(|(init, segments)| {
+        let mut all: Vec<Segment> = Vec::with_capacity(segments.len() + 1);
+        if let Some(init) = init {
+            all.push(init.clone());
+        }
+        all.extend(segments.iter().cloned());
+        exact_total_bytes(&all)
+    });
+    let default_id = pick_default_representation(&manifest.representations)
+        .map(|r| r.id.clone());
+    let duration_secs = manifest.duration_secs.map(|d| d as u64);
     let formats = manifest
         .representations
         .iter()
         .map(|r| {
             let is_video = r.is_video();
             let is_audio = r.is_audio();
+            // The estimate ladder (round 11, item 10): the
+            // default representation's exact byte-range sum when
+            // available, else peak BANDWIDTH × duration. DASH
+            // declares no average bandwidth, so there is no
+            // middle rung.
+            let (filesize, size_kind) = if Some(&r.id) == default_id.as_ref() {
+                if let Some(total) = default_exact {
+                    (Some(total), Some(SizeKind::Exact))
+                } else {
+                    dash_size_estimate(r, duration_secs)
+                }
+            } else {
+                dash_size_estimate(r, duration_secs)
+            };
             StreamFormat {
                 id: r.id.clone(),
                 ext: if is_audio && !is_video {
@@ -3382,30 +3570,38 @@ pub fn list_dash_formats(
                     None
                 },
                 fps: r.frame_rate,
-                filesize: None,
+                filesize,
+                size_kind,
                 needs_merge: is_video && has_audio,
             }
         })
         .collect();
-    // Segment count from the default representation (best
-    // effort): the template/timeline expands to a concrete list,
-    // so the plan can show the piece count up front like HLS.
-    // The init segment counts too — it is a piece the worker
-    // downloads.
-    let segment_count = choose_dash_representation(&manifest, None)
-        .ok()
-        .and_then(|(chosen, _)| {
-            dash_segments(chosen, &manifest_url, manifest.duration_secs).ok()
-        })
-        .map(|(init, segments)| segments.len() as u64 + init.map_or(0, |_| 1));
     Ok(StreamInfo {
         kind: StreamKind::Dash,
         title: title_from_manifest_url(&manifest_url),
-        duration_secs: manifest.duration_secs.map(|d| d as u64),
+        duration_secs,
         manifest_url,
         formats,
         segment_count,
     })
+}
+
+/// Peak-`BANDWIDTH × duration` size estimate for one DASH
+/// representation (round 11, item 10): a rough upper bound, since
+/// DASH declares no average bandwidth. None when the duration is
+/// unknown or the representation declares no bandwidth.
+fn dash_size_estimate(r: &DashRepresentation, duration_secs: Option<u64>) -> (Option<u64>, Option<SizeKind>) {
+    let (Some(d), Some(bw)) = (duration_secs, r.bandwidth) else {
+        return (None, None);
+    };
+    if d == 0 {
+        return (None, None);
+    }
+    let bytes = (bw as u128 * d as u128) / 8;
+    (
+        Some(u64::try_from(bytes).unwrap_or(u64::MAX)),
+        Some(SizeKind::Peak),
+    )
 }
 
 /// Options for a DASH download.
@@ -3765,6 +3961,7 @@ mod tests {
             HlsVariant {
                 uri: "a".into(),
                 bandwidth: Some(100),
+                average_bandwidth: None,
                 width: None,
                 height: None,
                 codecs: None,
@@ -3774,6 +3971,7 @@ mod tests {
             HlsVariant {
                 uri: "b".into(),
                 bandwidth: Some(500),
+                average_bandwidth: None,
                 width: None,
                 height: None,
                 codecs: None,
@@ -3782,6 +3980,98 @@ mod tests {
             },
         ];
         assert_eq!(pick_default_variant(&no_res).unwrap().uri, "b");
+    }
+
+    #[test]
+    fn parse_hls_master_reads_average_bandwidth() {
+        // Round 11, item 10: AVERAGE-BANDWIDTH is the estimate
+        // ladder's second rung — peak BANDWIDTH can be 4x the
+        // average on VBR content (Shaka's 768x576 variant: peak
+        // 8.06 Mbps vs average 1.82 Mbps).
+        let text = "#EXTM3U\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=8060000,AVERAGE-BANDWIDTH=1820000,RESOLUTION=768x576\n\
+            v.m3u8\n";
+        let m = parse_hls_master(text, "https://example.com/v/master.m3u8");
+        assert_eq!(m.variants.len(), 1);
+        assert_eq!(m.variants[0].bandwidth, Some(8_060_000));
+        assert_eq!(m.variants[0].average_bandwidth, Some(1_820_000));
+    }
+
+    #[test]
+    fn variant_size_estimate_prefers_average_over_peak() {
+        let v = HlsVariant {
+            uri: "v.m3u8".into(),
+            bandwidth: Some(8_060_000),
+            average_bandwidth: Some(1_820_000),
+            width: Some(768),
+            height: Some(576),
+            codecs: None,
+            fps: None,
+            audio_group: None,
+        };
+        // 1,820,000 bps / 8 * 600 s = 136,500,000 bytes.
+        assert_eq!(
+            variant_size_estimate(&v, Some(600)),
+            (Some(136_500_000), Some(SizeKind::Average))
+        );
+        let peak_only = HlsVariant {
+            average_bandwidth: None,
+            ..v.clone()
+        };
+        // 8,060,000 / 8 * 600 = 604,500,000 — the rough peak bound.
+        assert_eq!(
+            variant_size_estimate(&peak_only, Some(600)),
+            (Some(604_500_000), Some(SizeKind::Peak))
+        );
+        assert_eq!(variant_size_estimate(&v, None), (None, None));
+        let no_bw = HlsVariant {
+            bandwidth: None,
+            average_bandwidth: None,
+            ..v
+        };
+        assert_eq!(variant_size_estimate(&no_bw, Some(600)), (None, None));
+    }
+
+    #[test]
+    fn dash_size_estimate_uses_peak_bandwidth() {
+        // Round 11, item 10: DASH declares no average bandwidth,
+        // so the ladder's only bitrate rung is peak.
+        let r = DashRepresentation {
+            id: "0".into(),
+            bandwidth: Some(1_780_000),
+            width: Some(1920),
+            height: Some(1080),
+            frame_rate: Some(23.98),
+            codecs: Some("hev1".into()),
+            mime_type: "video/mp4".into(),
+            content_type: "video".into(),
+            base_url: None,
+            template: None,
+            segment_list: None,
+        };
+        // 1,780,000 / 8 * 100 = 22,250,000 bytes, peak kind.
+        assert_eq!(
+            dash_size_estimate(&r, Some(100)),
+            (Some(22_250_000), Some(SizeKind::Peak))
+        );
+        assert_eq!(dash_size_estimate(&r, None), (None, None));
+    }
+
+    #[test]
+    fn size_kind_markers_and_weaker() {
+        assert_eq!(SizeKind::Exact.marker(), "");
+        assert_eq!(SizeKind::Average.marker(), "≈");
+        assert_eq!(SizeKind::Peak.marker(), "~");
+        assert_eq!(SizeKind::Measured.marker(), "~");
+        assert_eq!(SizeKind::Exact.weaker(SizeKind::Peak), SizeKind::Peak);
+        assert_eq!(
+            SizeKind::Average.weaker(SizeKind::Exact),
+            SizeKind::Average
+        );
+        assert_eq!(
+            SizeKind::Measured.weaker(SizeKind::Average),
+            SizeKind::Measured
+        );
     }
 
     #[test]

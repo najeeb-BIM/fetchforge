@@ -159,6 +159,26 @@ pub struct DownloadRecord {
     /// `#[serde(default)]` so older history files still load.
     #[serde(default)]
     pub quality_note: Option<String>,
+    /// Live download speed in bytes per second, from the most
+    /// recent progress report (round 11, item 8). The engine
+    /// already computed it in every progress report; the record
+    /// just never kept it, so the UI's Speed column showed "-".
+    /// None until the first report, and None for records written
+    /// before this field existed. The UI shows it only for
+    /// Downloading rows — a paused row keeps its last value in
+    /// the record, but the UI must not show a stale speed.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub speed_bps: Option<f64>,
+    /// How `total_bytes` was determined (round 11, item 10 — the
+    /// estimate ladder). Set at plan time from the plan's kind;
+    /// Exact for a direct download with a probed Content-Length.
+    /// When the download's measured estimate is the only size
+    /// known, `apply_progress` sets it to Measured. None when
+    /// there is no total at all. The UI shows the marker.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub size_kind: Option<crate::media::SizeKind>,
 }
 
 impl DownloadRecord {
@@ -184,6 +204,27 @@ impl DownloadRecord {
         if let Some(e) = p.estimated_total {
             self.estimated_total_bytes = Some(e);
         }
+        // Round 11, item 8: keep the live speed (bytes per
+        // second, averaged over the download so far by the
+        // engine). Only positive values — a 0 report at the very
+        // start must not overwrite a real speed.
+        if p.bytes_per_sec > 0.0 {
+            self.speed_bps = Some(p.bytes_per_sec);
+        }
+        // Round 11, item 10: the measured estimate is the only
+        // size known for a stream whose manifest declared no
+        // bandwidth and no ranges — label the total Measured so
+        // the UI shows it with "~". A plan kind already set
+        // (Exact/Average/Peak) is never downgraded. Deliberately
+        // NOT promoted to Exact when all segments land: a
+        // two-phase download (DASH video then audio) reports
+        // done == total at the end of phase 1, and promoting
+        // then would show 100% with the video phase's total
+        // alone. The exact total arrives at completion, when
+        // complete_with_file reconciles against the real file.
+        if p.estimated_total.is_some() && self.size_kind.is_none() {
+            self.size_kind = Some(crate::media::SizeKind::Measured);
+        }
         self.updated_unix = now_secs();
     }
 
@@ -207,6 +248,9 @@ impl DownloadRecord {
                 let size = meta.len();
                 self.downloaded_bytes = size;
                 self.total_bytes = Some(size);
+                // Round 11, item 10: the file on disk is the
+                // exact total — the ladder kind is settled now.
+                self.size_kind = Some(crate::media::SizeKind::Exact);
             }
             _ => {
                 self.downloaded_bytes = self.total_bytes.unwrap_or(self.downloaded_bytes);
@@ -906,6 +950,8 @@ mod tests {
             delivered_height: None,
             delivered_bitrate_kbps: None,
             quality_note: None,
+            speed_bps: None,
+            size_kind: None,
         });
         s.save().unwrap();
         let mut s2 = Store::load(path);
@@ -947,6 +993,8 @@ mod tests {
             delivered_height: None,
             delivered_bitrate_kbps: None,
             quality_note: None,
+            speed_bps: None,
+            size_kind: None,
         }
     }
 
@@ -1591,6 +1639,57 @@ mod tests {
         assert_eq!(r.downloaded_bytes, 600_000_000);
         assert_eq!(r.segments_done, 700);
         assert_eq!(r.total_bytes, Some(1_000_000_000), "None never wipes a total");
+    }
+
+    #[test]
+    fn apply_progress_stores_speed_and_marks_measured() {
+        // Round 11, items 8/10: the live speed lands in the
+        // record, and a measured estimate labels the total
+        // Measured when no plan kind was set — never downgrading
+        // a plan kind.
+        let mut r = rec("s");
+        r.status = Status::Downloading;
+        r.total_bytes = None;
+        let p = crate::download::Progress {
+            downloaded: 100_000_000,
+            total: None,
+            bytes_per_sec: 2_500_000.0,
+            segments_done: Some(10),
+            segments_total: Some(100),
+            estimated_total: Some(1_000_000_000),
+        };
+        r.apply_progress(&p);
+        assert_eq!(r.speed_bps, Some(2_500_000.0));
+        assert_eq!(r.size_kind, Some(crate::media::SizeKind::Measured));
+        // A 0 speed never overwrites a real one.
+        let zero = crate::download::Progress {
+            bytes_per_sec: 0.0,
+            ..p
+        };
+        r.apply_progress(&zero);
+        assert_eq!(r.speed_bps, Some(2_500_000.0));
+        // A plan kind is never downgraded by the estimate.
+        r.size_kind = Some(crate::media::SizeKind::Average);
+        r.apply_progress(&p);
+        assert_eq!(r.size_kind, Some(crate::media::SizeKind::Average));
+    }
+
+    #[test]
+    fn complete_with_file_marks_total_exact() {
+        // Round 11, item 10: the file on disk is the exact total
+        // — the ladder kind is settled at completion.
+        let dir = std::env::temp_dir().join("fetchforge-test-store-complete-exact");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let file = dir.join("Movie.mp4");
+        fs::write(&file, vec![0u8; 999]).unwrap();
+        let mut r = rec("e");
+        r.status = Status::Downloading;
+        r.total_bytes = Some(50_000_000);
+        r.size_kind = Some(crate::media::SizeKind::Peak);
+        r.complete_with_file(&file);
+        assert_eq!(r.total_bytes, Some(999));
+        assert_eq!(r.size_kind, Some(crate::media::SizeKind::Exact));
     }
 
     #[test]

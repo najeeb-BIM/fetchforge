@@ -210,6 +210,13 @@ pub struct MediaFormat {
     /// `filesize_approx` (then `filesize_approx` is true).
     pub filesize: Option<u64>,
     pub filesize_approx: bool,
+    /// How `filesize` was determined (round 11, item 10 — the
+    /// estimate ladder). Exact for a `filesize` the extractor
+    /// reported, Peak for `filesize_approx` (tbr-derived), and
+    /// the stream engine's kind for manifest formats. None when
+    /// there is no size. The label carries the marker (`≈`/`~`).
+    #[serde(default)]
+    pub size_kind: Option<crate::media::SizeKind>,
     /// True for VideoOnly formats: the download merges this video
     /// stream with the best audio stream (needs ffmpeg).
     pub needs_merge: bool,
@@ -263,7 +270,7 @@ fn format_label(
     abr: Option<f64>,
     fps: Option<f64>,
     filesize: Option<u64>,
-    filesize_approx: bool,
+    size_kind: Option<crate::media::SizeKind>,
     needs_merge: bool,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -315,11 +322,12 @@ fn format_label(
         }
     }
     if let Some(s) = filesize {
-        if filesize_approx {
-            parts.push(format!("~{}", fmt_size(s)));
-        } else {
-            parts.push(fmt_size(s));
-        }
+        // Round 11, item 10: the size marker comes from the
+        // ladder kind — exact plain, average `≈`, peak/measured
+        // `~`. A missing kind with a size is treated as exact
+        // (an extractor-reported size with no provenance note).
+        let marker = size_kind.map(|k| k.marker()).unwrap_or("");
+        parts.push(format!("{marker}{}", fmt_size(s)));
     }
     parts.join(" · ")
 }
@@ -414,12 +422,20 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
             let vbr = f.get("vbr").and_then(|v| v.as_f64());
             let fps = f.get("fps").and_then(|v| v.as_f64());
             let language = opt_str(f, "language").map(|s| s.to_string());
-            let (filesize, filesize_approx) =
+            // Round 11, item 10: the size kind rides with the
+            // size — an extractor-reported `filesize` is exact,
+            // `filesize_approx` is tbr-derived (peak). The
+            // `filesize_approx` bool is derived from the kind
+            // below (it stays for serde compat and mirrors kind
+            // != Exact).
+            let (filesize, size_kind) =
                 match f.get("filesize").and_then(|v| v.as_u64()) {
-                    Some(s) => (Some(s), false),
+                    Some(s) => (Some(s), Some(crate::media::SizeKind::Exact)),
                     None => (
                         f.get("filesize_approx").and_then(|v| v.as_u64()),
-                        true,
+                        f.get("filesize_approx")
+                            .and_then(|v| v.as_u64())
+                            .map(|_| crate::media::SizeKind::Peak),
                     ),
                 };
             // Plausibility: some extractors report nonsense sizes
@@ -427,10 +443,16 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
             // video). A real stream carries far more than 1 KB/s, so
             // a size below duration * 1 KB/s is dropped and shown as
             // unknown rather than misleading the picker.
-            let filesize = match (filesize, duration_secs) {
-                (Some(s), Some(d)) if d > 0 && s < d.saturating_mul(1000) => None,
-                (s, _) => s,
+            let (filesize, size_kind) = match (filesize, duration_secs) {
+                (Some(s), Some(d)) if d > 0 && s < d.saturating_mul(1000) => (None, None),
+                (s, _) => (s, size_kind),
             };
+            // Keep the bool mirroring the kind: no size means no
+            // approx flag either (the plausibility filter above
+            // drops both together).
+            let filesize_approx = size_kind
+                .map(|k| k != crate::media::SizeKind::Exact)
+                .unwrap_or(false);
             let needs_merge = kind == FormatKind::VideoOnly;
             let label = format_label(
                 format_id,
@@ -441,7 +463,7 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
                 abr,
                 fps,
                 filesize,
-                filesize_approx,
+                size_kind,
                 needs_merge,
             );
             formats.push(MediaFormat {
@@ -457,6 +479,7 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
                 language,
                 filesize,
                 filesize_approx,
+                size_kind,
                 needs_merge,
             });
         }
@@ -469,9 +492,10 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
         if value.get("url").and_then(|v| v.as_str()).is_some() {
             let ext = opt_str(value, "ext").unwrap_or("mp4").to_string();
             let filesize = value.get("filesize").and_then(|v| v.as_u64());
+            let size_kind = filesize.map(|_| crate::media::SizeKind::Exact);
             formats.push(MediaFormat {
                 format_id: opt_str(value, "format_id").unwrap_or("0").to_string(),
-                label: format_label("0", FormatKind::Combined, &ext, None, None, None, None, filesize, false, false),
+                label: format_label("0", FormatKind::Combined, &ext, None, None, None, None, filesize, size_kind, false),
                 ext,
                 kind: FormatKind::Combined,
                 height: None,
@@ -482,6 +506,7 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
                 language: None,
                 filesize,
                 filesize_approx: false,
+                size_kind,
                 needs_merge: false,
             });
         } else if saw_drm_only {
@@ -519,13 +544,38 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
     // Round 10, item 10: the same stream can appear twice in
     // yt-dlp's list (YouTube listed 140 m4a twice, identical
     // entries, and the picker showed it twice). Keep the first of
-    // each format id — the sort already put the best first. Keyed
-    // on format id, NOT on the label: distinct streams can share
-    // a label (YouTube's HLS audio entries 233/234 are both
-    // "Audio only · mp4" yet different qualities) and must both
-    // survive.
+    // each format id — the sort already put the best first.
     let mut seen_ids = std::collections::HashSet::new();
     formats.retain(|f| seen_ids.insert(f.format_id.clone()));
+    // Round 11, item 3: dedupe on visible identity as well —
+    // yt-dlp lists the SAME stream under multiple ids (YouTube's
+    // m4a audio as both 140 and 140-drc, identical label/bitrate/
+    // size), so id-only dedupe showed it twice (and merged video
+    // rows twice, 144p three times). Identical on label + kind +
+    // bitrate + size is the same stream to the user; the first
+    // occurrence wins. A format with NO measurement at all (no
+    // bitrate, no size) skips the visible dedupe: its identity
+    // is too thin to prove two entries are the same stream —
+    // YouTube's HLS audio entries 233/234 are both "Audio only ·
+    // mp4" with no bitrate or size yet different qualities, and
+    // must both survive.
+    let mut seen_visible = std::collections::HashSet::new();
+    formats.retain(|f| {
+        if f.abr.is_none() && f.vbr.is_none() && f.filesize.is_none() {
+            return true;
+        }
+        seen_visible.insert((
+            f.label.clone(),
+            match f.kind {
+                FormatKind::Combined => 0u8,
+                FormatKind::VideoOnly => 1,
+                FormatKind::AudioOnly => 2,
+            },
+            f.abr.map(f64::to_bits).unwrap_or(0),
+            f.vbr.map(f64::to_bits).unwrap_or(0),
+            f.filesize,
+        ))
+    });
     let default_format_id = pick_default_format(&formats, &extractor);
     Ok(MediaInfo {
         title,
@@ -898,21 +948,38 @@ fn list_formats_with_fallback(
 /// yt-dlp first. HLS (.m3u8) and DASH (.mpd) URLs never reach
 /// yt-dlp: their manifests are parsed directly by media.rs, so a
 /// stream lists its qualities even with no yt-dlp installed.
-pub fn list_formats(data_dir: &Path, url: &str) -> Result<MediaInfo, String> {
+/// The referer is the page the stream came from: vidrift-class
+/// hosts 403 a manifest fetch without the page Referer they
+/// expect (MoviesJoy, 2026-11-24 — the listing 403'd while the
+/// plan fetch, which carries the referer, worked). Round 11,
+/// item 5: the popup's listing now carries the referer through
+/// the bridge instead of the extension fetching the manifest
+/// itself with no headers.
+pub fn list_formats_with_referer(
+    data_dir: &Path,
+    url: &str,
+    referer: Option<String>,
+) -> Result<MediaInfo, String> {
     if crate::media::is_manifest_url(url) {
-        let info = crate::media::list_stream_formats(url, &None, None)?;
+        let info = crate::media::list_stream_formats(url, &referer, None)?;
         return Ok(stream_info_to_media_info(&info));
     }
     // Round 10, item 4: extensionless playlist URLs (MoviesJoy /
     // NOXX / 123Movies) carry no .m3u8/.mpd, so the check above
     // misses them — sniff the first bytes before yt-dlp. A failed
     // sniff (None) falls through to yt-dlp as before.
-    if let Some(kind) = crate::media::sniff_stream_kind(url, &None) {
-        let info = crate::media::list_stream_formats_kind(url, kind, &None, None)?;
+    if let Some(kind) = crate::media::sniff_stream_kind(url, &referer) {
+        let info = crate::media::list_stream_formats_kind(url, kind, &referer, None)?;
         return Ok(stream_info_to_media_info(&info));
     }
     let ytdlp = ensure_ytdlp(data_dir)?;
     list_formats_with(&ytdlp, url)
+}
+
+/// List formats with no referer (the desktop paste-link path:
+/// the URL was typed, not observed on a page).
+pub fn list_formats(data_dir: &Path, url: &str) -> Result<MediaInfo, String> {
+    list_formats_with_referer(data_dir, url, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1482,7 +1549,7 @@ fn stream_info_to_media_info(info: &crate::media::StreamInfo) -> MediaInfo {
                     f.abr_kbps,
                     f.fps,
                     f.filesize,
-                    false,
+                    f.size_kind,
                     f.needs_merge,
                 ),
                 ext: f.ext.clone(),
@@ -1498,7 +1565,11 @@ fn stream_info_to_media_info(info: &crate::media::StreamInfo) -> MediaInfo {
                 // tags only drive the yt-dlp multi-audio selector.
                 language: None,
                 filesize: f.filesize,
-                filesize_approx: false,
+                filesize_approx: f
+                    .size_kind
+                    .map(|k| k != crate::media::SizeKind::Exact)
+                    .unwrap_or(false),
+                size_kind: f.size_kind,
                 needs_merge: f.needs_merge,
             }
         })
@@ -1552,6 +1623,11 @@ pub struct MediaPlan {
     /// (a merge may pick a different container than expected).
     pub filename: String,
     pub total_bytes: Option<u64>,
+    /// How `total_bytes` was determined (round 11, item 10 — the
+    /// estimate ladder). None when there is no total. Merged
+    /// totals combine with worst-kind-wins: an exact video plus
+    /// an estimated audio is an estimated total.
+    pub size_kind: Option<crate::media::SizeKind>,
     pub format_id: String,
     pub format_label: String,
     pub needs_merge: bool,
@@ -1643,6 +1719,20 @@ fn stem_for_title(title: &str) -> String {
         || lower.contains("movies & tv")
         || lower.contains("movies and tv");
     if junk {
+        return "video".to_string();
+    }
+    // Round 11, item 13 (second line of defence — the extension
+    // skips hash-like server titles first): a title that is a
+    // single 20+ character token of URL-safe characters with no
+    // spaces, dots or slashes is a URL hash segment, not a film
+    // (novahd's yt-dlp title for an extensionless playlist URL
+    // is the URL's hash). Fall back to "video" rather than
+    // saving the hash as the filename.
+    let is_hash_like = t.len() >= 20
+        && !t.chars().any(|c| c.is_whitespace())
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '='));
+    if is_hash_like {
         return "video".to_string();
     }
     let clean = sanitize_filename(t);
@@ -1847,6 +1937,30 @@ fn plan_from_info(
         })
     };
     let mut total = est_size(chosen.filesize, chosen.vbr);
+    // Round 11, item 10: the kind of a size estimate mirrors
+    // est_size — a reported size keeps its own kind (Exact when
+    // no kind was recorded, matching format_label's rule), a
+    // bitrate × duration fallback is Peak (tbr-derived, like
+    // filesize_approx). Merged totals combine worst-kind-wins:
+    // an exact video plus an estimated audio is an estimated
+    // total.
+    let est_kind = |size_kind: Option<crate::media::SizeKind>,
+                    filesize: Option<u64>,
+                    bitrate_kbps: Option<f64>|
+     -> Option<crate::media::SizeKind> {
+        if filesize.is_some() {
+            Some(size_kind.unwrap_or(crate::media::SizeKind::Exact))
+        } else {
+            let d = info.duration_secs?;
+            let b = bitrate_kbps?;
+            if d == 0 || b <= 0.0 {
+                None
+            } else {
+                Some(crate::media::SizeKind::Peak)
+            }
+        }
+    };
+    let mut size_kind = est_kind(chosen.size_kind, chosen.filesize, chosen.vbr);
     if chosen.needs_merge {
         // Sum the audio streams the multi selector actually
         // downloads: the best of each tagged language when there
@@ -1884,12 +1998,25 @@ fn plan_from_info(
             .sum();
         if audio_total > 0 {
             total = Some(total.unwrap_or(0) + audio_total);
+            let audio_kind = to_sum.iter().filter_map(|f| {
+                est_kind(f.size_kind, f.filesize, f.abr)
+            }).fold(None, |acc: Option<crate::media::SizeKind>, k| {
+                Some(match acc {
+                    None => k,
+                    Some(a) => a.weaker(k),
+                })
+            });
+            size_kind = match (size_kind, audio_kind) {
+                (Some(a), Some(b)) => Some(a.weaker(b)),
+                (a, b) => a.or(b),
+            };
         }
     }
     let mut plan = MediaPlan {
         title: info.title.clone(),
         filename,
         total_bytes: total,
+        size_kind,
         format_id: chosen.format_id.clone(),
         format_label: chosen.label.clone(),
         needs_merge: chosen.needs_merge,
@@ -2652,6 +2779,113 @@ mod tests {
     }
 
     #[test]
+    fn parse_media_info_dedupes_visible_identity_but_keeps_hls_audio() {
+        // Round 11, item 3: YouTube lists the same m4a stream as
+        // both 140 and 140-drc (identical label/bitrate/size) —
+        // one row must survive. The HLS audio entries 233/234
+        // share a label but carry no measurements at all, so
+        // their identity is too thin to prove identical — both
+        // survive.
+        let v = serde_json::json!({
+            "title": "Test",
+            "extractor": "youtube",
+            "duration": 635,
+            "webpage_url": "https://www.youtube.com/watch?v=x",
+            "formats": [
+                {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2",
+                 "abr": 128.0, "filesize": 10000000},
+                {"format_id": "140-drc", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2",
+                 "abr": 128.0, "filesize": 10000000},
+                {"format_id": "233", "ext": "mp4", "vcodec": "none", "protocol": "m3u8_native"},
+                {"format_id": "234", "ext": "mp4", "vcodec": "none", "protocol": "m3u8_native"}
+            ]
+        });
+        let info = parse_media_info(&v, "https://www.youtube.com/watch?v=x").unwrap();
+        let ids: Vec<&str> = info.formats.iter().map(|f| f.format_id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "140-drc deduped, 233+234 kept: {ids:?}");
+        assert!(ids.contains(&"140"));
+        assert!(!ids.contains(&"140-drc"));
+        assert!(ids.contains(&"233"));
+        assert!(ids.contains(&"234"));
+    }
+
+    #[test]
+    fn format_label_marks_estimates_from_size_kind() {
+        // Round 11, item 10: an extractor-reported filesize is
+        // exact (plain), filesize_approx is peak (~), and a
+        // stream format's average kind is ≈.
+        let v = serde_json::json!({
+            "title": "Test",
+            "extractor": "youtube",
+            "duration": 635,
+            "webpage_url": "https://www.youtube.com/watch?v=x",
+            "formats": [
+                {"format_id": "a", "ext": "m4a", "vcodec": "none", "acodec": "mp4a",
+                 "abr": 128.0, "filesize": 10000000},
+                {"format_id": "b", "ext": "webm", "vcodec": "none", "acodec": "opus",
+                 "abr": 160.0, "filesize_approx": 12000000}
+            ]
+        });
+        let info = parse_media_info(&v, "https://www.youtube.com/watch?v=x").unwrap();
+        let a = info.formats.iter().find(|f| f.format_id == "a").unwrap();
+        assert_eq!(a.size_kind, Some(crate::media::SizeKind::Exact));
+        assert!(a.label.contains("9.5 MB"), "label: {}", a.label);
+        assert!(!a.label.contains('~'), "label: {}", a.label);
+        let b = info.formats.iter().find(|f| f.format_id == "b").unwrap();
+        assert_eq!(b.size_kind, Some(crate::media::SizeKind::Peak));
+        assert!(b.label.contains("~11.4 MB"), "label: {}", b.label);
+        // Stream path: the average kind renders ≈.
+        let stream = crate::media::StreamInfo {
+            kind: crate::media::StreamKind::Hls,
+            title: "clip".into(),
+            duration_secs: Some(600),
+            manifest_url: "https://example.com/master.m3u8".into(),
+            segment_count: None,
+            formats: vec![crate::media::StreamFormat {
+                id: "https://example.com/v.m3u8".into(),
+                ext: "ts".into(),
+                is_video: true,
+                is_audio: true,
+                height: Some(576),
+                width: Some(768),
+                abr_kbps: None,
+                vbr_kbps: Some(8060.0),
+                fps: None,
+                filesize: Some(136_500_000),
+                size_kind: Some(crate::media::SizeKind::Average),
+                needs_merge: false,
+            }],
+        };
+        let media = stream_info_to_media_info(&stream);
+        assert_eq!(
+            media.formats[0].size_kind,
+            Some(crate::media::SizeKind::Average)
+        );
+        assert!(
+            media.formats[0].label.contains("≈130 MB"),
+            "label: {}",
+            media.formats[0].label
+        );
+    }
+
+    #[test]
+    fn plan_from_info_carries_size_kind() {
+        // Round 11, item 10: the plan total's kind — exact when
+        // the chosen format reports a filesize, peak when the
+        // total falls back to bitrate × duration, and
+        // worst-kind-wins when a merge adds an estimated audio.
+        let info = parse_media_info(&multilang_json(), "https://example.com").unwrap();
+        // 2637: video-only, no filesize, vbr 3000 → peak fallback;
+        // the audio is exact (filesize) → the merged kind is Peak.
+        let plan = plan_from_info(&info, Some("2637"), None).unwrap();
+        assert_eq!(plan.size_kind, Some(crate::media::SizeKind::Peak));
+        assert!(plan.total_bytes.is_some());
+        // An audio-only format with a filesize plans exact.
+        let plan = plan_from_info(&info, Some("a-en-m4a"), None).unwrap();
+        assert_eq!(plan.size_kind, Some(crate::media::SizeKind::Exact));
+    }
+
+    #[test]
     fn format_selector_multi_keeps_one_audio_per_language() {
         // Round 10, item 3: three tagged languages → the first
         // branch names the best audio of each (en picks the m4a
@@ -3295,6 +3529,7 @@ mod tests {
                 vbr_kbps: Some(2800.0),
                 fps: Some(30.0),
                 filesize: None,
+                size_kind: None,
                 needs_merge: false,
             }],
         };
@@ -3538,6 +3773,7 @@ exit 0
                     vbr_kbps: Some(800.0),
                     fps: None,
                     filesize: None,
+                    size_kind: None,
                     needs_merge: false,
                 },
                 StreamFormat {
@@ -3551,6 +3787,7 @@ exit 0
                     vbr_kbps: Some(6000.0),
                     fps: Some(60.0),
                     filesize: None,
+                    size_kind: None,
                     needs_merge: true,
                 },
                 StreamFormat {
@@ -3564,6 +3801,7 @@ exit 0
                     vbr_kbps: Some(2800.0),
                     fps: Some(30.0),
                     filesize: None,
+                    size_kind: None,
                     needs_merge: false,
                 },
             ],
@@ -3667,6 +3905,79 @@ exit 0
     }
 
     #[test]
+    fn list_formats_with_referer_sends_referer_header() {
+        // Round 11, item 5: the formats listing carries the page
+        // referer to the manifest fetch — vidrift-class hosts
+        // 403 without it. The local server records the Referer
+        // header on every request (master + default variant).
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen2 = seen.clone();
+        let stop2 = stop.clone();
+        let server = std::thread::spawn(move || loop {
+            if stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let referer = req
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("referer:"))
+                        .map(|l| {
+                            l.splitn(2, ':').nth(1).unwrap_or("").trim().to_string()
+                        });
+                    seen2.lock().unwrap().push(referer.unwrap_or_default());
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let body = match path {
+                        "/master.m3u8" => TEST_MASTER.as_bytes(),
+                        _ => TEST_MEDIA.as_bytes(),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body);
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        });
+        let dir = std::env::temp_dir().join("fetchforge-test-hls-referer");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let info = list_formats_with_referer(
+            &dir,
+            &format!("http://127.0.0.1:{port}/master.m3u8"),
+            Some("https://flixmovie.st/watch/movie-the-odyssey".to_string()),
+        )
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(info.extractor, "HLS");
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "no requests recorded");
+        assert!(
+            seen.iter()
+                .all(|r| r == "https://flixmovie.st/watch/movie-the-odyssey"),
+            "every manifest fetch must carry the referer: {seen:?}"
+        );
+    }
+
+    #[test]
     fn plan_stream_download_picks_default_and_explicit_format() {
         let mut files = std::collections::HashMap::new();
         files.insert("/master.m3u8".to_string(), TEST_MASTER.as_bytes().to_vec());
@@ -3739,6 +4050,23 @@ exit 0
         assert_eq!(stem_for_title(""), "download");
         assert_eq!(stem_for_title("(1)"), "download");
         assert_eq!(stem_for_title("The Odyssey"), "The Odyssey");
+    }
+
+    #[test]
+    fn stem_for_title_returns_video_for_hash_like_titles() {
+        // Round 11, item 13: novahd's yt-dlp title for an
+        // extensionless playlist URL is the URL's hash segment —
+        // a long token that names no film. Short single-word
+        // titles and dotted release names are not hash-like.
+        assert_eq!(
+            stem_for_title("0BGHIHfw0FTI-dNbLxEad3TYSrs97iR2W7IUCXXIJQ55hG38"),
+            "video"
+        );
+        assert_eq!(stem_for_title("Inception"), "Inception");
+        assert_eq!(
+            stem_for_title("The.Odyssey.2026.1080p.WEB-DL"),
+            "The.Odyssey.2026.1080p"
+        );
     }
 
     #[test]

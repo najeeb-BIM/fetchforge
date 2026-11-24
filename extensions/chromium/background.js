@@ -185,7 +185,7 @@ async function sendDownload(url, filename, referer, audioUrl, formatId, manifest
 // shows an error state; a plain throw (bridge-<status>) means the
 // bridge answered but the listing failed, and the popup shows its
 // degraded single-quality rows instead.
-async function getFormats(url) {
+async function getFormats(url, referer) {
   const token = await getToken();
   if (!token) { const e = new Error("no-token"); e.unreachable = true; throw e; }
   let verified;
@@ -197,10 +197,15 @@ async function getFormats(url) {
   if (!verified) { const e = new Error("challenge-failed"); e.unreachable = true; throw e; }
   let r;
   try {
+    // Round 11, item 5: the page referer goes with the request —
+    // the bridge forwards it when it fetches the manifest, and
+    // vidrift-class hosts 403 a manifest fetch without it.
+    const body = { url };
+    if (referer) body.referer = referer;
     r = await fetch(BRIDGE + "/media/formats", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-FetchForge-Token": token },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify(body),
     });
   } catch (_) {
     const e = new Error("bridge unreachable"); e.unreachable = true; throw e;
@@ -717,7 +722,12 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // error state only when the bridge could not be reached at
     // all, and degraded rows otherwise — never a silent send.
     if (!_sender || !_sender.tab) { sendResponse({ ok: false, error: "No tab" }); return false; }
-    getFormats(msg.url).then((j) => sendResponse(Object.assign({ ok: true }, j)))
+    // Round 11, item 5: the content script sends the verdict's
+    // referer (the page the stream came from); the sender's tab
+    // URL is the fallback when it does not. The bridge forwards
+    // it as the Referer header on the manifest fetch.
+    const fmtReferer = msg.referer || (_sender && _sender.url) || (_sender.tab && _sender.tab.url) || undefined;
+    getFormats(msg.url, fmtReferer).then((j) => sendResponse(Object.assign({ ok: true }, j)))
       .catch((e) => sendResponse({ ok: false, error: (e && e.message) || "formats failed", unreachable: !!(e && e.unreachable), reason: (e && e.reason) || "" }));
     return true;
   }

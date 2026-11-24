@@ -26,8 +26,8 @@ pub use category::category_for_filename;
 pub use download::{download, probe, stop_reason, DownloadOptions, Probe, Progress, StopReason};
 pub use extract::{
     download_media, drive_direct_url, drive_file_id, ensure_ytdlp, find_ytdlp, format_selector,
-    format_selector_multi, list_formats, list_formats_with, parse_media_info,
-    plan_media_download, plan_media_download_or_drive_fallback, FormatKind,
+    format_selector_multi, list_formats, list_formats_with, list_formats_with_referer,
+    parse_media_info, plan_media_download, plan_media_download_or_drive_fallback, FormatKind,
     MediaDownloadOptions, MediaFormat, MediaInfo, MediaPlan, PlanOutcome,
 };
 pub use ffmpeg::{
@@ -44,7 +44,7 @@ pub use media::{
     download_hls_audio_only, download_hls_pair, download_hls_variant, estimate_total_bytes,
     is_manifest_url, list_stream_formats, list_stream_formats_kind, sniff_stream_kind,
     stream_kind_of_content_type, stream_kind_of_url, CapturedManifest, DashDownloadOptions,
-    StreamKind, MAX_CAPTURED_MANIFEST_BYTES,
+    SizeKind, StreamKind, MAX_CAPTURED_MANIFEST_BYTES,
 };
 pub use threed::{
     download_gltf_bundle, fetch_gltf_plan, gltf_dependency_uris, is_gltf_url, is_model_url,

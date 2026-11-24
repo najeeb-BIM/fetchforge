@@ -3,7 +3,7 @@
 // ranking (item 8), formats dedupe (item 10), junk-title
 // auto-fill (item 11), formats-failure reasons (item 12),
 // browser identity for the paired count (item 15), and the
-// 0.2.9 manifest + chromium/firefox byte-identity checks.
+// 0.2.10 manifest + chromium/firefox byte-identity checks.
 // Every function under test is the exact source extracted from
 // extensions/chromium/content.js / background.js — see extract.js.
 "use strict";
@@ -30,7 +30,7 @@ const ctxA = makeContext(
     + "function findPlaylistFromResources() { return null; }\n"
     + "function findStreamUrlFromResources() { return null; }\n",
     extractConst(contentSrc, "STREAM_EXT_RE", 2) + "\n",
-    extractMany(contentSrc, ["qualityHintScore", "mediaSource", "resolveUrl", "pageTitleStem", "pageNameHint", "isJunkTitle", "sanitizeFilenameStem", "popupDefaultName", "stemOfFilename", "sortFormatsForPopup"], 2),
+    extractMany(contentSrc, ["qualityHintScore", "mediaSource", "sameDirectoryEncodes", "resolveUrl", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "sanitizeFilenameStem", "popupDefaultName", "stemOfFilename", "sortFormatsForPopup"], 2),
   ]
 );
 function setDocA(title, qs) {
@@ -117,14 +117,24 @@ test("Item 8: without a playing source, the best-ranked encode wins (Archive sha
     "https://archive.org/download/Night.Of.The.Living.Dead_1080p/NightOfTheLivingDead_1080p_512kb.mp4",
     "https://archive.org/download/Night.Of.The.Living.Dead_1080p/NightOfTheLivingDead_1080p.mp4",
   ]);
-  // Neither URL carries a height hint, so document order stands —
-  // but with a hinted pair the best encode must win:
+  // Round 11, item 4: hints are read from the filename only, so
+  // the 512kb file scores 512 (its "1080p" is followed by "_",
+  // no word boundary) and the plain 1080p file scores 11080 —
+  // the better encode wins. (Under round 10's full-URL scoring
+  // both tied at 11080 on the directory's "1080p" and document
+  // order stood, keeping the worse 512kb file.)
   const ranked = pickSource("", [
     "https://example.com/film_512kb.mp4",
     "https://example.com/film_1080p.mp4",
   ]);
   assertEq(ranked, "https://example.com/film_1080p.mp4", "1080p beats the first-listed 512kb");
-  assertEq(url, "https://archive.org/download/Night.Of.The.Living.Dead_1080p/NightOfTheLivingDead_1080p_512kb.mp4", "hint-less URLs keep document order");
+  assertEq(url, "https://archive.org/download/Night.Of.The.Living.Dead_1080p/NightOfTheLivingDead_1080p.mp4", "the better Archive encode wins");
+  // Genuinely hint-less URLs keep document order.
+  const plain = pickSource("", [
+    "https://example.com/a.mp4",
+    "https://example.com/b.mp4",
+  ]);
+  assertEq(plain, "https://example.com/a.mp4", "hint-less URLs keep document order");
 });
 
 test("Item 8: the playing source always wins; a blob currentSrc does not count", () => {
@@ -154,14 +164,20 @@ test("Item 10: sortFormatsForPopup dedupes by format id, first occurrence wins",
   assertEq(out[2].format_id, "140", "audio last");
 });
 
-test("Item 10: sortFormatsForPopup dedupes id-less rows by label + kind", () => {
+test("Item 10 (round 11): sortFormatsForPopup dedupes measured rows by visible identity; measurement-less rows stay", () => {
   ctxA.formats = [
+    // The same stream under two ids (YouTube 140 / 140-drc):
+    // identical label + kind + bitrate + size collapses.
+    { label: "Audio only", kind: "audio_only", abr: 128, filesize: 10000000, format_id: "140" },
+    { label: "Audio only", kind: "audio_only", abr: 128, filesize: 10000000, format_id: "140-drc" },
+    { label: "Audio only", kind: "combined", abr: 128, filesize: 10000000 },
+    // No measurement at all: too thin to prove identical
+    // (YouTube HLS 233/234 shape) — both survive.
     { label: "Audio only", kind: "audio_only" },
     { label: "Audio only", kind: "audio_only" },
-    { label: "Audio only", kind: "combined" },
   ];
   const out = runIn(ctxA, "sortFormatsForPopup(formats)");
-  assertEq(out.length, 2, "same label + same kind collapses; different kind stays");
+  assertEq(out.length, 4, "140/140-drc collapse; different kind stays; measurement-less pair stays");
 });
 
 // ---------- Context B: sendCurrentDownload + pickAndSend (items 5/7) ----------
@@ -183,7 +199,7 @@ const ctxB = makeContext(
   [
     "let popupOpen = false;\nlet popupRows = [];\nlet popupRequestId = 0;\nlet floatOverlay = null;\n"
     + "globalThis.__popupOpen = function () { return popupOpen; };\n",
-    extractMany(contentSrc, ["sendCurrentDownload", "pickAndSend", "showPopupSendError", "closeQualityPopup", "currentPopupFilename", "defaultFilenameFor", "pageTitleStem", "pageNameHint", "isJunkTitle", "stemOfFilename", "sanitizeFilenameStem", "isManifestUrl", "shortFailureReason"], 2),
+    extractMany(contentSrc, ["sendCurrentDownload", "pickAndSend", "showPopupSendError", "closeQualityPopup", "currentPopupFilename", "defaultFilenameFor", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename", "sanitizeFilenameStem", "isManifestUrl", "shortFailureReason"], 2),
   ]
 );
 function makeOverlayB(filename) {
@@ -294,7 +310,7 @@ const ctxC = makeContext(
     + "function openFormatsPopup(btn, dl) { __calls.formats.push({ btn: btn, dl: dl }); popupOpen = true; }\n"
     + "function openSimplePopup(btn, dl) { __calls.simple.push({ btn: btn, dl: dl }); popupOpen = true; }\n"
     + "function sendCurrentDownload(btn, dl, opts) { __calls.send.push({ btn: btn, dl: dl, opts: opts }); }\n",
-    extractMany(contentSrc, ["onOverlayClick", "parseHlsMaster", "parseHlsAttrs", "resolveAgainst", "friendlyCodec", "formatBandwidth", "hlsVariantHeight", "probeDirectFileDuration", "parseMp4Duration", "isManifestUrl", "isDashUrl", "isMp4FamilyUrl", "isVideoFileUrl"], 2),
+    extractMany(contentSrc, ["onOverlayClick", "parseHlsMaster", "parseHlsAttrs", "resolveAgainst", "friendlyCodec", "formatBandwidth", "hlsVariantHeight", "probeDirectFileDuration", "parseMp4Duration", "isManifestUrl", "isDashUrl", "isMp4FamilyUrl", "isVideoFileUrl", "isOneClickFileUrl"], 2),
   ]
 );
 function clickC(dl) {
@@ -314,7 +330,7 @@ test("Item 1: an observed extensionless playlist opens the formats popup, never 
   assertEq(calls.simple.length, 0);
 });
 
-test("Item 1: a file-kind verdict keeps the one-click send; a master still wins over kind", async () => {
+test("Item 1: a named file-kind verdict (image) keeps the one-click send; a master still wins over kind", async () => {
   const file = clickC({ url: "https://example.com/photo.jpg", filename: "photo.jpg", kind: "file" });
   await tick();
   assertEq(file.send.length, 1, "a file verdict still one-click sends");
@@ -492,10 +508,10 @@ test("Item 15: getBrowserId is stable across calls and stored once", async () =>
 });
 
 // ---------- Manifests + byte identity ----------
-test("Manifests are at 0.2.9 in both browsers", () => {
+test("Manifests are at 0.2.10 in both browsers", () => {
   for (const name of ["chromium", "firefox"]) {
     const m = JSON.parse(readSource("extensions/" + name + "/manifest.json"));
-    assertEq(m.version, "0.2.9", name + " version");
+    assertEq(m.version, "0.2.10", name + " version");
   }
 });
 

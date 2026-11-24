@@ -1321,7 +1321,7 @@
     btn.disabled = true;
     btn.textContent = "Sending…";
     btn.title = "";
-    return sendRuntimeMessage({ type: "downloadMedia", url: url, filename: filename, audioUrl: audioUrl, referer: dl.referer, formatId: opts.formatId, manifestText: manifestText, audioOnly: audioOnly }).then(function (resp) {
+    return sendRuntimeMessage({ type: "downloadMedia", url: url, filename: filename, audioUrl: audioUrl, referer: dl.referer, formatId: opts.formatId, manifestText: manifestText, audioOnly: audioOnly, audioLang: opts.audioLang, subtitleLangs: opts.subtitleLangs, audioFormat: opts.audioFormat }).then(function (resp) {
       if (resp && resp.duplicate) {
         // Nothing new was queued: the file is already in the
         // app's downloads. Say so honestly — "Sent" would be a
@@ -1378,6 +1378,14 @@
   function pickAndSend(btn, dl, opts) {
     opts = opts || {};
     if (!("filename" in opts) || !opts.filename) opts.filename = currentPopupFilename();
+    // Round 11 extension, features 2/4/13: the popup-chrome
+    // option selects apply to every pick. A row's own audio
+    // language (an audio-only row for one rendition) wins over
+    // the select's value — the row IS that language's track.
+    const popupOpts = currentPopupOptions(!!opts.audioOnly);
+    if (!opts.audioLang && popupOpts.audioLang) opts.audioLang = popupOpts.audioLang;
+    if ((!opts.subtitleLangs || !opts.subtitleLangs.length) && popupOpts.subtitleLangs) opts.subtitleLangs = popupOpts.subtitleLangs;
+    if (!opts.audioFormat && popupOpts.audioFormat) opts.audioFormat = popupOpts.audioFormat;
     const p = sendCurrentDownload(btn, dl, opts);
     if (p && p.then) {
       p.then(function (resp) {
@@ -1502,12 +1510,19 @@
   // 1080 or higher, then 720, then 480, then lower), plus
   // audio-only rows from EXT-X-MEDIA audio groups. The top row is
   // the highest variant, labelled "Best" and pre-selected.
-  // Returns { rows: [{ label, url, audioUrl?, audioOnly?, selected }], hasAudioRows }
+  // Returns { rows: [{ label, url, audioUrl?, audioGroup?, audioLang?, audioOnly?, selected }], hasAudioRows,
+  //   audioGroups: { GROUP-ID -> [{ uri, name, language }] }, audioLanguages: [...], subtitleLanguages: [...] }
   // or null when the text is not a master playlist (no
   // #EXT-X-STREAM-INF). Relative variant URIs resolve against the
   // master URL. hasAudioRows says whether any audio-only row was
   // added: when false the audio is muxed into the variants, and
   // the popup offers an "Audio only" row for the best variant.
+  // Round 11 extension, feature 4: ALL audio renditions of a
+  // group are kept (novahd carries 7 tracks in one group; keeping
+  // only the first collapsed them to one). audioLanguages is the
+  // distinct LANGUAGE (else NAME) tags across all renditions,
+  // for the popup's audio-language select; subtitleLanguages
+  // likewise from EXT-X-MEDIA TYPE=SUBTITLES.
   function parseHlsAttrs(s) {
     const out = {};
     const re = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/g;
@@ -1546,17 +1561,26 @@
   }
   function parseHlsMaster(text, masterUrl) {
     const lines = String(text || "").split(/\r?\n/);
-    const audioGroups = {}; // GROUP-ID -> { uri, name }
+    // GROUP-ID -> [{ uri, name, language }]: EVERY rendition is
+    // kept (round 11 extension, feature 4) — a group with 7
+    // audio tracks (novahd) keeps all 7, and the popup's
+    // language select resolves the chosen one at pick time.
+    const audioGroups = {};
+    const subtitleGroups = {};
     const variants = [];
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
       if (line.indexOf("#EXT-X-MEDIA:") === 0) {
         const attrs = parseHlsAttrs(line.slice("#EXT-X-MEDIA:".length));
-        if ((attrs.TYPE || "").toUpperCase() === "AUDIO" && attrs["GROUP-ID"] && !audioGroups[attrs["GROUP-ID"]]) {
-          audioGroups[attrs["GROUP-ID"]] = {
+        const type = (attrs.TYPE || "").toUpperCase();
+        const gid = attrs["GROUP-ID"];
+        if (gid && (type === "AUDIO" || type === "SUBTITLES")) {
+          const groups = type === "AUDIO" ? audioGroups : subtitleGroups;
+          (groups[gid] = groups[gid] || []).push({
             uri: attrs.URI ? resolveAgainst(attrs.URI, masterUrl) : null,
-            name: attrs.NAME || attrs.LANGUAGE || "",
-          };
+            name: attrs.NAME || "",
+            language: attrs.LANGUAGE || "",
+          });
         }
       } else if (line.indexOf("#EXT-X-STREAM-INF:") === 0) {
         const attrs = parseHlsAttrs(line.slice("#EXT-X-STREAM-INF:".length));
@@ -1602,26 +1626,50 @@
       // group the audio is muxed into the variant itself. The
       // master text is authoritative here — the timing-log sibling
       // (dl.audioUrl) belongs to the download URL, not necessarily
-      // to this variant.
+      // to this variant. The DEFAULT sibling is the group's first
+      // rendition; the popup's language select overrides it at
+      // pick time (openHlsPopup resolves the chosen language
+      // against audioGroups, kept on the returned object).
       let audioUrl;
       const groupId = v.attrs.AUDIO;
-      if (groupId && audioGroups[groupId] && audioGroups[groupId].uri) audioUrl = audioGroups[groupId].uri;
-      rows.push({ label: label, url: v.url, audioUrl: audioUrl, selected: idx === 0 });
+      if (groupId && audioGroups[groupId] && audioGroups[groupId][0] && audioGroups[groupId][0].uri) audioUrl = audioGroups[groupId][0].uri;
+      rows.push({ label: label, url: v.url, audioUrl: audioUrl, audioGroup: groupId || null, selected: idx === 0 });
     });
-    // Audio-only rows, one per audio group with a downloadable URI.
-    // A group without a URI has its audio embedded in the variants
-    // and offers nothing to download separately. audioOnly marks
-    // the row so the popup sends it with the audio-only flag —
-    // without it the audio playlist would download as a video file.
+    // Audio-only rows, one per audio rendition with a
+    // downloadable URI. A rendition without a URI has its audio
+    // embedded in the variants and offers nothing to download
+    // separately. audioOnly marks the row so the popup sends it
+    // with the audio-only flag — without it the audio playlist
+    // would download as a video file. audioLang names the
+    // rendition's language (LANGUAGE, else NAME) so the pick
+    // carries it even when the language select says otherwise.
     let hasAudioRows = false;
     Object.keys(audioGroups).forEach(function (gid) {
-      const g = audioGroups[gid];
-      if (!g.uri || seenUrls.has(g.uri)) return;
-      seenUrls.add(g.uri);
-      hasAudioRows = true;
-      rows.push({ label: "Audio only" + (g.name ? " · " + g.name : ""), url: g.uri, audioUrl: undefined, audioOnly: true, selected: false });
+      audioGroups[gid].forEach(function (g) {
+        if (!g.uri || seenUrls.has(g.uri)) return;
+        seenUrls.add(g.uri);
+        hasAudioRows = true;
+        rows.push({ label: "Audio only" + ((g.name || g.language) ? " · " + (g.name || g.language) : ""), url: g.uri, audioUrl: undefined, audioOnly: true, audioLang: g.language || g.name || undefined, selected: false });
+      });
     });
-    return { rows: rows, hasAudioRows: hasAudioRows };
+    // Distinct languages across all renditions, for the popup's
+    // selects. LANGUAGE wins over NAME, matching the engine's
+    // rendition_language (media.rs).
+    const audioLanguages = [];
+    Object.keys(audioGroups).forEach(function (gid) {
+      audioGroups[gid].forEach(function (g) {
+        const lang = g.language || g.name;
+        if (lang && audioLanguages.indexOf(lang) === -1) audioLanguages.push(lang);
+      });
+    });
+    const subtitleLanguages = [];
+    Object.keys(subtitleGroups).forEach(function (gid) {
+      subtitleGroups[gid].forEach(function (g) {
+        const lang = g.language || g.name;
+        if (lang && subtitleLanguages.indexOf(lang) === -1) subtitleLanguages.push(lang);
+      });
+    });
+    return { rows: rows, hasAudioRows: hasAudioRows, audioGroups: audioGroups, audioLanguages: audioLanguages, subtitleLanguages: subtitleLanguages };
   }
 
   // ---- IDM-style quality popup (round 6, study C1–C3) ----
@@ -1669,11 +1717,75 @@
     // the user already typed their own name (dirty flag).
     popupFilenameDirty = false;
     if (floatOverlay.filenameInput) floatOverlay.filenameInput.value = defaultName || "download";
+    // The option selects are hidden on every open; the opener
+    // configures them (configurePopupOptions) once the choices
+    // are known. A popup that never configures them shows none.
+    if (floatOverlay.langRow) floatOverlay.langRow.style.display = "none";
+    if (floatOverlay.subRow) floatOverlay.subRow.style.display = "none";
+    if (floatOverlay.fmtRow) floatOverlay.fmtRow.style.display = "none";
     floatOverlay.popupBody.textContent = "";
     popupRows = [];
     floatOverlay.popup.style.display = "flex";
     popupOpen = true;
     return true;
+  }
+  // Configures the popup-chrome option selects for the open
+  // popup (round 11 extension, features 2/4/13): audio language
+  // (only when several tracks exist), subtitles (only when the
+  // stream offers any), and the audio format (only when the
+  // popup offers an audio-only row — the format applies to an
+  // audio send, never to a video pick).
+  function configurePopupOptions(opts) {
+    if (!floatOverlay) return;
+    opts = opts || {};
+    const langs = opts.audioLanguages || [];
+    if (langs.length > 1) {
+      floatOverlay.langSelect.textContent = "";
+      const def = document.createElement("option");
+      def.value = ""; def.textContent = "Default";
+      floatOverlay.langSelect.appendChild(def);
+      langs.forEach(function (l) {
+        const o = document.createElement("option");
+        o.value = l; o.textContent = l;
+        floatOverlay.langSelect.appendChild(o);
+      });
+      floatOverlay.langRow.style.display = "flex";
+    } else {
+      floatOverlay.langRow.style.display = "none";
+    }
+    const subs = opts.subtitleLanguages || [];
+    if (subs.length) {
+      floatOverlay.subList.textContent = "";
+      subs.forEach(function (l) {
+        const label = document.createElement("label");
+        label.style.cssText = "display:flex;gap:3px;align-items:center;font-size:12px;color:#e5e7eb;cursor:pointer;";
+        const cb = document.createElement("input");
+        cb.type = "checkbox"; cb.value = l;
+        cb.style.cssText = "accent-color:#22c55e;margin:0;";
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(l));
+        floatOverlay.subList.appendChild(label);
+      });
+      floatOverlay.subRow.style.display = "flex";
+    } else {
+      floatOverlay.subRow.style.display = "none";
+    }
+    floatOverlay.fmtRow.style.display = opts.showAudioFormat ? "flex" : "none";
+  }
+  // The current option values, read at pick time. The audio
+  // format applies only to an audio-only send — a video pick
+  // drops it even when the select is visible.
+  function currentPopupOptions(audioOnly) {
+    const out = {};
+    if (floatOverlay && floatOverlay.langSelect && floatOverlay.langSelect.value) out.audioLang = floatOverlay.langSelect.value;
+    if (floatOverlay && floatOverlay.subList) {
+      const checked = floatOverlay.subList.querySelectorAll("input:checked");
+      const langs = [];
+      for (let i = 0; i < checked.length; i++) langs.push(checked[i].value);
+      if (langs.length) out.subtitleLangs = langs;
+    }
+    if (audioOnly && floatOverlay && floatOverlay.fmtSelect && floatOverlay.fmtSelect.value) out.audioFormat = floatOverlay.fmtSelect.value;
+    return out;
   }
   function addQualityRow(label, selected, pick) {
     const idx = popupRows.length;
@@ -1702,9 +1814,28 @@
   }
   function openHlsPopup(btn, dl, parsed) {
     if (!openQualityPopup("Choose quality", null, popupDefaultName(dl, null))) return;
+    // Round 11 extension, features 2/4/13: the language select
+    // (when the master carries several audio tracks), the
+    // subtitle checkboxes, and the audio-format select (this
+    // popup always offers an audio-only row).
+    configurePopupOptions({ audioLanguages: parsed.audioLanguages, subtitleLanguages: parsed.subtitleLanguages, showAudioFormat: true });
     parsed.rows.forEach(function (r) {
       addQualityRow(r.label, !!r.selected, function () {
-        pickAndSend(btn, dl, { url: r.url, audioUrl: r.audioUrl, manifestText: capturedTextFor(r.url), audioOnly: !!r.audioOnly });
+        // The audio-language select overrides the variant's
+        // default audio sibling: resolve the rendition for the
+        // chosen language in this variant's AUDIO group. No
+        // match keeps the default sibling (the engine falls
+        // back the same way). An audio-only row carries its
+        // own language (r.audioLang) and ignores the select.
+        let audioUrl = r.audioUrl;
+        const lang = floatOverlay && floatOverlay.langSelect ? floatOverlay.langSelect.value : "";
+        if (lang && r.audioGroup && parsed.audioGroups && parsed.audioGroups[r.audioGroup]) {
+          const renditions = parsed.audioGroups[r.audioGroup];
+          for (let i = 0; i < renditions.length; i++) {
+            if ((renditions[i].language || renditions[i].name) === lang && renditions[i].uri) { audioUrl = renditions[i].uri; break; }
+          }
+        }
+        pickAndSend(btn, dl, { url: r.url, audioUrl: audioUrl, manifestText: capturedTextFor(r.url), audioOnly: !!r.audioOnly, audioLang: r.audioLang });
       });
     });
     // Muxed master (no separate audio track to pick): offer the
@@ -1723,6 +1854,10 @@
   // sees the video choice and the audio choice.
   function openSimplePopup(btn, dl) {
     if (!openQualityPopup("Choose quality", null, popupDefaultName(dl, null))) return;
+    // Round 11 extension, feature 13: the audio-format select —
+    // this popup always offers an Audio only row. No language or
+    // subtitle choices: a single-variant stream carries none.
+    configurePopupOptions({ showAudioFormat: true });
     // The one known quality: the container when the URL names one.
     const m = /\.([a-z0-9]+)([?#]|$)/i.exec(dl.url || "");
     const container = m ? m[1].toUpperCase() : "";
@@ -1822,6 +1957,9 @@
           pickAndSend(btn, dl, { audioOnly: true });
         });
       }
+      // The degraded popup knows no languages or subtitles — but
+      // its DASH audio row still gets the format select.
+      configurePopupOptions({ showAudioFormat: isDashUrl(dl.url) });
     }
     function showUnreachableError() {
       if (reqId !== popupRequestId) return;
@@ -1874,6 +2012,15 @@
       floatOverlay.popupBody.textContent = "";
       popupRows = [];
       let anySelected = false;
+      // Round 11 extension, features 2/4/13: the formats
+      // response carries the page's audio languages and
+      // subtitle languages; the audio-format select shows when
+      // any format is audio-only.
+      configurePopupOptions({
+        audioLanguages: resp.audio_languages || [],
+        subtitleLanguages: resp.subtitle_langs || [],
+        showAudioFormat: resp.formats.some(function (f) { return f.kind === "audio_only"; }),
+      });
       // A single format ALSO shows the popup now (round 8): the
       // one row plus the filename field, no silent send.
       sortFormatsForPopup(resp.formats).forEach(function (f) {
@@ -2028,12 +2175,56 @@
     const popupNameNote = document.createElement("div");
     popupNameNote.textContent = "The file type (.mp4, .m4a, …) is added automatically.";
     popupNameNote.style.cssText = "font-size:11px;color:#6b7280;padding:4px 12px 0;flex:none;";
+    // Option selects (round 11 extension, features 2/4/13):
+    // part of the popup chrome, like the filename field, so a
+    // rows refresh never wipes them. Each row starts hidden;
+    // configurePopupOptions shows the ones that apply to the
+    // open popup, and a row pick reads the current values at
+    // click time.
+    const popupOptions = document.createElement("div");
+    popupOptions.style.cssText = "padding:8px 12px 0;flex:none;display:flex;flex-direction:column;gap:6px;";
+    const popupLangRow = document.createElement("div");
+    popupLangRow.style.cssText = "display:none;align-items:center;gap:8px;";
+    const popupLangLabel = document.createElement("span");
+    popupLangLabel.textContent = "Audio";
+    popupLangLabel.style.cssText = "font-size:11px;color:#9ca3af;flex:none;";
+    const popupLangSelect = document.createElement("select");
+    popupLangSelect.style.cssText = "flex:1;background:#1f2937;color:#f9fafb;border:1px solid rgba(255,255,255,.14);border-radius:6px;padding:5px 6px;font:400 12px system-ui,sans-serif;outline:none;";
+    popupLangRow.appendChild(popupLangLabel);
+    popupLangRow.appendChild(popupLangSelect);
+    const popupSubRow = document.createElement("div");
+    popupSubRow.style.cssText = "display:none;align-items:flex-start;gap:8px;";
+    const popupSubLabel = document.createElement("span");
+    popupSubLabel.textContent = "Subtitles";
+    popupSubLabel.style.cssText = "font-size:11px;color:#9ca3af;flex:none;padding-top:2px;";
+    const popupSubList = document.createElement("span");
+    popupSubList.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;";
+    popupSubRow.appendChild(popupSubLabel);
+    popupSubRow.appendChild(popupSubList);
+    const popupFmtRow = document.createElement("div");
+    popupFmtRow.style.cssText = "display:none;align-items:center;gap:8px;";
+    const popupFmtLabel = document.createElement("span");
+    popupFmtLabel.textContent = "Audio format";
+    popupFmtLabel.style.cssText = "font-size:11px;color:#9ca3af;flex:none;";
+    const popupFmtSelect = document.createElement("select");
+    popupFmtSelect.style.cssText = "flex:1;background:#1f2937;color:#f9fafb;border:1px solid rgba(255,255,255,.14);border-radius:6px;padding:5px 6px;font:400 12px system-ui,sans-serif;outline:none;";
+    ["m4a", "mp3", "opus"].forEach(function (f) {
+      const o = document.createElement("option");
+      o.value = f; o.textContent = f.toUpperCase();
+      popupFmtSelect.appendChild(o);
+    });
+    popupFmtRow.appendChild(popupFmtLabel);
+    popupFmtRow.appendChild(popupFmtSelect);
+    popupOptions.appendChild(popupLangRow);
+    popupOptions.appendChild(popupSubRow);
+    popupOptions.appendChild(popupFmtRow);
     const popupBody = document.createElement("div");
     popupBody.style.cssText = "overflow-y:auto;padding:6px;max-height:260px;";
     popup.appendChild(popupHeader);
     popup.appendChild(popupSubtitle);
     popup.appendChild(popupNameRow);
     popup.appendChild(popupNameNote);
+    popup.appendChild(popupOptions);
     popup.appendChild(popupBody);
     // Fallback for the capture-phase shield (which dispatches
     // popup clicks directly and swallows the event before it
@@ -2045,7 +2236,7 @@
     });
     shadow.appendChild(popup);
     (document.body || document.documentElement).appendChild(host);
-    return { host: host, button: btn, popover: isPopover, popup: popup, popupTitle: popupTitle, popupSubtitle: popupSubtitle, popupBody: popupBody, filenameInput: popupNameInput };
+    return { host: host, button: btn, popover: isPopover, popup: popup, popupTitle: popupTitle, popupSubtitle: popupSubtitle, popupBody: popupBody, filenameInput: popupNameInput, langRow: popupLangRow, langSelect: popupLangSelect, subRow: popupSubRow, subList: popupSubList, fmtRow: popupFmtRow, fmtSelect: popupFmtSelect };
   }
 
   // Show or hide the floating button from the current state.

@@ -199,7 +199,7 @@ const ctxB = makeContext(
   [
     "let popupOpen = false;\nlet popupRows = [];\nlet popupRequestId = 0;\nlet floatOverlay = null;\n"
     + "globalThis.__popupOpen = function () { return popupOpen; };\n",
-    extractMany(contentSrc, ["sendCurrentDownload", "pickAndSend", "showPopupSendError", "closeQualityPopup", "currentPopupFilename", "defaultFilenameFor", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename", "sanitizeFilenameStem", "isManifestUrl", "shortFailureReason"], 2),
+    extractMany(contentSrc, ["sendCurrentDownload", "pickAndSend", "showPopupSendError", "closeQualityPopup", "currentPopupOptions", "currentPopupFilename", "defaultFilenameFor", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename", "sanitizeFilenameStem", "isManifestUrl", "shortFailureReason"], 2),
   ]
 );
 function makeOverlayB(filename) {

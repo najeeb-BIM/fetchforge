@@ -73,12 +73,22 @@ pub struct GltfPlan {
     pub total_bytes: Option<u64>,
 }
 
-fn http_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
+/// Build the glTF HTTP client, optionally through the
+/// user-configured proxy (round 11 extension, feature 10).
+/// Never logged — it may contain credentials.
+fn http_client_with_proxy(proxy: Option<&str>) -> Result<reqwest::blocking::Client, String> {
+    let mut builder = reqwest::blocking::Client::builder()
         .user_agent("FetchForge/0.2")
         .timeout(Duration::from_secs(120))
         .connect_timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::limited(10));
+    if let Some(p) = proxy {
+        builder = builder.proxy(
+            reqwest::Proxy::all(p)
+                .map_err(|_| "The configured proxy could not be used.".to_string())?,
+        );
+    }
+    builder
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
 }
@@ -87,7 +97,8 @@ fn http_error(code: u16) -> String {
     match code {
         400 => "Server rejected the request (400)".to_string(),
         401 | 403 => {
-            "Access denied by the server (401/403). The model may need sign-in or may be protected.".to_string()
+            "Access denied by the server (401/403). The model may need sign-in or may be protected."
+                .to_string()
         }
         404 => "File not found on the server (404)".to_string(),
         429 => "Server rate-limited the request (429). Retry later.".to_string(),
@@ -100,8 +111,8 @@ fn http_error(code: u16) -> String {
 /// and `images[].uri`. Entries without a `uri` are embedded in the file
 /// (buffer views) and need no download.
 pub fn gltf_dependency_uris(json: &str) -> Result<Vec<String>, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|_| "not a valid glTF model file (the JSON could not be read)".to_string())?;
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|_| "not a valid glTF model file (the JSON could not be read)".to_string())?;
     let mut out = Vec::new();
     for key in ["buffers", "images"] {
         if let Some(items) = value.get(key).and_then(|v| v.as_array()) {
@@ -194,8 +205,15 @@ fn bundle_relative_path(base: &url::Url, dep: &url::Url) -> Result<String, Strin
 /// server will not serve fails the plan with a plain explanation, so
 /// the user never gets a half-downloaded model that looks complete.
 pub fn fetch_gltf_plan(url: &str) -> Result<GltfPlan, String> {
+    fetch_gltf_plan_with_proxy(url, None)
+}
+
+/// [`fetch_gltf_plan`] through the user-configured proxy (round 11
+/// extension, feature 10): the model fetch and every dependency
+/// probe use it, so a proxy user can plan a model at all.
+pub fn fetch_gltf_plan_with_proxy(url: &str, proxy: Option<&str>) -> Result<GltfPlan, String> {
     let clean = validate_url(url)?;
-    let client = http_client()?;
+    let client = http_client_with_proxy(proxy)?;
     let resp = client
         .get(&clean)
         .send()
@@ -250,7 +268,11 @@ pub fn fetch_gltf_plan(url: &str) -> Result<GltfPlan, String> {
         }
         let dep_url = base
             .join(&uri)
-            .map_err(|_| format!("3D model dependency {uri} is not a valid URL; the model was not downloaded."))?
+            .map_err(|_| {
+                format!(
+                    "3D model dependency {uri} is not a valid URL; the model was not downloaded."
+                )
+            })?
             .to_string();
         if seen.contains(&dep_url) {
             continue;
@@ -264,6 +286,7 @@ pub fn fetch_gltf_plan(url: &str) -> Result<GltfPlan, String> {
         // halfway through the download.
         let probe_opts = DownloadOptions {
             url: dep_url.clone(),
+            proxy_url: proxy.map(|p| p.to_string()),
             ..Default::default()
         };
         let size = match probe(&probe_opts) {
@@ -302,6 +325,10 @@ pub struct GltfDownloadOptions {
     pub max_segments: usize,
     pub max_retries: u32,
     pub bandwidth_kbps: Option<u64>,
+    /// Proxy for the bundle's files (round 11 extension, feature
+    /// 10): passed through to each file's DownloadOptions.
+    /// Never logged — it may contain credentials.
+    pub proxy_url: Option<String>,
 }
 
 /// Download a planned `.gltf` bundle: the model plus every
@@ -337,10 +364,11 @@ pub fn download_gltf_bundle(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "model".to_string());
     let hash = format!("{:x}", Sha256::digest(plan.main_url.as_bytes()));
-    let bundle_dir = opts
-        .destination_dir
-        .join("3D")
-        .join(format!("{}-{}", sanitize_filename(&stem), &hash[..8]));
+    let bundle_dir = opts.destination_dir.join("3D").join(format!(
+        "{}-{}",
+        sanitize_filename(&stem),
+        &hash[..8]
+    ));
     std::fs::create_dir_all(&bundle_dir)
         .map_err(|e| format!("Cannot create 3D model folder: {e}"))?;
 
@@ -353,17 +381,16 @@ pub fn download_gltf_bundle(
     let main_target = bundle_dir
         .join(&main_parent)
         .join(sanitize_filename(main_filename));
-    let mut files: Vec<(String, PathBuf, Option<u64>)> = vec![(
-        plan.main_url.clone(),
-        main_target.clone(),
-        plan.main_size,
-    )];
+    let mut files: Vec<(String, PathBuf, Option<u64>)> =
+        vec![(plan.main_url.clone(), main_target.clone(), plan.main_size)];
     for dep in &plan.dependencies {
         // Defence in depth: the plan already validated these paths,
         // but a path must never escape the bundle folder.
         let rel = Path::new(&dep.relative_path);
         if rel.is_absolute()
-            || rel.components().any(|c| matches!(c, std::path::Component::ParentDir))
+            || rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
         {
             return Err(format!(
                 "3D model dependency {} has an unsafe path; the model was not downloaded.",
@@ -423,6 +450,7 @@ pub fn download_gltf_bundle(
             max_retries: opts.max_retries,
             bandwidth_kbps: opts.bandwidth_kbps,
             referer: None,
+            proxy_url: opts.proxy_url.clone(),
             user_agent: None,
             organise_by_category: false,
         };
@@ -504,10 +532,7 @@ mod tests {
             ]
         );
         assert!(gltf_dependency_uris("not json").is_err());
-        assert_eq!(
-            gltf_dependency_uris("{}").unwrap(),
-            Vec::<String>::new()
-        );
+        assert_eq!(gltf_dependency_uris("{}").unwrap(), Vec::<String>::new());
     }
 
     #[test]

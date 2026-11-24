@@ -91,7 +91,6 @@ fn ytdlp_exe_name() -> &'static str {
     }
 }
 
-
 /// Lookup only: no download. Used where a tool must already be
 /// present (for example, the probe-failure fallback in add_download,
 /// which must not trigger a 23 MB download for a dead direct link).
@@ -240,6 +239,30 @@ pub struct MediaInfo {
     /// a direct file to yt-dlp). None for normal extraction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_url: Option<String>,
+    /// Audio languages the page offers (round 11 extension,
+    /// feature 4): the distinct `language` tags across the audio
+    /// formats (yt-dlp) or the stream's audio renditions (HLS/
+    /// DASH). Empty when there is a single untagged track.
+    #[serde(default)]
+    pub audio_languages: Vec<String>,
+    /// Subtitle languages the page offers (round 11 extension,
+    /// feature 2): the keys of yt-dlp's `subtitles` object
+    /// (human subtitles only — NOT `automatic_captions`), or the
+    /// stream's subtitle renditions.
+    #[serde(default)]
+    pub subtitle_langs: Vec<String>,
+    /// True when the listed URL is a playlist (round 11
+    /// extension, feature 11): yt-dlp's video JSON carries
+    /// `playlist_count` when the URL was a playlist URL, even
+    /// with `--no-playlist`, so this costs no extra call.
+    #[serde(default)]
+    pub is_playlist: bool,
+    /// The playlist's title, when `is_playlist`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist_title: Option<String>,
+    /// How many videos the playlist holds, when `is_playlist`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist_count: Option<u32>,
 }
 
 fn opt_str<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -358,7 +381,10 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
         .unwrap_or("Untitled video")
         .to_string();
     let extractor = opt_str(value, "extractor").unwrap_or("unknown").to_string();
-    let duration_secs = value.get("duration").and_then(|v| v.as_f64()).map(|d| d as u64);
+    let duration_secs = value
+        .get("duration")
+        .and_then(|v| v.as_f64())
+        .map(|d| d as u64);
     let webpage_url = opt_str(value, "webpage_url")
         .unwrap_or(page_url)
         .to_string();
@@ -428,16 +454,15 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
             // `filesize_approx` bool is derived from the kind
             // below (it stays for serde compat and mirrors kind
             // != Exact).
-            let (filesize, size_kind) =
-                match f.get("filesize").and_then(|v| v.as_u64()) {
-                    Some(s) => (Some(s), Some(crate::media::SizeKind::Exact)),
-                    None => (
-                        f.get("filesize_approx").and_then(|v| v.as_u64()),
-                        f.get("filesize_approx")
-                            .and_then(|v| v.as_u64())
-                            .map(|_| crate::media::SizeKind::Peak),
-                    ),
-                };
+            let (filesize, size_kind) = match f.get("filesize").and_then(|v| v.as_u64()) {
+                Some(s) => (Some(s), Some(crate::media::SizeKind::Exact)),
+                None => (
+                    f.get("filesize_approx").and_then(|v| v.as_u64()),
+                    f.get("filesize_approx")
+                        .and_then(|v| v.as_u64())
+                        .map(|_| crate::media::SizeKind::Peak),
+                ),
+            };
             // Plausibility: some extractors report nonsense sizes
             // (Google Drive's transcodes report ~2.9 KB for a whole
             // video). A real stream carries far more than 1 KB/s, so
@@ -495,7 +520,18 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
             let size_kind = filesize.map(|_| crate::media::SizeKind::Exact);
             formats.push(MediaFormat {
                 format_id: opt_str(value, "format_id").unwrap_or("0").to_string(),
-                label: format_label("0", FormatKind::Combined, &ext, None, None, None, None, filesize, size_kind, false),
+                label: format_label(
+                    "0",
+                    FormatKind::Combined,
+                    &ext,
+                    None,
+                    None,
+                    None,
+                    None,
+                    filesize,
+                    size_kind,
+                    false,
+                ),
                 ext,
                 kind: FormatKind::Combined,
                 height: None,
@@ -576,6 +612,37 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
             f.filesize,
         ))
     });
+    // Round 11 extension, features 2 + 4: the audio languages
+    // (distinct language tags across the audio formats) and the
+    // subtitle languages (keys of the `subtitles` object —
+    // human subtitles only, never `automatic_captions`).
+    let mut audio_languages: Vec<String> = Vec::new();
+    for f in &formats {
+        if f.kind == FormatKind::AudioOnly {
+            if let Some(l) = &f.language {
+                if !l.is_empty() && !audio_languages.contains(l) {
+                    audio_languages.push(l.clone());
+                }
+            }
+        }
+    }
+    let mut subtitle_langs: Vec<String> = Vec::new();
+    if let Some(subs) = value.get("subtitles").and_then(|v| v.as_object()) {
+        for key in subs.keys() {
+            if !key.is_empty() {
+                subtitle_langs.push(key.clone());
+            }
+        }
+    }
+    subtitle_langs.sort();
+    // Round 11 extension, feature 11: a playlist URL's video
+    // JSON carries the playlist metadata even with --no-playlist.
+    let playlist_count = value
+        .get("playlist_count")
+        .and_then(|v| v.as_u64())
+        .map(|c| c as u32);
+    let playlist_title = opt_str(value, "playlist_title").map(|t| t.to_string());
+    let is_playlist = playlist_count.map_or(false, |c| c > 1);
     let default_format_id = pick_default_format(&formats, &extractor);
     Ok(MediaInfo {
         title,
@@ -585,6 +652,11 @@ pub fn parse_media_info(value: &serde_json::Value, page_url: &str) -> Result<Med
         formats,
         default_format_id,
         resolved_url: None,
+        audio_languages,
+        subtitle_langs,
+        is_playlist,
+        playlist_title,
+        playlist_count,
     })
 }
 
@@ -693,8 +765,7 @@ fn best_audio_per_language<'a>(
         let best = formats
             .iter()
             .filter(|f| {
-                f.kind == FormatKind::AudioOnly
-                    && f.language.as_deref().unwrap_or("") == lang
+                f.kind == FormatKind::AudioOnly && f.language.as_deref().unwrap_or("") == lang
             })
             .max_by(|a, b| {
                 let a_compat = !compat_ext.is_empty() && a.ext == compat_ext;
@@ -751,6 +822,57 @@ pub fn format_selector_multi(format: &MediaFormat, formats: &[MediaFormat]) -> S
             .join("+")
     );
     format!("{multi}/{}", format_selector(format))
+}
+
+/// The yt-dlp `-f` selector for a chosen format with ONE audio
+/// language (round 11 extension, feature 4): the video joined
+/// with the best audio stream of that language only — no
+/// multistreams, no other languages. The fallback branch is the
+/// plain [`format_selector`] (best audio, then video alone), so
+/// a page whose audio list changed mid-run still downloads.
+/// Falls back to [`format_selector`] entirely when the language
+/// has no audio format. Non-video formats return their own id
+/// unchanged (an audio-only choice needs no audio join).
+pub fn format_selector_for_language(
+    format: &MediaFormat,
+    formats: &[MediaFormat],
+    language: &str,
+) -> String {
+    if format.kind != FormatKind::VideoOnly {
+        return format.format_id.clone();
+    }
+    let compat = match format.ext.as_str() {
+        "mp4" => "m4a",
+        "webm" => "webm",
+        _ => "",
+    };
+    let best = formats
+        .iter()
+        .filter(|f| {
+            f.kind == FormatKind::AudioOnly
+                && f.language
+                    .as_deref()
+                    .is_some_and(|l| l.eq_ignore_ascii_case(language))
+        })
+        .max_by(|a, b| {
+            let a_compat = !compat.is_empty() && a.ext == compat;
+            let b_compat = !compat.is_empty() && b.ext == compat;
+            a_compat.cmp(&b_compat).then(
+                a.abr
+                    .unwrap_or(0.0)
+                    .partial_cmp(&b.abr.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
+    match best {
+        Some(a) => format!(
+            "{}+{}/{}",
+            format.format_id,
+            a.format_id,
+            format_selector(format)
+        ),
+        None => format_selector(format),
+    }
 }
 
 /// Does this yt-dlp `-f` selector's first branch join the video
@@ -834,9 +956,8 @@ fn run_with_timeout(mut child: Child, timeout: Duration) -> Result<(bool, String
             Err(e) => return Err(e.to_string()),
         }
     };
-    let stdout = join_reader(out_thread, Duration::from_secs(5)).ok_or_else(|| {
-        "Media extraction produced no output. Try again.".to_string()
-    })?;
+    let stdout = join_reader(out_thread, Duration::from_secs(5))
+        .ok_or_else(|| "Media extraction produced no output. Try again.".to_string())?;
     let stderr = join_reader(err_thread, Duration::from_secs(2)).unwrap_or_default();
     Ok((success, stdout, stderr))
 }
@@ -858,19 +979,23 @@ fn friendly_media_error(stderr: &str) -> String {
         return "This video is unavailable. It may have been removed, made private, or blocked in your region.".to_string();
     }
     if has("drm") || has("encrypted") {
-        return "This video is DRM-protected. FetchForge does not bypass DRM or encryption.".to_string();
+        return "This video is DRM-protected. FetchForge does not bypass DRM or encryption."
+            .to_string();
     }
     if has("http error 403") || has("http error 401") {
-        return "Access denied by the site (403). The link may need sign-in or may have expired.".to_string();
+        return "Access denied by the site (403). The link may need sign-in or may have expired."
+            .to_string();
     }
     if has("http error 404") {
-        return "This page was not found (404). The link may have expired or been removed.".to_string();
+        return "This page was not found (404). The link may have expired or been removed."
+            .to_string();
     }
     if has("timed out") || has("timeout") {
         return "The site took too long to respond. Try again.".to_string();
     }
     if has("unable to download webpage") || has("name or service not known") || has("connection") {
-        return "Could not reach the page. Check the link and your connection, then try again.".to_string();
+        return "Could not reach the page. Check the link and your connection, then try again."
+            .to_string();
     }
     if has("no video formats found") || has("no formats found") {
         return "No downloadable video was found on this page. The video may be protected or members-only.".to_string();
@@ -895,13 +1020,26 @@ fn friendly_media_error(stderr: &str) -> String {
 /// List formats for a page, using an explicit yt-dlp binary (the
 /// testable core; production callers use [`list_formats`]).
 pub fn list_formats_with(ytdlp: &Path, url: &str) -> Result<MediaInfo, String> {
-    list_formats_with_fallback(ytdlp, url, true)
+    list_formats_with_proxy(ytdlp, url, None)
+}
+
+/// [`list_formats_with`] through the user-configured proxy
+/// (round 11 extension, feature 10): yt-dlp gets `--proxy`,
+/// and the HTML fallback's page fetch uses it too. The proxy
+/// value is never logged.
+pub fn list_formats_with_proxy(
+    ytdlp: &Path,
+    url: &str,
+    proxy: Option<&str>,
+) -> Result<MediaInfo, String> {
+    list_formats_with_fallback(ytdlp, url, true, proxy)
 }
 
 fn list_formats_with_fallback(
     ytdlp: &Path,
     url: &str,
     allow_fallback: bool,
+    proxy: Option<&str>,
 ) -> Result<MediaInfo, String> {
     let clean = validate_url(url)?;
     let mut cmd = Command::new(ytdlp);
@@ -911,11 +1049,14 @@ fn list_formats_with_fallback(
         "--no-warnings",
         "--socket-timeout",
         "30",
-        &clean,
-    ])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+    ]);
+    if let Some(p) = proxy {
+        cmd.arg("--proxy").arg(p);
+    }
+    cmd.arg(&clean)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     no_console_window(&mut cmd);
     let child = cmd.spawn().map_err(|e| {
         format!("Could not run yt-dlp ({e}). Reinstall FetchForge, or set FETCHFORGE_YTDLP_PATH to a working yt-dlp binary.")
@@ -935,7 +1076,7 @@ fn list_formats_with_fallback(
             // or session, so it cannot unlock what yt-dlp was
             // refused, and re-fetching would only waste a request.
             if allow_fallback && stderr.to_lowercase().contains("unsupported url") {
-                if let Some(result) = try_html_embedded_fallback(ytdlp, &clean) {
+                if let Some(result) = try_html_embedded_fallback(ytdlp, &clean, proxy) {
                     return result;
                 }
             }
@@ -960,26 +1101,169 @@ pub fn list_formats_with_referer(
     url: &str,
     referer: Option<String>,
 ) -> Result<MediaInfo, String> {
+    list_formats_with_referer_and_proxy(data_dir, url, referer, None)
+}
+
+/// [`list_formats_with_referer`] through the user-configured
+/// proxy (round 11 extension, feature 10): the manifest fetch,
+/// the sniff and the yt-dlp extraction all use it.
+pub fn list_formats_with_referer_and_proxy(
+    data_dir: &Path,
+    url: &str,
+    referer: Option<String>,
+    proxy: Option<&str>,
+) -> Result<MediaInfo, String> {
     if crate::media::is_manifest_url(url) {
-        let info = crate::media::list_stream_formats(url, &referer, None)?;
+        let info = crate::media::list_stream_formats_with_proxy(url, &referer, None, proxy)?;
         return Ok(stream_info_to_media_info(&info));
     }
     // Round 10, item 4: extensionless playlist URLs (MoviesJoy /
     // NOXX / 123Movies) carry no .m3u8/.mpd, so the check above
     // misses them — sniff the first bytes before yt-dlp. A failed
     // sniff (None) falls through to yt-dlp as before.
-    if let Some(kind) = crate::media::sniff_stream_kind(url, &referer) {
-        let info = crate::media::list_stream_formats_kind(url, kind, &referer, None)?;
+    if let Some(kind) = crate::media::sniff_stream_kind_with_proxy(url, &referer, proxy) {
+        let info =
+            crate::media::list_stream_formats_kind_with_proxy(url, kind, &referer, None, proxy)?;
         return Ok(stream_info_to_media_info(&info));
     }
     let ytdlp = ensure_ytdlp(data_dir)?;
-    list_formats_with(&ytdlp, url)
+    list_formats_with_proxy(&ytdlp, url, proxy)
 }
 
 /// List formats with no referer (the desktop paste-link path:
 /// the URL was typed, not observed on a page).
 pub fn list_formats(data_dir: &Path, url: &str) -> Result<MediaInfo, String> {
     list_formats_with_referer(data_dir, url, None)
+}
+
+// ---------------------------------------------------------------------------
+// Playlists (round 11 extension, feature 11)
+// ---------------------------------------------------------------------------
+
+/// One entry of a playlist listing: enough to queue it as its
+/// own download (each entry becomes its own record, with the
+/// playlist title + its index, so the list shows where it came
+/// from).
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaylistEntry {
+    pub title: String,
+    pub url: String,
+    pub index: u32,
+    pub duration_secs: Option<u64>,
+}
+
+/// A playlist listing from `yt-dlp --flat-playlist -J`: the
+/// entries' titles + URLs only (flat = no per-video extraction,
+/// so even a long playlist lists in one call).
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaylistInfo {
+    pub title: String,
+    pub url: String,
+    pub entries: Vec<PlaylistEntry>,
+}
+
+/// List a playlist's entries (flat: titles + URLs only, no
+/// per-video extraction). Errors plainly when the URL is not a
+/// playlist (yt-dlp returns a single video instead of a
+/// playlist object) or when it has no usable entries. Entries
+/// without a usable URL are skipped, not failed — a playlist
+/// with one dead entry still downloads the rest.
+pub fn list_playlist(data_dir: &Path, url: &str) -> Result<PlaylistInfo, String> {
+    list_playlist_with_proxy(data_dir, url, None)
+}
+
+/// [`list_playlist`] through the user-configured proxy (round
+/// 11 extension, feature 10).
+pub fn list_playlist_with_proxy(
+    data_dir: &Path,
+    url: &str,
+    proxy: Option<&str>,
+) -> Result<PlaylistInfo, String> {
+    let ytdlp = ensure_ytdlp(data_dir)?;
+    let clean = validate_url(url)?;
+    let mut cmd = Command::new(&ytdlp);
+    cmd.args([
+        "-J",
+        "--flat-playlist",
+        "--no-warnings",
+        "--socket-timeout",
+        "30",
+    ]);
+    if let Some(p) = proxy {
+        cmd.arg("--proxy").arg(p);
+    }
+    cmd.arg(&clean)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    no_console_window(&mut cmd);
+    let child = cmd.spawn().map_err(|e| {
+        format!("Could not run yt-dlp ({e}). Reinstall FetchForge, or set FETCHFORGE_YTDLP_PATH to a working yt-dlp binary.")
+    })?;
+    let (_success, stdout, stderr) = run_with_timeout(child, EXTRACT_TIMEOUT)?;
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).map_err(|_| friendly_media_error(&stderr))?;
+    parse_playlist_info(&value, &clean)
+}
+
+/// Parse a `--flat-playlist -J` document into a [`PlaylistInfo`]
+/// (pure, so tests can feed canned JSON without yt-dlp).
+fn parse_playlist_info(value: &serde_json::Value, page_url: &str) -> Result<PlaylistInfo, String> {
+    if value.get("_type").and_then(|v| v.as_str()) != Some("playlist") {
+        return Err(
+            "That link is a single video, not a playlist. Add it as a normal download instead."
+                .to_string(),
+        );
+    }
+    let title = opt_str(value, "title")
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or("Playlist")
+        .to_string();
+    let mut entries = Vec::new();
+    if let Some(list) = value.get("entries").and_then(|v| v.as_array()) {
+        for (i, e) in list.iter().enumerate() {
+            // Flat entries carry `webpage_url` (full URL) and
+            // `url` (usually the same, sometimes a bare id).
+            // Prefer the full URL; a bare id is unusable — the
+            // entry is skipped, not failed.
+            let url = opt_str(e, "webpage_url")
+                .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+                .or_else(|| {
+                    opt_str(e, "url")
+                        .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+                });
+            let Some(url) = url else {
+                continue;
+            };
+            let entry_title = opt_str(e, "title")
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| format!("Video {}", i + 1));
+            let index = e
+                .get("playlist_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or((i + 1) as u32);
+            let duration_secs = e.get("duration").and_then(|v| v.as_f64()).map(|d| d as u64);
+            entries.push(PlaylistEntry {
+                title: entry_title,
+                url: url.to_string(),
+                index,
+                duration_secs,
+            });
+        }
+    }
+    if entries.is_empty() {
+        return Err(
+            "This playlist has no downloadable videos (every entry was unavailable or private)."
+                .to_string(),
+        );
+    }
+    Ok(PlaylistInfo {
+        title,
+        url: page_url.to_string(),
+        entries,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,14 +1285,19 @@ const FALLBACK_FILE_EXTS: [&str; 4] = [".mp4", ".webm", ".mov", ".mkv"];
 /// redirects — the same discipline as the manifest fetches in
 /// media.rs. A non-HTML response is still scanned (some players
 /// serve the player page as JSON), but the body is capped.
-fn fetch_page_html(url: &str) -> Result<String, String> {
-    let client = reqwest::blocking::Client::builder()
+fn fetch_page_html(url: &str, proxy: Option<&str>) -> Result<String, String> {
+    let mut builder = reqwest::blocking::Client::builder()
         .user_agent("FetchForge/0.2")
         .timeout(Duration::from_secs(60))
         .connect_timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| e.to_string())?;
+        .redirect(reqwest::redirect::Policy::limited(10));
+    if let Some(p) = proxy {
+        builder = builder.proxy(
+            reqwest::Proxy::all(p)
+                .map_err(|_| "The configured proxy could not be used.".to_string())?,
+        );
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
     let resp = client.get(url).send().map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("Page request failed: HTTP {}", resp.status()));
@@ -1402,8 +1691,16 @@ fn rank_direct_candidates(
         };
         rank(&a.1)
             .cmp(&rank(&b.1))
-            .then(b.1.duration_secs.unwrap_or(0).cmp(&a.1.duration_secs.unwrap_or(0)))
-            .then(b.1.total_bytes.unwrap_or(0).cmp(&a.1.total_bytes.unwrap_or(0)))
+            .then(
+                b.1.duration_secs
+                    .unwrap_or(0)
+                    .cmp(&a.1.duration_secs.unwrap_or(0)),
+            )
+            .then(
+                b.1.total_bytes
+                    .unwrap_or(0)
+                    .cmp(&a.1.total_bytes.unwrap_or(0)),
+            )
             .then(a.2.cmp(&b.2))
     });
     ranked
@@ -1430,8 +1727,12 @@ fn rank_direct_candidates(
 /// (under 60 s) is NEVER the answer while a longer or unknown
 /// candidate exists; when the page holds only short clips the plan
 /// FAILS with a clear reason instead of silently queueing an ad.
-fn try_html_embedded_fallback(ytdlp: &Path, page_url: &str) -> Option<Result<MediaInfo, String>> {
-    let html = fetch_page_html(page_url).ok()?;
+fn try_html_embedded_fallback(
+    ytdlp: &Path,
+    page_url: &str,
+    proxy: Option<&str>,
+) -> Option<Result<MediaInfo, String>> {
+    let html = fetch_page_html(page_url, proxy).ok()?;
     let candidates = find_embedded_media_urls(&html, page_url);
     if candidates.is_empty() {
         return None;
@@ -1439,8 +1740,11 @@ fn try_html_embedded_fallback(ytdlp: &Path, page_url: &str) -> Option<Result<Med
     // Manifests first (already ordered by find_embedded_media_urls):
     // the first that lists wins.
     let mut last_err: Option<String> = None;
-    for candidate in candidates.iter().filter(|u| crate::media::is_manifest_url(u)) {
-        match crate::media::list_stream_formats(candidate, &None, None)
+    for candidate in candidates
+        .iter()
+        .filter(|u| crate::media::is_manifest_url(u))
+    {
+        match crate::media::list_stream_formats_with_proxy(candidate, &None, None, proxy)
             .map(|info| stream_info_to_media_info(&info))
         {
             Ok(mut info) => {
@@ -1460,13 +1764,17 @@ fn try_html_embedded_fallback(ytdlp: &Path, page_url: &str) -> Option<Result<Med
             "No downloadable video was found on this page.".to_string()
         })));
     }
-    let client = reqwest::blocking::Client::builder()
+    let mut probe_builder = reqwest::blocking::Client::builder()
         .user_agent(crate::media::BROWSER_USER_AGENT)
         .timeout(Duration::from_secs(HTML_FALLBACK_PROBE_TIMEOUT_SECS))
         .connect_timeout(Duration::from_secs(3))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .ok();
+        .redirect(reqwest::redirect::Policy::limited(10));
+    if let Some(p) = proxy {
+        if let Ok(px) = reqwest::Proxy::all(p) {
+            probe_builder = probe_builder.proxy(px);
+        }
+    }
+    let client = probe_builder.build().ok();
     let ranked = match &client {
         Some(c) => rank_direct_candidates(c, &files),
         // No probe client (should not happen): try in document
@@ -1507,7 +1815,7 @@ fn try_html_embedded_fallback(ytdlp: &Path, page_url: &str) -> Option<Result<Med
         {
             continue;
         }
-        match list_formats_with_fallback(ytdlp, candidate, false) {
+        match list_formats_with_fallback(ytdlp, candidate, false, proxy) {
             Ok(mut info) => {
                 info.resolved_url = Some(candidate.clone());
                 return Some(Ok(info));
@@ -1559,10 +1867,12 @@ fn stream_info_to_media_info(info: &crate::media::StreamInfo) -> MediaInfo {
                 abr: f.abr_kbps,
                 vbr: f.vbr_kbps,
                 fps: f.fps,
-                // The native HLS/DASH path keeps all audio tracks
-                // by construction (media.rs downloads every audio
-                // rendition), so no language tag is needed here —
-                // tags only drive the yt-dlp multi-audio selector.
+                // Stream formats carry no per-format language
+                // tag: the languages live on MediaInfo itself
+                // (audio_languages / subtitle_langs, from the
+                // manifest's renditions), and the worker passes
+                // the user's choice to the stream engine, which
+                // picks that rendition (see pick_audio_rendition).
                 language: None,
                 filesize: f.filesize,
                 filesize_approx: f
@@ -1605,6 +1915,12 @@ fn stream_info_to_media_info(info: &crate::media::StreamInfo) -> MediaInfo {
         formats,
         default_format_id,
         resolved_url: None,
+        audio_languages: info.audio_languages.clone(),
+        subtitle_langs: info.subtitle_languages.clone(),
+        // A manifest URL is one stream, never a playlist.
+        is_playlist: false,
+        playlist_title: None,
+        playlist_count: None,
     }
 }
 
@@ -1652,6 +1968,11 @@ pub struct MediaPlan {
     /// "0 / N pieces" before the first segment lands. None for
     /// yt-dlp downloads and when the count could not be determined.
     pub segments_total: Option<u64>,
+    /// What the chosen format contains (round 11 extension,
+    /// feature 13): "audio", "video" or "combined", copied to
+    /// the record so the worker knows whether the audio-format
+    /// choice applies (audio-only downloads only).
+    pub format_kind: Option<String>,
     /// What the user picked (round 10, item 8): the chosen
     /// format's height and video bitrate, copied to the record so
     /// the delivered file can be probed against them and a
@@ -1673,10 +1994,7 @@ fn stem_for_title(title: &str) -> String {
         let stripped = t.strip_prefix('(').and_then(|rest| {
             let close = rest.find(')')?;
             let num = &rest[..close];
-            if !num.is_empty()
-                && num.len() <= 3
-                && num.bytes().all(|b| b.is_ascii_digit())
-            {
+            if !num.is_empty() && num.len() <= 3 && num.bytes().all(|b| b.is_ascii_digit()) {
                 Some(rest[close + 1..].trim_start())
             } else {
                 None
@@ -1766,18 +2084,45 @@ pub fn plan_media_download(
     referer: &Option<String>,
     captured: Option<&crate::media::CapturedManifest>,
 ) -> Result<MediaPlan, String> {
+    plan_media_download_with_options(
+        data_dir, url, format_id, filename, referer, captured, None, None,
+    )
+}
+
+/// [`plan_media_download`] with the round 11 extension options:
+/// the audio language (feature 4 — the yt-dlp selector and the
+/// audio total follow it) and the proxy (feature 10 — the
+/// sniff, the manifest fetch and the yt-dlp extraction all use
+/// it).
+#[allow(clippy::too_many_arguments)]
+pub fn plan_media_download_with_options(
+    data_dir: &Path,
+    url: &str,
+    format_id: Option<&str>,
+    filename: Option<&str>,
+    referer: &Option<String>,
+    captured: Option<&crate::media::CapturedManifest>,
+    audio_lang: Option<&str>,
+    proxy: Option<&str>,
+) -> Result<MediaPlan, String> {
     if crate::media::is_manifest_url(url) {
-        return plan_stream_download(url, format_id, filename, referer, captured);
+        let kind = crate::media::stream_kind_of_url(url)
+            .ok_or_else(|| "Not an HLS (.m3u8) or DASH (.mpd) URL.".to_string())?;
+        return plan_stream_download_kind(
+            url, kind, format_id, filename, referer, captured, audio_lang, proxy,
+        );
     }
     // Round 10, item 4: extensionless playlist URLs — sniff
     // before yt-dlp, same as list_formats (the caller may already
     // have sniffed once; a second 2 KB ranged GET is cheap and
     // keeps each layer correct on its own).
-    if let Some(kind) = crate::media::sniff_stream_kind(url, referer) {
-        return plan_stream_download_kind(url, kind, format_id, filename, referer, captured);
+    if let Some(kind) = crate::media::sniff_stream_kind_with_proxy(url, referer, proxy) {
+        return plan_stream_download_kind(
+            url, kind, format_id, filename, referer, captured, audio_lang, proxy,
+        );
     }
-    let info = list_formats(data_dir, url)?;
-    plan_from_info(&info, format_id, filename)
+    let info = list_formats_with_referer_and_proxy(data_dir, url, referer.clone(), proxy)?;
+    plan_from_info_with_language(&info, format_id, filename, audio_lang)
 }
 
 /// Plan an HLS/DASH download from the parsed manifest: same
@@ -1792,12 +2137,19 @@ fn plan_stream_download(
 ) -> Result<MediaPlan, String> {
     let kind = crate::media::stream_kind_of_url(url)
         .ok_or_else(|| "Not an HLS (.m3u8) or DASH (.mpd) URL.".to_string())?;
-    plan_stream_download_kind(url, kind, format_id, filename, referer, captured)
+    plan_stream_download_kind(
+        url, kind, format_id, filename, referer, captured, None, None,
+    )
 }
 
 /// [`plan_stream_download`] with the protocol given (round 10,
 /// item 4): for extensionless playlist URLs the caller already
-/// sniffed the kind from the first bytes.
+/// sniffed the kind from the first bytes. `audio_lang` (round
+/// 11 extension, feature 4) only affects the yt-dlp total math
+/// via [`plan_from_info_with_language`]; the stream engine
+/// receives the language separately at download time. `proxy`
+/// (feature 10) is used for the manifest fetch.
+#[allow(clippy::too_many_arguments)]
 fn plan_stream_download_kind(
     url: &str,
     kind: crate::media::StreamKind,
@@ -1805,10 +2157,13 @@ fn plan_stream_download_kind(
     filename: Option<&str>,
     referer: &Option<String>,
     captured: Option<&crate::media::CapturedManifest>,
+    audio_lang: Option<&str>,
+    proxy: Option<&str>,
 ) -> Result<MediaPlan, String> {
-    let info = crate::media::list_stream_formats_kind(url, kind, referer, captured)?;
+    let info =
+        crate::media::list_stream_formats_kind_with_proxy(url, kind, referer, captured, proxy)?;
     let media = stream_info_to_media_info(&info);
-    let mut plan = plan_from_info(&media, format_id, filename)?;
+    let mut plan = plan_from_info_with_language(&media, format_id, filename, audio_lang)?;
     plan.stream_kind = Some(info.kind);
     plan.selector = String::new();
     plan.segments_total = info.segment_count;
@@ -1851,7 +2206,29 @@ pub fn plan_media_download_or_drive_fallback(
     referer: &Option<String>,
     captured: Option<&crate::media::CapturedManifest>,
 ) -> Result<PlanOutcome, String> {
-    match plan_media_download(data_dir, url, format_id, filename, referer, captured) {
+    plan_media_download_or_drive_fallback_with_options(
+        data_dir, url, format_id, filename, referer, captured, None, None,
+    )
+}
+
+/// [`plan_media_download_or_drive_fallback`] with the round 11
+/// extension options (audio language + proxy). The Drive probe
+/// uses the proxy too — a proxy user behind a restrictive
+/// network could not probe Drive directly.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_media_download_or_drive_fallback_with_options(
+    data_dir: &Path,
+    url: &str,
+    format_id: Option<&str>,
+    filename: Option<&str>,
+    referer: &Option<String>,
+    captured: Option<&crate::media::CapturedManifest>,
+    audio_lang: Option<&str>,
+    proxy: Option<&str>,
+) -> Result<PlanOutcome, String> {
+    match plan_media_download_with_options(
+        data_dir, url, format_id, filename, referer, captured, audio_lang, proxy,
+    ) {
         Ok(plan) => Ok(PlanOutcome::Media(plan)),
         Err(e) => {
             if let Some(file_id) = drive_file_id(url) {
@@ -1859,6 +2236,7 @@ pub fn plan_media_download_or_drive_fallback(
                 let probe_opts = crate::download::DownloadOptions {
                     url: direct.clone(),
                     referer: referer.clone(),
+                    proxy_url: proxy.map(|p| p.to_string()),
                     ..Default::default()
                 };
                 if let Ok(p) = crate::download::probe(&probe_opts) {
@@ -1869,7 +2247,10 @@ pub fn plan_media_download_or_drive_fallback(
                     {
                         let fname = filename
                             .map(crate::filename::sanitize_filename)
-                            .or(p.filename.as_deref().map(crate::filename::sanitize_filename))
+                            .or(p
+                                .filename
+                                .as_deref()
+                                .map(crate::filename::sanitize_filename))
                             .unwrap_or_else(|| "download".to_string());
                         return Ok(PlanOutcome::Direct {
                             url: direct,
@@ -1889,6 +2270,20 @@ fn plan_from_info(
     info: &MediaInfo,
     format_id: Option<&str>,
     filename: Option<&str>,
+) -> Result<MediaPlan, String> {
+    plan_from_info_with_language(info, format_id, filename, None)
+}
+
+/// [`plan_from_info`] with the audio language chosen in the
+/// popup (round 11 extension, feature 4): the selector joins
+/// the video with that language's audio only (see
+/// [`format_selector_for_language`]), and the total sums only
+/// that language's audio instead of every tagged language.
+fn plan_from_info_with_language(
+    info: &MediaInfo,
+    format_id: Option<&str>,
+    filename: Option<&str>,
+    audio_lang: Option<&str>,
 ) -> Result<MediaPlan, String> {
     let chosen = match format_id {
         Some(id) => info
@@ -1962,22 +2357,48 @@ fn plan_from_info(
     };
     let mut size_kind = est_kind(chosen.size_kind, chosen.filesize, chosen.vbr);
     if chosen.needs_merge {
-        // Sum the audio streams the multi selector actually
-        // downloads: the best of each tagged language when there
-        // are two or more, else the single best audio (old
-        // behaviour — max abr across all audio formats).
+        // Sum the audio streams the selector actually downloads.
+        // With a chosen language (round 11 extension, feature
+        // 4): only that language's best audio — the multi
+        // selector is not used, so the other languages' sizes
+        // must not inflate the total. Without one: the best of
+        // each tagged language when there are two or more, else
+        // the single best audio (old behaviour — max abr across
+        // all audio formats).
         let compat = match chosen.ext.as_str() {
             "mp4" => "m4a",
             "webm" => "webm",
             _ => "",
         };
+        let chosen_lang_audio: Option<&MediaFormat> = audio_lang.and_then(|lang| {
+            info.formats
+                .iter()
+                .filter(|f| {
+                    f.kind == FormatKind::AudioOnly
+                        && f.language
+                            .as_deref()
+                            .is_some_and(|l| l.eq_ignore_ascii_case(lang))
+                })
+                .max_by(|a, b| {
+                    let a_compat = !compat.is_empty() && a.ext == compat;
+                    let b_compat = !compat.is_empty() && b.ext == compat;
+                    a_compat.cmp(&b_compat).then(
+                        a.abr
+                            .unwrap_or(0.0)
+                            .partial_cmp(&b.abr.unwrap_or(0.0))
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
+                })
+        });
         let audios = best_audio_per_language(&info.formats, compat);
         let tagged: Vec<&MediaFormat> = audios
             .iter()
             .copied()
             .filter(|f| f.language.is_some())
             .collect();
-        let to_sum: Vec<&MediaFormat> = if tagged.len() >= 2 {
+        let to_sum: Vec<&MediaFormat> = if let Some(one) = chosen_lang_audio {
+            vec![one]
+        } else if tagged.len() >= 2 {
             tagged
         } else {
             info.formats
@@ -1998,14 +2419,15 @@ fn plan_from_info(
             .sum();
         if audio_total > 0 {
             total = Some(total.unwrap_or(0) + audio_total);
-            let audio_kind = to_sum.iter().filter_map(|f| {
-                est_kind(f.size_kind, f.filesize, f.abr)
-            }).fold(None, |acc: Option<crate::media::SizeKind>, k| {
-                Some(match acc {
-                    None => k,
-                    Some(a) => a.weaker(k),
-                })
-            });
+            let audio_kind = to_sum
+                .iter()
+                .filter_map(|f| est_kind(f.size_kind, f.filesize, f.abr))
+                .fold(None, |acc: Option<crate::media::SizeKind>, k| {
+                    Some(match acc {
+                        None => k,
+                        Some(a) => a.weaker(k),
+                    })
+                });
             size_kind = match (size_kind, audio_kind) {
                 (Some(a), Some(b)) => Some(a.weaker(b)),
                 (a, b) => a.or(b),
@@ -2020,7 +2442,18 @@ fn plan_from_info(
         format_id: chosen.format_id.clone(),
         format_label: chosen.label.clone(),
         needs_merge: chosen.needs_merge,
-        selector: format_selector_multi(chosen, &info.formats),
+        selector: match audio_lang {
+            Some(lang) => format_selector_for_language(chosen, &info.formats, lang),
+            None => format_selector_multi(chosen, &info.formats),
+        },
+        format_kind: Some(
+            match chosen.kind {
+                FormatKind::AudioOnly => "audio",
+                FormatKind::VideoOnly => "video",
+                FormatKind::Combined => "combined",
+            }
+            .to_string(),
+        ),
         stream_kind: None,
         // HTML-fallback plans: extraction resolved the page to an
         // embedded stream/file URL, and the worker downloads the
@@ -2044,6 +2477,60 @@ fn plan_from_info(
         }
     }
     Ok(plan)
+}
+
+/// The next lower quality below `current_height` (round 11
+/// extension, feature 9): the highest format whose height is
+/// strictly below the current one. None when the current quality
+/// is already the lowest available (or no format reports a
+/// height below it). Audio-only formats never match (no height)
+/// — a downgrade is a video-quality step, never a switch to
+/// audio-only.
+pub fn next_lower_format<'a>(
+    formats: &'a [MediaFormat],
+    current_height: u32,
+) -> Option<&'a MediaFormat> {
+    formats
+        .iter()
+        .filter(|f| f.kind != FormatKind::AudioOnly)
+        .filter(|f| f.height.is_some_and(|h| h < current_height))
+        .max_by_key(|f| f.height.unwrap_or(0))
+}
+
+/// Delete yt-dlp's partial files for one download (round 11
+/// extension, feature 9): before a downgrade retry, the old
+/// quality's `.part` files must go, or yt-dlp resumes the OLD
+/// quality's fragments under the new selector. Matches only this
+/// download's parts — `<stem>.<ext>.part` (the merged/single
+/// part), `<stem>.f*.*.part` (format-specific parts) and
+/// `<stem>.part` — never a finished file, and never another
+/// download's parts (a stem is only matched up to its own
+/// extension or a `.f` format marker, so "Movie.2024.mp4.part"
+/// is not "Movie"'s part). Returns how many files were removed.
+/// `.ytdl` temp files are matched the same way.
+pub fn remove_partial_files(dir: &Path, stem: &str, ext: &str) -> usize {
+    let mut removed = 0;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_temp = name.ends_with(".part") || name.ends_with(".ytdl");
+        if !is_temp {
+            continue;
+        }
+        let base = name
+            .strip_suffix(".part")
+            .or_else(|| name.strip_suffix(".ytdl"))
+            .unwrap_or(&name);
+        let ours = base == stem
+            || base == format!("{stem}.{ext}")
+            || base.starts_with(&format!("{stem}.f"));
+        if ours && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 // ---------------------------------------------------------------------------
@@ -2105,6 +2592,24 @@ pub struct MediaDownloadOptions {
     /// refuse requests without the Referer they expect; yt-dlp gets
     /// it as `--referer`. None for pasted links (no page context).
     pub referer: Option<String>,
+    /// Subtitle languages to embed (round 11 extension, feature
+    /// 2): yt-dlp gets `--sub-langs <csv> --embed-subs`. Empty
+    /// means no subtitles. Embedding needs ffmpeg, so a
+    /// non-empty list resolves it (see [`download_media`]).
+    pub subtitle_langs: Vec<String>,
+    /// Audio format for an audio-only download (round 11
+    /// extension, feature 13): "mp3", "opus" or "m4a". When set,
+    /// yt-dlp gets `--extract-audio --audio-format <fmt>` and the
+    /// worker skips its own extraction post-step. None means the
+    /// worker extracts with ffmpeg itself (the old behaviour).
+    /// Only set when the chosen format kind is audio.
+    pub audio_format: Option<String>,
+    /// User-configured proxy (round 11 extension, feature 10):
+    /// yt-dlp gets `--proxy`. Never logged.
+    pub proxy_url: Option<String>,
+    /// Global speed limit in KB/s (round 11 extension, feature
+    /// 3): yt-dlp gets `--limit-rate <kbps>K`.
+    pub bandwidth_kbps: Option<u64>,
 }
 
 /// Download a media page with yt-dlp, resolving (and if needed
@@ -2121,11 +2626,18 @@ pub fn download_media(
     cancelled: &AtomicBool,
 ) -> Result<PathBuf, String> {
     let ytdlp = ensure_ytdlp(data_dir)?;
-    let ffmpeg = if opts.needs_merge {
-        Some(crate::ffmpeg::ensure_ffmpeg(data_dir)?)
-    } else {
-        None
-    };
+    // ffmpeg is REQUIRED for a merge, for subtitle embedding and
+    // for audio extraction (round 11 extension, features 2 + 13)
+    // — resolve (downloading if needed) when any of those apply.
+    // Otherwise ffmpeg is only wanted for metadata/chapter
+    // embedding (feature 12): use it when already installed, but
+    // never download it just for that.
+    let ffmpeg =
+        if opts.needs_merge || !opts.subtitle_langs.is_empty() || opts.audio_format.is_some() {
+            Some(crate::ffmpeg::ensure_ffmpeg(data_dir)?)
+        } else {
+            crate::ffmpeg::find_ffmpeg(data_dir).ok()
+        };
     download_media_with(&ytdlp, ffmpeg.as_deref(), opts, progress, paused, cancelled)
 }
 
@@ -2278,11 +2790,14 @@ pub fn download_media_with_stall(
     stall_timeout: Duration,
 ) -> Result<PathBuf, String> {
     let clean_url = validate_url(&opts.url)?;
-    if opts.needs_merge && ffmpeg.is_none() {
+    if (opts.needs_merge || !opts.subtitle_langs.is_empty() || opts.audio_format.is_some())
+        && ffmpeg.is_none()
+    {
         return Err(
-            "This quality needs ffmpeg to merge the separate video and audio streams, \
-             and ffmpeg could not be found or downloaded. Pick a combined (video + audio) \
-             quality instead, or install ffmpeg and try again."
+            "This download needs ffmpeg (to merge the separate video and audio streams, \
+             embed subtitles, or convert the audio), and ffmpeg could not be found or \
+             downloaded. Pick a combined (video + audio) quality instead, or install \
+             ffmpeg and try again."
                 .to_string(),
         );
     }
@@ -2335,8 +2850,37 @@ pub fn download_media_with_stall(
         // refuse requests without the Referer they expect.
         cmd.arg("--referer").arg(r);
     }
+    // Round 11 extension, feature 10: the user-configured proxy.
+    // Never logged (yt-dlp's argv is never printed anywhere).
+    if let Some(p) = &opts.proxy_url {
+        cmd.arg("--proxy").arg(p);
+    }
+    // Round 11 extension, feature 3: the global speed limit.
+    if let Some(kbps) = opts.bandwidth_kbps {
+        if kbps > 0 {
+            cmd.arg("--limit-rate").arg(format!("{kbps}K"));
+        }
+    }
+    // Round 11 extension, feature 2: embed the chosen subtitles
+    // into the output file. --embed-subs alone (no --write-subs)
+    // embeds without leaving sidecar .vtt files behind.
+    if !opts.subtitle_langs.is_empty() {
+        cmd.arg("--sub-langs")
+            .arg(opts.subtitle_langs.join(","))
+            .arg("--embed-subs");
+    }
+    // Round 11 extension, feature 13: extract the audio in the
+    // chosen format (audio-only downloads only — the worker
+    // sets audio_format only when the format kind is audio).
+    if let Some(fmt) = &opts.audio_format {
+        cmd.arg("--extract-audio").arg("--audio-format").arg(fmt);
+    }
     if let Some(ff) = ffmpeg {
         cmd.arg("--ffmpeg-location").arg(ff);
+        // Round 11 extension, feature 12: embed title/metadata
+        // and chapters whenever ffmpeg is available (a no-op
+        // when the video carries no chapters).
+        cmd.arg("--embed-metadata").arg("--embed-chapters");
     }
     cmd.arg(&clean_url)
         .stdin(Stdio::null())
@@ -2625,9 +3169,15 @@ mod tests {
 
     #[test]
     fn parses_youtube_info_filters_storyboard_and_drm() {
-        let info = parse_media_info(&youtube_json(), "https://www.youtube.com/watch?v=aqz-KE-bpKQ")
-            .unwrap();
-        assert_eq!(info.title, "Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film");
+        let info = parse_media_info(
+            &youtube_json(),
+            "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+        )
+        .unwrap();
+        assert_eq!(
+            info.title,
+            "Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film"
+        );
         assert_eq!(info.extractor, "youtube");
         assert_eq!(info.duration_secs, Some(635));
         let ids: Vec<&str> = info.formats.iter().map(|f| f.format_id.as_str()).collect();
@@ -2660,7 +3210,11 @@ mod tests {
         assert!(f22.label.contains("video + audio"), "label: {}", f22.label);
         let f137 = info.formats.iter().find(|f| f.format_id == "137").unwrap();
         assert!(f137.label.contains("1080p"), "label: {}", f137.label);
-        assert!(f137.label.contains("merged with best audio"), "label: {}", f137.label);
+        assert!(
+            f137.label.contains("merged with best audio"),
+            "label: {}",
+            f137.label
+        );
     }
 
     #[test]
@@ -2682,10 +3236,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(info.formats.len(), 4);
-        let source = info.formats.iter().find(|f| f.format_id == "source").unwrap();
+        let source = info
+            .formats
+            .iter()
+            .find(|f| f.format_id == "source")
+            .unwrap();
         assert_eq!(source.kind, FormatKind::Combined);
         assert!(!source.needs_merge);
-        assert!(source.label.contains("Original file"), "label: {}", source.label);
+        assert!(
+            source.label.contains("Original file"),
+            "label: {}",
+            source.label
+        );
         assert_eq!(info.default_format_id.as_deref(), Some("source"));
     }
 
@@ -2770,10 +3332,7 @@ mod tests {
         let info = parse_media_info(&youtube_json(), "https://example.com").unwrap();
         assert_eq!(info.formats.len(), 8);
         assert_eq!(
-            info.formats
-                .iter()
-                .filter(|f| f.format_id == "140")
-                .count(),
+            info.formats.iter().filter(|f| f.format_id == "140").count(),
             1
         );
     }
@@ -2841,6 +3400,8 @@ mod tests {
             duration_secs: Some(600),
             manifest_url: "https://example.com/master.m3u8".into(),
             segment_count: None,
+            audio_languages: Vec::new(),
+            subtitle_languages: Vec::new(),
             formats: vec![crate::media::StreamFormat {
                 id: "https://example.com/v.m3u8".into(),
                 ext: "ts".into(),
@@ -2910,18 +3471,23 @@ mod tests {
             format_selector(v137)
         );
         assert!(!selector_has_multiple_audio(&format_selector_multi(
-            v137, &yt.formats
+            v137,
+            &yt.formats
         )));
         // One tagged language only: still single-audio.
         let mut one = multilang_json();
         let formats = one.get_mut("formats").unwrap().as_array_mut().unwrap();
-        formats.retain(|f| f["language"].as_str() != Some("es") && f["language"].as_str() != Some("fr"));
+        formats.retain(|f| {
+            f["language"].as_str() != Some("es") && f["language"].as_str() != Some("fr")
+        });
         let one = parse_media_info(&one, "https://example.com").unwrap();
         let v = one.formats.iter().find(|f| f.format_id == "2637").unwrap();
         assert_eq!(format_selector_multi(v, &one.formats), format_selector(v));
         // Detector: only the first branch counts.
         assert!(selector_has_multiple_audio("2637+a+b/2637+bestaudio/2637"));
-        assert!(!selector_has_multiple_audio("137+bestaudio[ext=m4a]/137+bestaudio/137"));
+        assert!(!selector_has_multiple_audio(
+            "137+bestaudio[ext=m4a]/137+bestaudio/137"
+        ));
         assert!(!selector_has_multiple_audio("22"));
     }
 
@@ -2956,8 +3522,16 @@ mod tests {
         // merge to .mkv via opus audio).
         assert_eq!(plan.selector, "137+bestaudio[ext=m4a]/137+bestaudio/137");
         assert_eq!(plan.total_bytes, Some(200_000_000 + 12_000_000));
-        assert!(plan.filename.ends_with(".mp4"), "filename: {}", plan.filename);
-        assert!(plan.filename.starts_with("Big Buck Bunny"), "filename: {}", plan.filename);
+        assert!(
+            plan.filename.ends_with(".mp4"),
+            "filename: {}",
+            plan.filename
+        );
+        assert!(
+            plan.filename.starts_with("Big Buck Bunny"),
+            "filename: {}",
+            plan.filename
+        );
         // Default choice (no format id): 22, no merge.
         let plan = plan_from_info(&info, None, None).unwrap();
         assert_eq!(plan.format_id, "22");
@@ -2987,19 +3561,27 @@ mod tests {
     #[test]
     fn parses_progress_lines_and_sizes() {
         let (pct, total, speed) =
-            parse_progress_line("[download]  54.4% of  939.19KiB at    1.34MiB/s ETA 00:00").unwrap();
+            parse_progress_line("[download]  54.4% of  939.19KiB at    1.34MiB/s ETA 00:00")
+                .unwrap();
         assert!((pct - 54.4).abs() < 0.01);
         assert_eq!(total, Some((939.19 * 1024.0) as u64));
         assert_eq!(speed, (1.34 * 1024.0 * 1024.0) as u64 as f64);
         let (pct, total, _) =
-            parse_progress_line("[download] 100% of  939.19KiB in 00:00:02 at 386.04KiB/s").unwrap();
+            parse_progress_line("[download] 100% of  939.19KiB in 00:00:02 at 386.04KiB/s")
+                .unwrap();
         assert_eq!(pct, 100.0);
         assert!(total.is_some());
         assert!(parse_progress_line("[download] Destination: /tmp/x.mp4").is_none());
         assert!(parse_progress_line("[Merger] Merging formats into \"x.mp4\"").is_none());
         assert!(parse_progress_line("some other line").is_none());
-        assert_eq!(parse_size_token("4.12MiB"), Some((4.12 * 1024.0 * 1024.0) as u64));
-        assert_eq!(parse_size_token("1.5GiB"), Some((1.5 * 1024.0 * 1024.0 * 1024.0) as u64));
+        assert_eq!(
+            parse_size_token("4.12MiB"),
+            Some((4.12 * 1024.0 * 1024.0) as u64)
+        );
+        assert_eq!(
+            parse_size_token("1.5GiB"),
+            Some((1.5 * 1024.0 * 1024.0 * 1024.0) as u64)
+        );
         assert_eq!(parse_size_token("512B"), Some(512));
         assert_eq!(parse_size_token("Unknown"), None);
         // Round 10, item 2: yt-dlp prefixes estimated totals with
@@ -3034,7 +3616,8 @@ mod tests {
     #[test]
     fn drive_file_id_and_direct_url() {
         assert_eq!(
-            drive_file_id("https://drive.google.com/file/d/1FFVqpzcgA-T0db2l6Gz4XxxWBnDNYNg3/view").as_deref(),
+            drive_file_id("https://drive.google.com/file/d/1FFVqpzcgA-T0db2l6Gz4XxxWBnDNYNg3/view")
+                .as_deref(),
             Some("1FFVqpzcgA-T0db2l6Gz4XxxWBnDNYNg3")
         );
         assert_eq!(
@@ -3045,7 +3628,10 @@ mod tests {
             drive_file_id("https://drive.google.com/uc?export=download&id=XYZ").as_deref(),
             Some("XYZ")
         );
-        assert_eq!(drive_file_id("https://drive.google.com/drive/folders/ABC"), None);
+        assert_eq!(
+            drive_file_id("https://drive.google.com/drive/folders/ABC"),
+            None
+        );
         assert_eq!(drive_file_id("https://example.com/file/d/ABC/view"), None);
         assert_eq!(
             drive_direct_url("ABC123"),
@@ -3055,14 +3641,15 @@ mod tests {
 
     #[test]
     fn friendly_errors_map_ytdlp_stderr() {
-        assert!(friendly_media_error("ERROR: Unsupported URL: https://example.com")
-            .contains("not a supported video"));
-        assert!(friendly_media_error("ERROR: [youtube] abc: Private video")
-            .contains("private"));
-        assert!(friendly_media_error("ERROR: [youtube] abc: Video unavailable")
-            .contains("unavailable"));
-        assert!(friendly_media_error("ERROR: This video is DRM protected")
-            .contains("DRM"));
+        assert!(
+            friendly_media_error("ERROR: Unsupported URL: https://example.com")
+                .contains("not a supported video")
+        );
+        assert!(friendly_media_error("ERROR: [youtube] abc: Private video").contains("private"));
+        assert!(
+            friendly_media_error("ERROR: [youtube] abc: Video unavailable").contains("unavailable")
+        );
+        assert!(friendly_media_error("ERROR: This video is DRM protected").contains("DRM"));
         assert!(friendly_media_error("ERROR: HTTP Error 403: Forbidden").contains("403"));
         assert!(friendly_media_error("").contains("failed"));
     }
@@ -3152,11 +3739,7 @@ mod tests {
     /// grandchild, so a fixed dir name could collide with a leftover
     /// from an earlier test run.
     fn unique_temp_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "fetchforge-test-{}-{}",
-            tag,
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("fetchforge-test-{}-{}", tag, std::process::id()))
     }
 
     #[test]
@@ -3378,7 +3961,7 @@ mod tests {
         let stop_page = std::sync::Arc::new(AtomicBool::new(false));
         let (page_port, page_server) = serve_files(pages, stop_page.clone());
         let result =
-            try_html_embedded_fallback(&stub, &format!("http://127.0.0.1:{page_port}/page"));
+            try_html_embedded_fallback(&stub, &format!("http://127.0.0.1:{page_port}/page"), None);
         stop_media.store(true, Ordering::Relaxed);
         stop_page.store(true, Ordering::Relaxed);
         let _ = media_server.join();
@@ -3416,7 +3999,7 @@ mod tests {
         let stop_page = std::sync::Arc::new(AtomicBool::new(false));
         let (page_port, page_server) = serve_files(pages, stop_page.clone());
         let result =
-            try_html_embedded_fallback(&stub, &format!("http://127.0.0.1:{page_port}/page"));
+            try_html_embedded_fallback(&stub, &format!("http://127.0.0.1:{page_port}/page"), None);
         stop_media.store(true, Ordering::Relaxed);
         stop_page.store(true, Ordering::Relaxed);
         let _ = media_server.join();
@@ -3518,6 +4101,8 @@ mod tests {
             duration_secs: Some(120),
             manifest_url: "https://cdn.example.com/clip/master.m3u8".to_string(),
             segment_count: None,
+            audio_languages: Vec::new(),
+            subtitle_languages: Vec::new(),
             formats: vec![StreamFormat {
                 id: "https://cdn.example.com/clip/mid.m3u8".to_string(),
                 ext: "ts".to_string(),
@@ -3609,6 +4194,10 @@ exit 0
             expected_total: Some(10 * 1024),
             organise_by_category: true,
             referer: None,
+            subtitle_langs: Vec::new(),
+            audio_format: None,
+            proxy_url: None,
+            bandwidth_kbps: None,
         };
         let paused = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
@@ -3618,7 +4207,11 @@ exit 0
         };
         let final_path =
             download_media_with(&stub, None, &opts, &progress, &paused, &cancelled).unwrap();
-        assert!(final_path.is_file(), "final path missing: {}", final_path.display());
+        assert!(
+            final_path.is_file(),
+            "final path missing: {}",
+            final_path.display()
+        );
         assert_eq!(
             std::fs::read_to_string(&final_path).unwrap(),
             "FAKE-VIDEO-DATA"
@@ -3656,6 +4249,10 @@ exit 0
             expected_total: None,
             organise_by_category: false,
             referer: None,
+            subtitle_langs: Vec::new(),
+            audio_format: None,
+            proxy_url: None,
+            bandwidth_kbps: None,
         };
         let paused = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
@@ -3704,6 +4301,10 @@ exit 0
             expected_total: None,
             organise_by_category: false,
             referer: None,
+            subtitle_langs: Vec::new(),
+            audio_format: None,
+            proxy_url: None,
+            bandwidth_kbps: None,
         };
         let paused = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
@@ -3743,12 +4344,16 @@ exit 0
             expected_total: None,
             organise_by_category: false,
             referer: None,
+            subtitle_langs: Vec::new(),
+            audio_format: None,
+            proxy_url: None,
+            bandwidth_kbps: None,
         };
         let paused = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
         let progress = |_p: Progress| {};
-        let err = download_media_with(&stub, None, &opts, &progress, &paused, &cancelled)
-            .unwrap_err();
+        let err =
+            download_media_with(&stub, None, &opts, &progress, &paused, &cancelled).unwrap_err();
         assert!(err.contains("ffmpeg"), "error: {err}");
     }
 
@@ -3761,6 +4366,8 @@ exit 0
             duration_secs: Some(120),
             manifest_url: "https://example.com/clip/master.m3u8".to_string(),
             segment_count: None,
+            audio_languages: Vec::new(),
+            subtitle_languages: Vec::new(),
             formats: vec![
                 StreamFormat {
                     id: "https://example.com/clip/low.m3u8".to_string(),
@@ -3821,7 +4428,11 @@ exit 0
             media.default_format_id.as_deref(),
             Some("https://example.com/clip/mid.m3u8")
         );
-        assert!(media.formats[0].label.contains("720p"), "label: {}", media.formats[0].label);
+        assert!(
+            media.formats[0].label.contains("720p"),
+            "label: {}",
+            media.formats[0].label
+        );
     }
 
     /// Loopback server for stream-routing tests: serves `files` by
@@ -3933,9 +4544,7 @@ exit 0
                     let referer = req
                         .lines()
                         .find(|l| l.to_ascii_lowercase().starts_with("referer:"))
-                        .map(|l| {
-                            l.splitn(2, ':').nth(1).unwrap_or("").trim().to_string()
-                        });
+                        .map(|l| l.splitn(2, ':').nth(1).unwrap_or("").trim().to_string());
                     seen2.lock().unwrap().push(referer.unwrap_or_default());
                     let path = req
                         .lines()
@@ -3993,7 +4602,11 @@ exit 0
         // tagged as an HLS plan with an empty yt-dlp selector.
         let plan = plan_media_download(&dir, &url, None, None, &None, None).unwrap();
         assert_eq!(plan.format_id, format!("http://127.0.0.1:{port}/mid.m3u8"));
-        assert!(plan.filename.ends_with(".ts"), "filename: {}", plan.filename);
+        assert!(
+            plan.filename.ends_with(".ts"),
+            "filename: {}",
+            plan.filename
+        );
         assert!(!plan.needs_merge);
         assert_eq!(plan.stream_kind, Some(crate::media::StreamKind::Hls));
         assert_eq!(plan.selector, "");
@@ -4039,10 +4652,7 @@ exit 0
         assert_eq!(stem_for_title("Watching The Odyssey"), "The Odyssey");
         assert_eq!(stem_for_title("WATCHING Dune"), "Dune");
         assert_eq!(stem_for_title("Watch The Odyssey"), "The Odyssey");
-        assert_eq!(
-            stem_for_title("(3) Watching The Odyssey"),
-            "The Odyssey"
-        );
+        assert_eq!(stem_for_title("(3) Watching The Odyssey"), "The Odyssey");
         // A 4-digit parenthesised year is NOT a notification count.
         assert_eq!(stem_for_title("(2026) Dune"), "(2026) Dune");
         // Existing behaviour: sanitisation, empty fallback, cap.
@@ -4133,16 +4743,236 @@ exit 0
         assert_eq!(info.formats.len(), 3);
         let plan = plan_media_download(&dir, &url, None, None, &None, None).unwrap();
         assert_eq!(plan.format_id, "v720");
-        assert!(plan.filename.ends_with(".mp4"), "filename: {}", plan.filename);
+        assert!(
+            plan.filename.ends_with(".mp4"),
+            "filename: {}",
+            plan.filename
+        );
         assert!(plan.needs_merge);
         assert_eq!(plan.stream_kind, Some(crate::media::StreamKind::Dash));
         assert_eq!(plan.selector, "");
         // Audio-only choice: .m4a, no merge.
         let plan = plan_media_download(&dir, &url, Some("a64k"), None, &None, None).unwrap();
         assert_eq!(plan.format_id, "a64k");
-        assert!(plan.filename.ends_with(".m4a"), "filename: {}", plan.filename);
+        assert!(
+            plan.filename.ends_with(".m4a"),
+            "filename: {}",
+            plan.filename
+        );
         assert!(!plan.needs_merge);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
+    }
+
+    // --- Round 11 extension tests ---
+
+    fn media_format_for_test(
+        id: &str,
+        kind: FormatKind,
+        ext: &str,
+        height: Option<u32>,
+        abr: Option<f64>,
+        language: Option<&str>,
+    ) -> MediaFormat {
+        MediaFormat {
+            format_id: id.to_string(),
+            label: id.to_string(),
+            ext: ext.to_string(),
+            kind,
+            height,
+            width: None,
+            abr,
+            vbr: None,
+            fps: None,
+            language: language.map(|l| l.to_string()),
+            filesize: None,
+            filesize_approx: false,
+            size_kind: None,
+            needs_merge: kind == FormatKind::VideoOnly,
+        }
+    }
+
+    #[test]
+    fn parse_media_info_reads_subtitle_langs_audio_languages_and_playlist() {
+        let json = serde_json::json!({
+            "title": "Test",
+            "extractor": "youtube",
+            "duration": 600,
+            "webpage_url": "https://example.com/watch?v=x&list=PL1",
+            "playlist": "My Series",
+            "playlist_title": "My Series",
+            "playlist_count": 12,
+            "subtitles": { "en": [], "es": [] },
+            "automatic_captions": { "fr": [] },
+            "formats": [
+                {"format_id": "137", "ext": "mp4", "vcodec": "avc1", "acodec": "none", "height": 1080},
+                {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "abr": 128, "language": "en"},
+                {"format_id": "141", "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "abr": 96, "language": "es"}
+            ]
+        });
+        let info = parse_media_info(&json, "https://example.com/watch?v=x&list=PL1").unwrap();
+        // Human subtitles only — automatic_captions ("fr") is NOT offered.
+        assert_eq!(
+            info.subtitle_langs,
+            vec!["en".to_string(), "es".to_string()]
+        );
+        assert_eq!(
+            info.audio_languages,
+            vec!["en".to_string(), "es".to_string()]
+        );
+        assert!(info.is_playlist);
+        assert_eq!(info.playlist_title.as_deref(), Some("My Series"));
+        assert_eq!(info.playlist_count, Some(12));
+    }
+
+    #[test]
+    fn format_selector_for_language_picks_only_that_language() {
+        let formats = vec![
+            media_format_for_test("137", FormatKind::VideoOnly, "mp4", Some(1080), None, None),
+            media_format_for_test(
+                "140",
+                FormatKind::AudioOnly,
+                "m4a",
+                None,
+                Some(128.0),
+                Some("en"),
+            ),
+            media_format_for_test(
+                "141",
+                FormatKind::AudioOnly,
+                "m4a",
+                None,
+                Some(96.0),
+                Some("es"),
+            ),
+        ];
+        let sel = format_selector_for_language(&formats[0], &formats, "es");
+        assert!(sel.starts_with("137+141/"), "selector: {sel}");
+        assert!(
+            !sel.contains("140"),
+            "selector must not include English: {sel}"
+        );
+        // Unknown language falls back to the plain selector.
+        let sel = format_selector_for_language(&formats[0], &formats, "xx");
+        assert!(sel.contains("bestaudio"), "selector: {sel}");
+        // Audio-only formats return their own id.
+        assert_eq!(
+            format_selector_for_language(&formats[1], &formats, "es"),
+            "140"
+        );
+    }
+
+    #[test]
+    fn parse_playlist_info_reads_entries_and_skips_bare_ids() {
+        let json = serde_json::json!({
+            "_type": "playlist",
+            "title": "My Series",
+            "entries": [
+                {"title": "Ep 1", "webpage_url": "https://example.com/v/1", "playlist_index": 1, "duration": 600},
+                {"title": "Ep 2", "url": "https://example.com/v/2", "playlist_index": 2},
+                {"title": "Dead", "url": "dQw4w9WgXcQ"}
+            ]
+        });
+        let info = parse_playlist_info(&json, "https://example.com/list/PL1").unwrap();
+        assert_eq!(info.title, "My Series");
+        assert_eq!(info.entries.len(), 2, "the bare-id entry is skipped");
+        assert_eq!(info.entries[0].url, "https://example.com/v/1");
+        assert_eq!(info.entries[0].index, 1);
+        assert_eq!(info.entries[0].duration_secs, Some(600));
+        assert_eq!(info.entries[1].index, 2);
+        let single = serde_json::json!({"_type": "video", "title": "One"});
+        assert!(parse_playlist_info(&single, "https://example.com/v/1").is_err());
+    }
+
+    #[test]
+    fn next_lower_format_steps_down_the_ladder() {
+        let formats = vec![
+            media_format_for_test("1080", FormatKind::VideoOnly, "mp4", Some(1080), None, None),
+            media_format_for_test("720", FormatKind::VideoOnly, "mp4", Some(720), None, None),
+            media_format_for_test("480", FormatKind::VideoOnly, "mp4", Some(480), None, None),
+            media_format_for_test("140", FormatKind::AudioOnly, "m4a", None, Some(128.0), None),
+        ];
+        assert_eq!(next_lower_format(&formats, 1080).unwrap().format_id, "720");
+        assert_eq!(next_lower_format(&formats, 1440).unwrap().format_id, "1080");
+        assert!(
+            next_lower_format(&formats, 480).is_none(),
+            "480 is the lowest"
+        );
+        assert!(next_lower_format(&formats, 144).is_none());
+    }
+
+    #[test]
+    fn remove_partial_files_only_removes_this_downloads_parts() {
+        let dir = unique_temp_dir("remove-partials");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "Movie.mp4.part",
+            "Movie.f137.mp4.part",
+            "Movie.f140.m4a.part",
+            "Movie.part",
+            "Movie.mp4",           // finished file: must survive
+            "Movie.2024.mp4.part", // another download's part: must survive
+            "Other.mp4.part",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let removed = remove_partial_files(&dir, "Movie", "mp4");
+        assert_eq!(removed, 4);
+        assert!(dir.join("Movie.mp4").is_file());
+        assert!(dir.join("Movie.2024.mp4.part").is_file());
+        assert!(dir.join("Other.mp4.part").is_file());
+        assert!(!dir.join("Movie.mp4.part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_from_info_with_language_uses_single_language_selector() {
+        let formats = vec![
+            media_format_for_test("137", FormatKind::VideoOnly, "mp4", Some(1080), None, None),
+            media_format_for_test(
+                "140",
+                FormatKind::AudioOnly,
+                "m4a",
+                None,
+                Some(128.0),
+                Some("en"),
+            ),
+            media_format_for_test(
+                "141",
+                FormatKind::AudioOnly,
+                "m4a",
+                None,
+                Some(96.0),
+                Some("es"),
+            ),
+        ];
+        let info = MediaInfo {
+            title: "Test".to_string(),
+            extractor: "youtube".to_string(),
+            duration_secs: Some(600),
+            webpage_url: "https://example.com/v".to_string(),
+            formats,
+            default_format_id: Some("137".to_string()),
+            resolved_url: None,
+            audio_languages: vec!["en".to_string(), "es".to_string()],
+            subtitle_langs: Vec::new(),
+            is_playlist: false,
+            playlist_title: None,
+            playlist_count: None,
+        };
+        let plan = plan_from_info_with_language(&info, Some("137"), None, Some("es")).unwrap();
+        assert!(
+            plan.selector.starts_with("137+141/"),
+            "selector: {}",
+            plan.selector
+        );
+        assert_eq!(plan.format_kind.as_deref(), Some("video"));
+        // No language: the multi selector keeps both languages.
+        let plan = plan_from_info(&info, Some("137"), None).unwrap();
+        assert!(
+            plan.selector.contains("140") && plan.selector.contains("141"),
+            "selector: {}",
+            plan.selector
+        );
     }
 }

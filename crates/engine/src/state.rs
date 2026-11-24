@@ -179,6 +179,70 @@ pub struct DownloadRecord {
     /// `#[serde(default)]` so older history files still load.
     #[serde(default)]
     pub size_kind: Option<crate::media::SizeKind>,
+    /// Media downloads only (round 11 extension, feature 4): the
+    /// audio language the user picked (an ISO 639 code such as
+    /// "en", or a rendition name such as "English"), when the
+    /// stream offers several audio tracks. None means the
+    /// default: yt-dlp's multi-audio selector (all tagged
+    /// languages) or the first HLS/DASH audio rendition.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub audio_lang: Option<String>,
+    /// Media downloads only (round 11 extension, feature 2): the
+    /// subtitle languages the user picked (ISO 639 codes, e.g.
+    /// ["en"]). Empty means no subtitles. yt-dlp downloads get
+    /// them embedded; HLS/DASH downloads mux the first chosen
+    /// language (or save it as a sidecar when the container
+    /// cannot hold subtitles).
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub subtitle_langs: Vec<String>,
+    /// Audio-only downloads only (round 11 extension, feature
+    /// 13): the audio container the user picked — "mp3", "opus"
+    /// or "m4a". None means the default ("m4a"). Applies only
+    /// when the chosen format is audio-only (see `format_kind`).
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub audio_format: Option<String>,
+    /// Media downloads only (round 11 extension): what the
+    /// chosen format contains — "audio", "video" or "combined",
+    /// set at plan time from the chosen format's kind. The
+    /// worker uses it to decide whether the audio-format choice
+    /// applies (audio only) and whether a quality downgrade is
+    /// possible (video formats only). None for direct downloads
+    /// and records planned before this field existed.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub format_kind: Option<String>,
+    /// Playlist downloads only (round 11 extension, feature 11):
+    /// the playlist's title, so the list can group the items.
+    /// None for standalone downloads.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub playlist: Option<String>,
+    /// Playlist downloads only (round 11 extension, feature 11):
+    /// this item's 1-based position in its playlist. None for
+    /// standalone downloads.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub playlist_index: Option<u32>,
+    /// Quality-downgrade retries only (round 11 extension,
+    /// feature 9): the quality label the download originally
+    /// picked (e.g. "1080p"), kept when a failure retried at the
+    /// next lower quality, so the UI can say what happened.
+    /// None when no downgrade happened.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub downgraded_from: Option<String>,
+    /// Quality-downgrade retries only (round 11 extension,
+    /// feature 9): true once a downgrade retry has been
+    /// attempted for this record. A downgrade happens at most
+    /// once per download — a failure at the lower quality fails
+    /// outright instead of stepping down again, and a manual
+    /// resume never re-downgrades.
+    /// `#[serde(default)]` so older history files still load.
+    #[serde(default)]
+    pub downgrade_attempted: bool,
 }
 
 impl DownloadRecord {
@@ -310,6 +374,43 @@ impl DownloadRecord {
         self.quality_note = Some(format!(
             "Delivered {delivered}; the site listed this stream as {picked}."
         ));
+    }
+
+    /// The audio container for an audio-only download (round 11
+    /// extension, feature 13): the user's pick when it is one of
+    /// the supported formats, else the "m4a" default. An
+    /// unsupported stored value (a hand-edited record, a future
+    /// format) falls back to the default instead of failing.
+    pub fn audio_extension(&self) -> &'static str {
+        match self.audio_format.as_deref() {
+            Some("mp3") => "mp3",
+            Some("opus") => "opus",
+            _ => "m4a",
+        }
+    }
+
+    /// Reset this record for a quality-downgrade retry (round 11
+    /// extension, feature 9): back to "pending" with the new
+    /// format id, progress cleared (the lower quality starts
+    /// fresh — its segments/.part files are not the old ones),
+    /// and the downgrade recorded so it happens at most once.
+    /// The worker re-plans the record from the new format id.
+    pub fn reset_for_downgrade(&mut self, new_format_id: String, old_label: String) {
+        self.format_id = Some(new_format_id);
+        self.format_selector = None;
+        self.stream_kind = Some("pending".to_string());
+        self.status = Status::Queued;
+        self.total_bytes = None;
+        self.downloaded_bytes = 0;
+        self.segments_total = None;
+        self.segments_done = 0;
+        self.estimated_total_bytes = None;
+        self.speed_bps = None;
+        self.size_kind = None;
+        self.error = None;
+        self.downgraded_from = Some(old_label);
+        self.downgrade_attempted = true;
+        self.updated_unix = now_secs();
     }
 }
 
@@ -484,7 +585,11 @@ pub fn delete_download_files(
         }
     }
     for final_path in &finals {
-        let name = final_path.file_name().unwrap().to_string_lossy().to_string();
+        let name = final_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let parent = final_path.parent().unwrap_or(download_dir);
         if try_remove_file(final_path) {
             removed += 1;
@@ -729,8 +834,7 @@ impl Store {
                 Some(_) if active.contains(&id) => {}
                 // Terminal in memory, non-terminal on disk: a
                 // terminal record never un-completes.
-                Some(ours)
-                    if ours.status.is_terminal() && !disk_rec.status.is_terminal() => {}
+                Some(ours) if ours.status.is_terminal() && !disk_rec.status.is_terminal() => {}
                 Some(ours) if disk_rec.updated_unix > ours.updated_unix => {
                     self.records.insert(id, disk_rec);
                 }
@@ -952,6 +1056,14 @@ mod tests {
             quality_note: None,
             speed_bps: None,
             size_kind: None,
+            audio_lang: None,
+            subtitle_langs: Vec::new(),
+            audio_format: None,
+            format_kind: None,
+            playlist: None,
+            playlist_index: None,
+            downgraded_from: None,
+            downgrade_attempted: false,
         });
         s.save().unwrap();
         let mut s2 = Store::load(path);
@@ -995,6 +1107,14 @@ mod tests {
             quality_note: None,
             speed_bps: None,
             size_kind: None,
+            audio_lang: None,
+            subtitle_langs: Vec::new(),
+            audio_format: None,
+            format_kind: None,
+            playlist: None,
+            playlist_index: None,
+            downgraded_from: None,
+            downgrade_attempted: false,
         }
     }
 
@@ -1638,7 +1758,11 @@ mod tests {
         r.apply_progress(&forward);
         assert_eq!(r.downloaded_bytes, 600_000_000);
         assert_eq!(r.segments_done, 700);
-        assert_eq!(r.total_bytes, Some(1_000_000_000), "None never wipes a total");
+        assert_eq!(
+            r.total_bytes,
+            Some(1_000_000_000),
+            "None never wipes a total"
+        );
     }
 
     #[test]
@@ -1745,6 +1869,48 @@ mod tests {
         let mut unknown = rec("q3");
         unknown.apply_delivered_quality(Some(720), Some(865));
         assert!(unknown.quality_note.is_none());
+    }
+
+    #[test]
+    fn audio_extension_defaults_to_m4a_and_rejects_unknown() {
+        // Round 11 extension, feature 13: the audio container is
+        // the user's pick when supported, else the m4a default —
+        // an unsupported stored value never fails the download.
+        let mut r = rec("a1");
+        assert_eq!(r.audio_extension(), "m4a");
+        r.audio_format = Some("mp3".to_string());
+        assert_eq!(r.audio_extension(), "mp3");
+        r.audio_format = Some("opus".to_string());
+        assert_eq!(r.audio_extension(), "opus");
+        r.audio_format = Some("flac".to_string());
+        assert_eq!(r.audio_extension(), "m4a");
+    }
+
+    #[test]
+    fn reset_for_downgrade_requeues_pending_and_records_once() {
+        // Round 11 extension, feature 9: the record goes back to
+        // "pending" with the new format id, progress cleared, and
+        // the downgrade recorded so it happens at most once.
+        let mut r = rec("d1");
+        r.status = Status::Failed;
+        r.format_id = Some("137".to_string());
+        r.format_selector = Some("137+bestaudio".to_string());
+        r.stream_kind = None;
+        r.total_bytes = Some(1000);
+        r.downloaded_bytes = 500;
+        r.segments_done = 10;
+        r.error = Some("boom".to_string());
+        r.reset_for_downgrade("136".to_string(), "1080p".to_string());
+        assert_eq!(r.status, Status::Queued);
+        assert_eq!(r.format_id.as_deref(), Some("136"));
+        assert!(r.format_selector.is_none());
+        assert_eq!(r.stream_kind.as_deref(), Some("pending"));
+        assert!(r.total_bytes.is_none());
+        assert_eq!(r.downloaded_bytes, 0);
+        assert_eq!(r.segments_done, 0);
+        assert!(r.error.is_none());
+        assert_eq!(r.downgraded_from.as_deref(), Some("1080p"));
+        assert!(r.downgrade_attempted);
     }
 
     #[test]

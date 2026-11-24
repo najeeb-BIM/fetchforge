@@ -65,6 +65,7 @@ fn segmented_progress_rises_while_downloading() {
         max_retries: 0,
         bandwidth_kbps: None,
         referer: None,
+        proxy_url: None,
         user_agent: None,
         organise_by_category: false,
     };

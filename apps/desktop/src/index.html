@@ -58,7 +58,29 @@ try {
     <p id="fpMeta"></p>
     <div id="fpList" role="radiogroup" aria-label="Available qualities"></div>
     <p id="fpMergeNote" class="merge-note" hidden>This quality merges separate video and audio streams. FFmpeg is needed for the merge: it is downloaded once (about 120 MB) if it is not already installed.</p>
+    <!-- Round 11 extension, features 2/4/13: the picker options —
+         audio language (when several tracks exist), subtitles
+         (when the page offers any), and the audio format (only
+         when the chosen format is audio-only). Each row is shown
+         only when relevant; the Download button reads them at
+         click time. -->
+    <div id="fpOptions" class="fp-options">
+      <label id="fpAudioLangRow" class="fp-opt-row" hidden>Audio language
+        <select id="fpAudioLang"></select>
+      </label>
+      <div id="fpSubRow" class="fp-opt-row" hidden><span class="fp-opt-label">Subtitles</span><div id="fpSubList" class="fp-sub-list"></div></div>
+      <label id="fpAudioFmtRow" class="fp-opt-row" hidden>Audio format
+        <select id="fpAudioFmt">
+          <option value="m4a">M4A</option>
+          <option value="mp3">MP3</option>
+          <option value="opus">Opus</option>
+        </select>
+      </label>
+    </div>
     <button id="fpDownloadBtn">Download</button>
+    <!-- Round 11 extension, feature 11: shown only when the
+         listed URL is a playlist. -->
+    <button id="fpPlaylistBtn" class="secondary" hidden>Download all videos</button>
     <button id="fpCancelBtn" class="secondary">Cancel</button>
   </section>
   <section id="deleteConfirm" class="format-picker" hidden>
@@ -94,7 +116,28 @@ try {
     <button data-view="detector" role="tab" aria-selected="false">Media Detector</button>
     <button data-view="history" role="tab" aria-selected="false">History</button>
     <button data-view="sites" role="tab" aria-selected="false">Sites</button>
+    <button data-view="settings" role="tab" aria-selected="false">Settings</button>
   </nav>
+  <!-- Round 11 extension, features 3/7/8/10: the settings panel —
+       speed limit, proxy, shutdown-when-finished (opt-in, with a
+       confirmation), and completion notifications. Saved to the
+       shared settings.json, so the bridge and the app agree. -->
+  <section id="view-settings" class="view" hidden>
+    <h2>Settings</h2>
+    <div class="settings-form">
+      <label>Speed limit (KB/s, empty = no limit)
+        <input id="setSpeed" type="number" min="0" step="1" placeholder="No limit">
+      </label>
+      <label>Proxy (http://, https:// or socks5://, empty = none)
+        <input id="setProxy" type="text" placeholder="http://proxy.example.com:8080" autocomplete="off">
+      </label>
+      <label class="check-row"><input id="setShutdown" type="checkbox"> Shut down the computer when all downloads finish</label>
+      <p class="settings-note">When this is on, FetchForge shuts the computer down 60 seconds after the last download completes. You can stop it in that minute with <code>shutdown /a</code>. It never fires while a download is queued, downloading, or paused.</p>
+      <label class="check-row"><input id="setNotify" type="checkbox" checked> Notify me when a download finishes</label>
+      <button id="setSaveBtn">Save settings</button>
+      <span id="setStatus"></span>
+    </div>
+  </section>
   <section id="view-sites" class="view" hidden>
     <h2>Movie sites FetchForge works with</h2>
     <p class="sites-note">Click a site to open it in your browser, then download with the extension. These are unofficial sites whose addresses change — the list is a convenience, not a guarantee.</p>
@@ -369,9 +412,14 @@ async function api(path, method = "GET", body) {
     if (path === "/downloads" && method === "GET") return invokeTimed("list_downloads");
     if (path === "/downloads" && method === "POST") return invokeTimed("add_download", body, ADD_TIMEOUT_MS);
     if (path === "/downloads/clear-finished" && method === "POST") return invokeTimed("clear_finished_downloads");
+    if (path === "/downloads/batch" && method === "POST") return invokeTimed("add_download_batch", { items: body.items }, ADD_TIMEOUT_MS);
+    if (path === "/downloads/playlist" && method === "POST") return invokeTimed("add_playlist_download", body, ADD_TIMEOUT_MS);
+    if (path === "/settings" && method === "GET") return invokeTimed("get_settings");
+    if (path === "/settings" && method === "POST") return invokeTimed("update_settings", { settings: body });
     if (path === "/pair/status" && method === "GET") return invokeTimed("pair_status");
     if (path === "/pair/browsers" && method === "GET") return invokeTimed("paired_browsers");
     if (path === "/media/formats" && method === "POST") return invokeTimed("media_formats", body, FORMATS_TIMEOUT_MS);
+    if (path === "/media/playlist" && method === "POST") return invokeTimed("media_playlist", body, FORMATS_TIMEOUT_MS);
     if (path === "/media/detected" && method === "GET") return invokeTimed("list_detected_media");
     if (path === "/media/detected/clear" && method === "POST") return invokeTimed("clear_detected_media");
     if (path === "/cache/clear" && method === "POST") return invokeTimed("clear_cache");
@@ -425,7 +473,9 @@ function showView(v) {
   document.getElementById("view-dashboard").hidden = v !== "dashboard";
   document.getElementById("view-detector").hidden = v !== "detector";
   document.getElementById("view-sites").hidden = v !== "sites";
+  document.getElementById("view-settings").hidden = v !== "settings";
   if (v === "sites") renderSites();
+  if (v === "settings") loadSettings();
   document.getElementById("view-downloads").hidden =
     !(v === "downloads" || v === "history");
   // A stale status filter would hide everything in a filtered view
@@ -516,6 +566,74 @@ function renderDashboard(all) {
     li.textContent = d.filename + " — " + d.status + (d.error ? " - " + d.error : "");
     ul.appendChild(li);
   }
+}
+
+// ---- Settings (round 11 extension, features 3/7/8/10) ----
+// The settings are cached after the first load: the
+// notifications gate in refresh() reads them without a server
+// call each poll. Null until loaded — notifications default ON.
+let cachedSettings = null;
+async function loadSettings() {
+  const status = document.getElementById("setStatus");
+  try {
+    const s = await api("/settings", "GET");
+    cachedSettings = s;
+    document.getElementById("setSpeed").value = s.bandwidth_kbps != null ? String(s.bandwidth_kbps) : "";
+    document.getElementById("setProxy").value = s.proxy_url || "";
+    document.getElementById("setShutdown").checked = !!s.shutdown_when_finished;
+    document.getElementById("setNotify").checked = s.notifications_enabled !== false;
+    status.textContent = "";
+  } catch (e) {
+    status.textContent = "Could not load settings: " + e.message;
+  }
+}
+// Shutdown is an explicit opt-in: checking the box asks once
+// more, and a cancelled confirm leaves it unchecked.
+document.getElementById("setShutdown").onchange = (ev) => {
+  if (ev.target.checked && !window.confirm("Shut down this computer 60 seconds after the last download finishes? You can stop it in that minute with shutdown /a.")) {
+    ev.target.checked = false;
+  }
+};
+document.getElementById("setSaveBtn").onclick = async () => {
+  const btn = document.getElementById("setSaveBtn");
+  const status = document.getElementById("setStatus");
+  const speedRaw = document.getElementById("setSpeed").value.trim();
+  const speed = speedRaw === "" ? null : Math.max(0, Math.floor(Number(speedRaw)));
+  const body = {
+    bandwidth_kbps: Number.isFinite(speed) ? speed : null,
+    proxy_url: document.getElementById("setProxy").value.trim() || null,
+    shutdown_when_finished: document.getElementById("setShutdown").checked,
+    notifications_enabled: document.getElementById("setNotify").checked,
+  };
+  setBusy(btn, true, "Saving…");
+  try {
+    const saved = await api("/settings", "POST", body);
+    cachedSettings = saved;
+    status.textContent = "Settings saved.";
+  } catch (e) {
+    status.textContent = "Could not save settings: " + e.message;
+  } finally { setBusy(btn, false); }
+};
+// ---- Completion notifications (round 11 extension, feature 8) ----
+// The Web Notification API — a desktop toast in Tauri's
+// WebView2. The seen-set is seeded on the first load, so
+// downloads that finished before this page opened never notify.
+// The user is only asked for permission once, when the first
+// download finishes.
+const notifiedCompleted = new Set();
+let notificationsSeeded = false;
+function notifyCompleted(d) {
+  if (cachedSettings && cachedSettings.notifications_enabled === false) return;
+  try {
+    if (!("Notification" in window)) return;
+    if (Notification.permission === "granted") {
+      new Notification("FetchForge", { body: d.filename + " finished downloading." });
+    } else if (Notification.permission !== "denied") {
+      Notification.requestPermission().then((p) => {
+        if (p === "granted") new Notification("FetchForge", { body: d.filename + " finished downloading." });
+      });
+    }
+  } catch (_) { /* notifications unavailable: silent */ }
 }
 
 // Last path segment of a URL, decoded, query stripped. "" when the
@@ -631,28 +749,29 @@ document.getElementById("detDownloadBtn").onclick = async () => {
   // item's page URL goes as the Referer (signed CDNs refuse
   // requests without it) and a paired audio variant is passed
   // through so the two tracks download and merge as one file.
+  // Round 11 extension, feature 5: one batch call for all
+  // selected items instead of one add per item. Direct add, no
+  // picker: the Rust side auto-picks a quality for a page URL,
+  // so a batch never opens the picker once per item.
   const items = detectedItems.filter((item) => detSelected.has(item.url));
-  const urls = items.map((item) => item.url);
-  if (!urls.length) { setError("Select at least one detected item first.", "action"); return; }
+  if (!items.length) { setError("Select at least one detected item first.", "action"); return; }
   const btn = document.getElementById("detDownloadBtn");
   setBusy(btn, true, "Adding…");
-  let added = 0, failed = 0, firstError = "";
-  for (const item of items) {
-    try {
-      // Direct add, no picker: the Rust side auto-picks a quality for
-      // a page URL, so a batch never opens the picker once per item.
-      await api("/downloads", "POST", { url: item.url, audio_url: item.audio_url, referer: item.page_url });
-      detSelected.delete(item.url);
-      added += 1;
-    } catch (e) { failed += 1; if (!firstError) firstError = e.message; }
-  }
-  setBusy(btn, false);
-  // Refresh first, then report: refresh() ends by writing "N shown",
-  // so reporting before it would be overwritten before the user reads it.
-  await refresh();
-  clearError();
-  setStatus("Added " + added + " of " + urls.length + " selected."
-    + (failed ? " " + failed + " failed: " + firstError : ""));
+  try {
+    const r = await api("/downloads/batch", "POST", { items: items.map((item) => ({ url: item.url, audio_url: item.audio_url, referer: item.page_url })) });
+    const added = (r && r.added) || [];
+    const errors = (r && r.errors) || [];
+    for (const rec of added) detSelected.delete(rec.url);
+    // Refresh first, then report: refresh() ends by writing
+    // "N shown", so reporting before it would be overwritten
+    // before the user reads it.
+    await refresh();
+    clearError();
+    setStatus("Added " + added.length + " of " + items.length + " selected."
+      + (errors.length ? " " + errors.length + " failed: " + (errors[0].error || "") : ""));
+  } catch (e) {
+    setError("Could not add selected items: " + e.message, "action");
+  } finally { setBusy(btn, false); }
 };
 // Clear detector: removes all detected media from the panel only.
 // Downloads and history are not affected.
@@ -674,6 +793,24 @@ document.getElementById("detClearBtn").onclick = async () => {
 async function refresh() {
   try {
     const all = await api("/downloads");
+    // Round 11 extension, feature 8: completion notifications.
+    // The first load only seeds the seen-set (old completions
+    // never notify); later polls notify for newly completed
+    // records. The set also drops ids that left the list, so it
+    // does not grow forever.
+    if (!notificationsSeeded) {
+      for (const d of all) if (d.status === "completed") notifiedCompleted.add(d.id);
+      notificationsSeeded = true;
+    } else {
+      const live = new Set(all.map((d) => d.id));
+      for (const id of notifiedCompleted) { if (!live.has(id)) notifiedCompleted.delete(id); }
+      for (const d of all) {
+        if (d.status === "completed" && !notifiedCompleted.has(d.id)) {
+          notifiedCompleted.add(d.id);
+          notifyCompleted(d);
+        }
+      }
+    }
     // Detected media is fetched only for the views that show it, so
     // the 2s cycle stays one call on the plain list views. A failure
     // here must never break the download list (own try/catch).
@@ -718,6 +855,21 @@ async function refresh() {
         const note = document.createElement("div");
         note.className = "quality-note";
         note.textContent = d.quality_note;
+        tdStatus.appendChild(note);
+      }
+      // Round 11 extension, feature 9: a downgraded download
+      // says what it was retried from. Feature 11: a playlist
+      // item says which playlist it came from and its position.
+      if (d.downgraded_from) {
+        const note = document.createElement("div");
+        note.className = "quality-note";
+        note.textContent = "Retried at a lower quality (was " + d.downgraded_from + ")";
+        tdStatus.appendChild(note);
+      }
+      if (d.playlist) {
+        const note = document.createElement("div");
+        note.className = "quality-note";
+        note.textContent = "Playlist: " + d.playlist + (d.playlist_index != null ? " · #" + d.playlist_index : "");
         tdStatus.appendChild(note);
       }
       const tdProg = document.createElement("td");
@@ -897,7 +1049,7 @@ async function addUrl(url, filename) {
     } catch (e) { /* fall through to a plain add */ }
   }
   try {
-    await api("/downloads", "POST", { url, filename });
+    await api("/downloads", "POST", { url, filename, audio_lang: null, subtitle_langs: [], audio_format: null });
     clearError();
     setStatus("Added.");
     refresh();
@@ -973,14 +1125,77 @@ function showFormatPicker(info, url, filename) {
   if (!list.querySelector("input:checked") && list.firstChild) {
     list.querySelector("input").checked = true;
   }
+  // Round 11 extension, features 2/4: the picker options — audio
+  // language (only when several tracks exist) and subtitles
+  // (only when the page offers any). Each row is hidden when it
+  // does not apply, so a plain video keeps a plain picker.
+  const langRow = document.getElementById("fpAudioLangRow");
+  const langSel = document.getElementById("fpAudioLang");
+  langSel.textContent = "";
+  const langs = info.audio_languages || [];
+  if (langs.length > 1) {
+    const def = document.createElement("option");
+    def.value = ""; def.textContent = "Default";
+    langSel.appendChild(def);
+    for (const l of langs) {
+      const o = document.createElement("option");
+      o.value = l; o.textContent = l;
+      langSel.appendChild(o);
+    }
+    langRow.hidden = false;
+  } else {
+    langRow.hidden = true;
+  }
+  const subRow = document.getElementById("fpSubRow");
+  const subList = document.getElementById("fpSubList");
+  subList.textContent = "";
+  const subs = info.subtitle_langs || [];
+  if (subs.length) {
+    for (const l of subs) {
+      const label = document.createElement("label");
+      label.className = "fp-sub-check";
+      const cb = document.createElement("input");
+      cb.type = "checkbox"; cb.value = l;
+      label.append(cb, document.createTextNode(l));
+      subList.appendChild(label);
+    }
+    subRow.hidden = false;
+  } else {
+    subRow.hidden = true;
+  }
+  // Feature 11: the formats listing already knows this URL is a
+  // playlist, so the picker offers the whole list alongside the
+  // single-video download.
+  const plBtn = document.getElementById("fpPlaylistBtn");
+  if (info.is_playlist) {
+    const n = info.playlist_count;
+    plBtn.textContent = "Download all " + (n != null ? n + " videos" : "videos");
+    plBtn.hidden = false;
+  } else {
+    plBtn.hidden = true;
+  }
   updateMergeNote();
   document.getElementById("formatPicker").hidden = false;
+}
+// The picker options as an add body: audio language (null =
+// default), the checked subtitle languages, and the audio
+// format (only when the audio-format row is visible — a video
+// format has no audio format).
+function pickerOptions() {
+  return {
+    audio_lang: document.getElementById("fpAudioLang").value || null,
+    subtitle_langs: [...document.querySelectorAll("#fpSubList input:checked")].map((cb) => cb.value),
+    audio_format: document.getElementById("fpAudioFmtRow").hidden ? null : document.getElementById("fpAudioFmt").value,
+  };
 }
 function updateMergeNote() {
   if (!pendingMedia) return;
   const checked = document.querySelector("#fpList input:checked");
   const f = checked && pendingMedia.info.formats.find((x) => x.format_id === checked.value);
   document.getElementById("fpMergeNote").hidden = !(f && f.needs_merge);
+  // Round 11 extension, feature 13: the audio-format select
+  // shows only when the chosen format is audio-only.
+  document.getElementById("fpAudioFmtRow").hidden = !(f && f.kind === "audio_only");
 }
 function hideFormatPicker() {
   pendingMedia = null;
@@ -996,7 +1211,7 @@ document.getElementById("fpDownloadBtn").onclick = async () => {
   const btn = document.getElementById("fpDownloadBtn");
   setBusy(btn, true, "Adding…");
   try {
-    await api("/downloads", "POST", { url, filename, format_id });
+    await api("/downloads", "POST", { url, filename, format_id, ...pickerOptions() });
     hideFormatPicker();
     clearError();
     setStatus("Added.");
@@ -1008,6 +1223,34 @@ document.getElementById("fpDownloadBtn").onclick = async () => {
       setTimeout(refresh, 5000);
     } else {
       setError("Could not add download: " + e.message, "action");
+    }
+  } finally { setBusy(btn, false); }
+};
+// Round 11 extension, feature 11: download the whole playlist
+// from the picker. The language/subtitle/audio-format options
+// apply to every video in the list.
+document.getElementById("fpPlaylistBtn").onclick = async () => {
+  if (!pendingMedia) return;
+  const { url } = pendingMedia;
+  const btn = document.getElementById("fpPlaylistBtn");
+  setBusy(btn, true, "Adding…");
+  try {
+    const r = await api("/downloads/playlist", "POST", { url, ...pickerOptions() });
+    const added = (r && r.added) || [];
+    const errors = (r && r.errors) || [];
+    hideFormatPicker();
+    clearError();
+    setStatus("Added " + added.length + " playlist videos."
+      + (errors.length ? " " + errors.length + " failed: " + (errors[0].error || "") : "")
+      + (r && r.truncated ? " (list capped at 200)" : ""));
+    refresh();
+  } catch (e) {
+    if (e.code === "TIMEOUT") {
+      hideFormatPicker();
+      setStatus("Still adding — if the videos appear in the list, they were added.");
+      setTimeout(refresh, 5000);
+    } else {
+      setError("Could not add playlist: " + e.message, "action");
     }
   } finally { setBusy(btn, false); }
 };
@@ -1030,6 +1273,10 @@ async function refreshPairedCount() {
   }
 }
 refreshPairedCount();
+// Seed the cached settings once at startup, so the
+// notifications gate in refresh() knows the user's choice
+// before the Settings tab is ever opened. Silent on failure.
+api("/settings", "GET").then((s) => { cachedSettings = s; }).catch(() => {});
 // Feat 1: Pair a browser. Code is shown as text only, never logged,
 // with a 60-second countdown. Tauri mode calls the Rust command
 // (which talks to the local bridge); bridge mode calls the bridge

@@ -102,3 +102,18 @@ thead th{position:relative}
 /* Round 10, item 16: site directory. */
 .sites-note{color:var(--muted);font-size:14px}
 .site-list{display:flex;flex-wrap:wrap;gap:8px}
+/* Round 11 extension: settings panel + picker options. */
+.settings-form{display:flex;flex-direction:column;gap:10px;max-width:520px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px}
+.settings-form label{display:flex;flex-direction:column;gap:4px;font-size:14px}
+.settings-form .check-row{flex-direction:row;align-items:center;gap:8px}
+.settings-form .check-row input{accent-color:var(--accent);width:16px;height:16px}
+.settings-note{margin:0;color:var(--muted);font-size:13px;line-height:1.5}
+.settings-note code{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:1px 5px;font-size:12px;color:var(--text)}
+#setStatus{font-size:13px;color:var(--text2)}
+.fp-options{display:flex;flex-direction:column;gap:8px;margin:8px 0}
+.fp-opt-row{display:flex;align-items:center;gap:8px;font-size:14px}
+.fp-opt-row select{flex:1}
+.fp-opt-label{font-size:14px}
+.fp-sub-list{display:flex;flex-wrap:wrap;gap:10px}
+.fp-sub-check{display:flex;gap:4px;align-items:center;font-size:14px;cursor:pointer}
+.fp-sub-check input{accent-color:var(--accent)}

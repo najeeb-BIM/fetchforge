@@ -13,7 +13,7 @@
 //! downloaded (a finite snapshot); a DASH manifest with
 //! type="dynamic" is refused outright.
 
-use crate::download::Progress;
+use crate::download::{Progress, SharedLimiter};
 use crate::extract::DOWNLOAD_STALL_TIMEOUT;
 use crate::validate::validate_url;
 use std::collections::HashMap;
@@ -175,8 +175,19 @@ pub fn classify_stream_prefix(prefix: &[u8]) -> Option<StreamKind> {
 /// failure — the caller proceeds down its normal path (fail open).
 /// Never sends cookies or credentials (the client has none).
 pub fn sniff_stream_kind(url: &str, referer: &Option<String>) -> Option<StreamKind> {
+    sniff_stream_kind_with_proxy(url, referer, None)
+}
+
+/// [`sniff_stream_kind`] through the user-configured proxy
+/// (round 11 extension, feature 10): without it, a proxy user
+/// could not detect an extensionless stream at all.
+pub fn sniff_stream_kind_with_proxy(
+    url: &str,
+    referer: &Option<String>,
+    proxy: Option<&str>,
+) -> Option<StreamKind> {
     use std::io::Read;
-    let client = hls_client_with_timeout(Duration::from_secs(30)).ok()?;
+    let client = hls_client_with_timeout_and_proxy(Duration::from_secs(30), proxy).ok()?;
     let req = browser_headers(
         client
             .get(url)
@@ -244,6 +255,18 @@ pub struct StreamInfo {
     /// not be determined (DASH template manifests without a
     /// timeline, or a variant playlist that failed to fetch).
     pub segment_count: Option<u64>,
+    /// Audio languages the stream offers (round 11 extension,
+    /// feature 4): the distinct `LANGUAGE` values of the HLS
+    /// audio renditions / DASH audio AdaptationSets (falling
+    /// back to the rendition NAME when no LANGUAGE is set).
+    /// Empty when the stream has no separate audio tracks.
+    pub audio_languages: Vec<String>,
+    /// Subtitle languages the stream offers (round 11
+    /// extension, feature 2): the distinct `LANGUAGE` values
+    /// of the HLS SUBTITLES renditions / DASH WebVTT text
+    /// AdaptationSets. TTML text tracks are NOT listed — the
+    /// engine cannot assemble TTML segments (see the notes).
+    pub subtitle_languages: Vec<String>,
 }
 
 /// List the qualities of an HLS or DASH manifest URL (routed by
@@ -258,8 +281,20 @@ pub fn list_stream_formats(
     referer: &Option<String>,
     captured: Option<&CapturedManifest>,
 ) -> Result<StreamInfo, String> {
+    list_stream_formats_with_proxy(url, referer, captured, None)
+}
+
+/// [`list_stream_formats`] through the user-configured proxy
+/// (round 11 extension, feature 10): the manifest fetch uses
+/// it, so a proxy user can list a stream's qualities at all.
+pub fn list_stream_formats_with_proxy(
+    url: &str,
+    referer: &Option<String>,
+    captured: Option<&CapturedManifest>,
+    proxy: Option<&str>,
+) -> Result<StreamInfo, String> {
     match stream_kind_of_url(url) {
-        Some(kind) => list_stream_formats_kind(url, kind, referer, captured),
+        Some(kind) => list_stream_formats_kind_with_proxy(url, kind, referer, captured, proxy),
         None => Err("Not an HLS (.m3u8) or DASH (.mpd) URL.".to_string()),
     }
 }
@@ -274,9 +309,21 @@ pub fn list_stream_formats_kind(
     referer: &Option<String>,
     captured: Option<&CapturedManifest>,
 ) -> Result<StreamInfo, String> {
+    list_stream_formats_kind_with_proxy(url, kind, referer, captured, None)
+}
+
+/// [`list_stream_formats_kind`] through the user-configured
+/// proxy (round 11 extension, feature 10).
+pub fn list_stream_formats_kind_with_proxy(
+    url: &str,
+    kind: StreamKind,
+    referer: &Option<String>,
+    captured: Option<&CapturedManifest>,
+    proxy: Option<&str>,
+) -> Result<StreamInfo, String> {
     match kind {
-        StreamKind::Hls => list_hls_formats(url, referer, captured),
-        StreamKind::Dash => list_dash_formats(url, referer, captured),
+        StreamKind::Hls => list_hls_formats_with_proxy(url, referer, captured, proxy),
+        StreamKind::Dash => list_dash_formats_with_proxy(url, referer, captured, proxy),
     }
 }
 
@@ -297,7 +344,14 @@ fn title_from_manifest_url(url: &str) -> String {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
     const GENERIC: [&str; 8] = [
-        "master", "index", "playlist", "manifest", "chunklist", "hls", "dash", "video",
+        "master",
+        "index",
+        "playlist",
+        "manifest",
+        "chunklist",
+        "hls",
+        "dash",
+        "video",
     ];
     if !stem.is_empty() && !GENERIC.contains(&stem.to_ascii_lowercase().as_str()) {
         return stem;
@@ -388,16 +442,59 @@ fn hls_client() -> Result<reqwest::blocking::Client, String> {
 /// [`hls_client`] with an overridden total timeout, for tests (a
 /// stalling stub server must fail in seconds, not after 120 s).
 fn hls_client_with_timeout(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
+    hls_client_with_timeout_and_proxy(timeout, None)
+}
+
+/// [`hls_client_with_timeout`] through the user-configured proxy
+/// (round 11 extension, feature 10). The proxy value is never
+/// logged and never appears in the error message — it may
+/// contain credentials.
+fn hls_client_with_timeout_and_proxy(
+    timeout: Duration,
+    proxy: Option<&str>,
+) -> Result<reqwest::blocking::Client, String> {
+    let mut builder = reqwest::blocking::Client::builder()
         .user_agent(BROWSER_USER_AGENT)
         .http1_only()
         .tcp_nodelay(true)
         .tcp_keepalive(Duration::from_secs(60))
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| e.to_string())
+        .redirect(reqwest::redirect::Policy::limited(10));
+    if let Some(p) = proxy {
+        builder = builder.proxy(
+            reqwest::Proxy::all(p)
+                .map_err(|_| "The configured proxy could not be used.".to_string())?,
+        );
+    }
+    builder.build().map_err(|e| e.to_string())
+}
+
+/// The extra knobs a stream download takes beyond the positional
+/// arguments of the `download_hls_*` / `download_dash` functions
+/// (round 11 extension): grouped into one struct so the existing
+/// 10-argument signatures do not grow a further five parameters.
+/// The `_opts` download functions take one of these; the old
+/// functions pass `StreamDownloadOptions::default()` unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct StreamDownloadOptions {
+    /// Audio language chosen in the popup (feature 4): the
+    /// `LANGUAGE` (or NAME) of the HLS audio rendition / DASH
+    /// audio AdaptationSet to use. None means the default
+    /// (first rendition / highest-bandwidth audio).
+    pub audio_language: Option<String>,
+    /// Subtitle language chosen in the popup (feature 2): the
+    /// `LANGUAGE` (or NAME) of the subtitle rendition to mux
+    /// into the output. None means no subtitles.
+    pub subtitle_language: Option<String>,
+    /// User-configured proxy (feature 10), validated at
+    /// settings-save time. Never logged.
+    pub proxy_url: Option<String>,
+    /// Global speed limit in KB/s (feature 3), enforced across
+    /// the parallel segment workers by one shared limiter.
+    pub bandwidth_kbps: Option<u64>,
+    /// Title metadata for the merged output (feature 12).
+    pub title: Option<String>,
 }
 
 /// Benign browser headers for manifest + segment requests (study
@@ -422,10 +519,7 @@ fn browser_headers(
         // fetch/XHR, which send Origin; include the page's origin
         // so the request looks like the player's own.
         if let Ok(u) = url::Url::parse(r) {
-            if let (Some(host), Some(port)) = (
-                u.host_str(),
-                u.port_or_known_default(),
-            ) {
+            if let (Some(host), Some(port)) = (u.host_str(), u.port_or_known_default()) {
                 let default_port = match u.scheme() {
                     "http" => 80,
                     "https" => 443,
@@ -731,9 +825,7 @@ fn inherit_query(base: &str, resolved: &str) -> String {
 pub fn proxy_inner_manifest_url(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
     for (k, v) in parsed.query_pairs() {
-        if (k == "url" || k == "u")
-            && stream_kind_of_url(&v) == Some(StreamKind::Hls)
-        {
+        if (k == "url" || k == "u") && stream_kind_of_url(&v) == Some(StreamKind::Hls) {
             return Some(v.into_owned());
         }
     }
@@ -772,6 +864,10 @@ pub struct HlsVariant {
     /// The AUDIO group this variant's sound lives in, if it is
     /// separate from the video (see [`HlsMaster::audio`]).
     pub audio_group: Option<String>,
+    /// The SUBTITLES group this variant's captions live in, if
+    /// any (round 11 extension, feature 2; see
+    /// [`HlsMaster::subtitles`]).
+    pub subtitles_group: Option<String>,
 }
 
 /// An `#EXT-X-MEDIA` audio rendition of a master playlist.
@@ -781,6 +877,27 @@ pub struct HlsAudioGroup {
     /// Absolute URL of the audio (media) playlist.
     pub uri: String,
     pub name: Option<String>,
+    /// The rendition's `LANGUAGE` attribute (an ISO 639 code such
+    /// as "en"), when the master declares one. A group can hold
+    /// several renditions with different languages (novahd
+    /// carries 7); the user picks one (round 11 extension,
+    /// feature 4) and the download uses that rendition's playlist
+    /// instead of the first one in the group.
+    pub language: Option<String>,
+}
+
+/// An `#EXT-X-MEDIA` subtitle rendition of a master playlist
+/// (round 11 extension, feature 2): a WebVTT media playlist the
+/// user can ask to have muxed into the output file.
+#[derive(Debug, Clone)]
+pub struct HlsSubtitleGroup {
+    pub group_id: String,
+    /// Absolute URL of the subtitle (media) playlist.
+    pub uri: String,
+    pub name: Option<String>,
+    /// The rendition's `LANGUAGE` attribute (an ISO 639 code such
+    /// as "en"), when the master declares one.
+    pub language: Option<String>,
 }
 
 /// A parsed HLS master playlist. A media playlist parses to zero
@@ -789,6 +906,9 @@ pub struct HlsAudioGroup {
 pub struct HlsMaster {
     pub variants: Vec<HlsVariant>,
     pub audio: Vec<HlsAudioGroup>,
+    /// Subtitle renditions (TYPE=SUBTITLES), one entry per
+    /// `#EXT-X-MEDIA` line — a group can hold several languages.
+    pub subtitles: Vec<HlsSubtitleGroup>,
 }
 
 /// Split an `#EXT-X-STREAM-INF` / `#EXT-X-MEDIA` attribute list on
@@ -855,16 +975,36 @@ pub fn parse_hls_master(text: &str, base_url: &str) -> HlsMaster {
                 codecs: map.get("CODECS").map(|s| s.to_string()),
                 fps: map.get("FRAME-RATE").and_then(|v| v.parse().ok()),
                 audio_group: map.get("AUDIO").map(|s| s.to_string()),
+                subtitles_group: map.get("SUBTITLES").map(|s| s.to_string()),
             });
         } else if let Some(attrs) = line.strip_prefix("#EXT-X-MEDIA:") {
             let map: HashMap<&str, &str> = split_attrs(attrs).into_iter().collect();
-            if map.get("TYPE") == Some(&"AUDIO") {
+            // TYPE=AUDIO and TYPE=SUBTITLES share the shape
+            // (GROUP-ID, URI, NAME, LANGUAGE); only the list
+            // they land in differs. Every rendition is kept —
+            // a group can hold several languages (novahd has 7
+            // audio tracks in one group), and keeping only the
+            // first would silently drop the user's choice.
+            let media_type = map.get("TYPE").copied().unwrap_or("");
+            if media_type == "AUDIO" || media_type == "SUBTITLES" {
                 if let (Some(group_id), Some(uri)) = (map.get("GROUP-ID"), map.get("URI")) {
-                    master.audio.push(HlsAudioGroup {
-                        group_id: group_id.to_string(),
-                        uri: resolve(base_url, uri),
-                        name: map.get("NAME").map(|s| s.to_string()),
-                    });
+                    let name = map.get("NAME").map(|s| s.to_string());
+                    let language = map.get("LANGUAGE").map(|s| s.to_string());
+                    if media_type == "AUDIO" {
+                        master.audio.push(HlsAudioGroup {
+                            group_id: group_id.to_string(),
+                            uri: resolve(base_url, uri),
+                            name,
+                            language,
+                        });
+                    } else {
+                        master.subtitles.push(HlsSubtitleGroup {
+                            group_id: group_id.to_string(),
+                            uri: resolve(base_url, uri),
+                            name,
+                            language,
+                        });
+                    }
                 }
             }
         }
@@ -1036,6 +1176,302 @@ fn hls_duration_secs(text: &str) -> Option<u64> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Subtitle (WebVTT) merging — round 11 extension, feature 2
+// ---------------------------------------------------------------------------
+
+/// One subtitle segment of an HLS subtitle playlist: its URL and
+/// its `#EXTINF` duration. The duration is the fallback cue
+/// offset when a segment carries no `X-TIMESTAMP-MAP` (see
+/// [`merge_vtt_segments`]).
+#[derive(Debug, Clone)]
+struct SubtitleSegment {
+    url: String,
+    duration_secs: f64,
+}
+
+/// Parse an HLS subtitle (WebVTT) media playlist into its
+/// segments, resolved against `base_url`. Only `#EXTINF`
+/// durations and segment URIs are read — byte ranges and init
+/// segments do not occur in subtitle playlists, and an encrypted
+/// subtitle playlist is refused like any other (spec §10).
+fn parse_hls_subtitle_playlist(text: &str, base_url: &str) -> Result<Vec<SubtitleSegment>, String> {
+    if text.contains("#EXT-X-KEY") {
+        return Err(
+            "This stream's subtitles are encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
+                .to_string(),
+        );
+    }
+    let mut out = Vec::new();
+    let mut pending_duration: Option<f64> = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            pending_duration = rest.split(',').next().and_then(|s| s.parse().ok());
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        out.push(SubtitleSegment {
+            url: resolve(base_url, line),
+            // A segment without a preceding #EXTINF keeps the
+            // previous offset (duration 0) rather than failing
+            // the whole subtitle track.
+            duration_secs: pending_duration.take().unwrap_or(0.0),
+        });
+    }
+    if out.is_empty() {
+        return Err("The subtitle playlist lists no segments.".to_string());
+    }
+    Ok(out)
+}
+
+/// Parse one WebVTT cue timestamp (`HH:MM:SS.mmm` or
+/// `MM:SS.mmm`) into seconds. Returns None for anything else —
+/// the merge keeps an unparsable timestamp line untouched rather
+/// than dropping the cue.
+fn parse_vtt_timestamp(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (main, frac) = match s.split_once('.') {
+        Some((m, f)) => (m, f),
+        None => (s, "0"),
+    };
+    let millis: f64 = if frac.is_empty() {
+        0.0
+    } else {
+        // "5" means 500 ms, "05" means 50 ms: pad to 3 digits.
+        let padded = format!("{frac:0<3}");
+        padded.parse::<f64>().ok()? / 1000.0
+    };
+    let parts: Vec<&str> = main.split(':').collect();
+    let secs = match parts.as_slice() {
+        [h, m, s] => {
+            h.parse::<f64>().ok()? * 3600.0
+                + m.parse::<f64>().ok()? * 60.0
+                + s.parse::<f64>().ok()?
+        }
+        [m, s] => m.parse::<f64>().ok()? * 60.0 + s.parse::<f64>().ok()?,
+        _ => return None,
+    };
+    Some(secs + millis)
+}
+
+/// Format seconds as a WebVTT timestamp (`HH:MM:SS.mmm`).
+/// Negative values clamp to zero — a cue can never start before
+/// the file does.
+fn format_vtt_timestamp(secs: f64) -> String {
+    let total_millis = (secs.max(0.0) * 1000.0).round() as u64;
+    let ms = total_millis % 1000;
+    let total_secs = total_millis / 1000;
+    let s = total_secs % 60;
+    let total_mins = total_secs / 60;
+    let m = total_mins % 60;
+    let h = total_mins / 60;
+    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+}
+
+/// Parse an `X-TIMESTAMP-MAP` header line
+/// (`X-TIMESTAMP-MAP=MPEGTS:123456,LOCAL:00:00:00.000`) into its
+/// MPEG-TS clock value (90 kHz ticks) and its local cue time in
+/// seconds. Returns None when the line is absent or malformed.
+fn parse_timestamp_map(line: &str) -> Option<(u64, f64)> {
+    let rest = line.strip_prefix("X-TIMESTAMP-MAP=")?;
+    let mut mpegts = None;
+    let mut local = None;
+    for part in rest.split(',') {
+        if let Some(v) = part.strip_prefix("MPEGTS:") {
+            mpegts = v.parse().ok();
+        } else if let Some(v) = part.strip_prefix("LOCAL:") {
+            local = parse_vtt_timestamp(v);
+        }
+    }
+    match (mpegts, local) {
+        (Some(m), Some(l)) => Some((m, l)),
+        _ => None,
+    }
+}
+
+/// Merge one subtitle track's WebVTT segments into a single
+/// WebVTT document. Each segment is `(its #EXTINF duration, its
+/// text)`.
+fn merge_vtt_segments(segments: &[(f64, String)]) -> String {
+    merge_vtt_segments_impl(segments, false)
+}
+
+/// [`merge_vtt_segments`] for DASH, where each segment is `(its
+/// start time in seconds, its text)`: the offset is the segment's
+/// start time itself (DASH VTT cues are relative to their
+/// segment's start), not the cumulative durations.
+fn merge_vtt_segments_with_start_times(segments: &[(f64, String)]) -> String {
+    merge_vtt_segments_impl(segments, true)
+}
+
+fn merge_vtt_segments_impl(segments: &[(f64, String)], starts: bool) -> String {
+    // Cue timestamps in a segment are LOCAL to that segment, so
+    // they must be shifted onto the track's timeline before the
+    // segments are concatenated — otherwise every segment's cues
+    // would pile up at 00:00. Two offset sources, in order:
+    //
+    // 1. `X-TIMESTAMP-MAP` (the accurate one, present on most
+    //    real-world HLS subtitle segments): the segment's MPEG-TS
+    //    clock value anchors it absolutely —
+    //    `offset = (mpegts - first_mpegts) / 90000 - local`.
+    //    The FIRST segment's MPEGTS is the baseline, so a track
+    //    whose clock starts at a non-zero value still begins at 0.
+    // 2. The segment's start time (DASH) or the cumulative
+    //    `#EXTINF` durations of the preceding segments (HLS),
+    //    used when a segment carries no map.
+    //
+    // The `WEBVTT` header and any `X-TIMESTAMP-MAP` / `NOTE`
+    // lines are dropped from the segments (the merged document
+    // carries a single header); cue identifiers, cue text and
+    // cue settings (e.g. `line:90%`) pass through unchanged.
+    let mut out = String::from("WEBVTT\n\n");
+    let mut cumulative = 0.0f64;
+    let mut first_mpegts: Option<u64> = None;
+    for (value, text) in segments {
+        let mut map: Option<(u64, f64)> = None;
+        let mut body: Vec<&str> = Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("WEBVTT") {
+                continue;
+            }
+            if let Some(parsed) = parse_timestamp_map(trimmed) {
+                map = Some(parsed);
+                continue;
+            }
+            if trimmed.starts_with("NOTE") {
+                continue;
+            }
+            body.push(line);
+        }
+        // Drop leading blank lines (the header separator of the
+        // segment itself) so the merged cues stay separated by
+        // exactly one blank line each.
+        let mut body_iter = body.into_iter().peekable();
+        while body_iter.peek().is_some_and(|l| l.trim().is_empty()) {
+            body_iter.next();
+        }
+        let offset = match map {
+            Some((mpegts, local)) => {
+                let first = *first_mpegts.get_or_insert(mpegts);
+                mpegts.saturating_sub(first) as f64 / 90_000.0 - local
+            }
+            // DASH: the segment's start time. HLS: the cumulative
+            // #EXTINF durations of the preceding segments.
+            None => {
+                if starts {
+                    *value
+                } else {
+                    cumulative
+                }
+            }
+        };
+        for line in body_iter {
+            if let Some((start, rest)) = line.split_once("-->") {
+                let start_s = start.trim();
+                let rest = rest.trim_start();
+                // The end timestamp is the first token; anything
+                // after it is cue settings, kept verbatim.
+                let (end_s, settings) = match rest.split_once(char::is_whitespace) {
+                    Some((e, s)) => (e, s.trim_start()),
+                    None => (rest, ""),
+                };
+                if let (Some(start_t), Some(end_t)) =
+                    (parse_vtt_timestamp(start_s), parse_vtt_timestamp(end_s))
+                {
+                    let shifted_start = format_vtt_timestamp(start_t + offset);
+                    let shifted_end = format_vtt_timestamp(end_t + offset);
+                    if settings.is_empty() {
+                        out.push_str(&format!("{shifted_start} --> {shifted_end}\n"));
+                    } else {
+                        out.push_str(&format!("{shifted_start} --> {shifted_end} {settings}\n"));
+                    }
+                    continue;
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        cumulative += value;
+    }
+    out
+}
+
+/// Download one HLS subtitle track and merge its segments into a
+/// single WebVTT file at `dest` (round 11 extension, feature
+/// 2). Segments are fetched sequentially — subtitle segments
+/// are kilobytes, so parallelism would buy nothing — with the
+/// same client (and proxy) as the video. Returns the path of
+/// the merged file. A subtitle failure is the CALLER's decision
+/// (the video workers warn and continue without subtitles);
+/// this function reports it as an error.
+fn download_hls_subtitles(
+    client: &reqwest::blocking::Client,
+    playlist_url: &str,
+    referer: &Option<String>,
+    dest: &Path,
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+) -> Result<PathBuf, String> {
+    let text = fetch_text(client, playlist_url, referer)?;
+    let segments = parse_hls_subtitle_playlist(&text, playlist_url)?;
+    let mut merged: Vec<(f64, String)> = Vec::with_capacity(segments.len());
+    for seg in &segments {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("__CANCELLED__".to_string());
+        }
+        if paused.load(Ordering::Relaxed) {
+            return Err("__PAUSED__".to_string());
+        }
+        let seg_text = fetch_text(client, &seg.url, referer)
+            .map_err(|e| format!("A subtitle segment could not be downloaded ({e})."))?;
+        merged.push((seg.duration_secs, seg_text));
+    }
+    let doc = merge_vtt_segments(&merged);
+    std::fs::write(dest, doc).map_err(|e| e.to_string())?;
+    Ok(dest.to_path_buf())
+}
+
+/// Download one DASH WebVTT subtitle track and merge its
+/// segments into a single WebVTT file at `dest` (round 11
+/// extension, feature 2). Segments are fetched sequentially
+/// (subtitle segments are kilobytes) and offset by their start
+/// times — DASH VTT cues are relative to their segment's start.
+/// The init segment of a text representation, when one exists,
+/// is skipped: it carries no cues. A subtitle failure is the
+/// CALLER's decision (the video workers warn and continue
+/// without subtitles); this function reports it as an error.
+fn download_dash_subtitles(
+    client: &reqwest::blocking::Client,
+    rep: &DashRepresentation,
+    manifest_url: &str,
+    duration_secs: Option<f64>,
+    referer: &Option<String>,
+    dest: &Path,
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+) -> Result<PathBuf, String> {
+    let (_init, timed) = dash_segments_with_times(rep, manifest_url, duration_secs)?;
+    let mut merged: Vec<(f64, String)> = Vec::with_capacity(timed.len());
+    for (seg, start) in &timed {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("__CANCELLED__".to_string());
+        }
+        if paused.load(Ordering::Relaxed) {
+            return Err("__PAUSED__".to_string());
+        }
+        let seg_text = fetch_text(client, &seg.url, referer)
+            .map_err(|e| format!("A subtitle segment could not be downloaded ({e})."))?;
+        merged.push((*start, seg_text));
+    }
+    let doc = merge_vtt_segments_with_start_times(&merged);
+    std::fs::write(dest, doc).map_err(|e| e.to_string())?;
+    Ok(dest.to_path_buf())
+}
+
 /// The default HLS variant for the no-UI path (and the picker's
 /// pre-selection): highest resolution at or below 1080p, else the
 /// highest resolution; without resolution info, the highest
@@ -1053,6 +1489,110 @@ fn pick_default_variant<'a>(variants: &'a [HlsVariant]) -> Option<&'a HlsVariant
             })
     };
     best(Some(1080)).or_else(|| best(None))
+}
+
+/// The identifier the popup offers (and the engine matches) for
+/// an HLS audio or subtitle rendition: its `LANGUAGE` when the
+/// master declares one, else its NAME, else its GROUP-ID. The
+/// three are tried in that order by the matcher too, so a
+/// rendition with no LANGUAGE tag is still selectable by name.
+fn rendition_language(language: &Option<String>, name: &Option<String>, group_id: &str) -> String {
+    if let Some(l) = language {
+        if !l.is_empty() {
+            return l.clone();
+        }
+    }
+    if let Some(n) = name {
+        if !n.is_empty() {
+            return n.clone();
+        }
+    }
+    group_id.to_string()
+}
+
+/// The distinct audio languages of a parsed master, in playlist
+/// order (round 11 extension, feature 4).
+fn master_audio_languages(master: &HlsMaster) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in &master.audio {
+        let label = rendition_language(&a.language, &a.name, &a.group_id);
+        if !out.contains(&label) {
+            out.push(label);
+        }
+    }
+    out
+}
+
+/// The distinct subtitle languages of a parsed master, in
+/// playlist order (round 11 extension, feature 2).
+fn master_subtitle_languages(master: &HlsMaster) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in &master.subtitles {
+        let label = rendition_language(&s.language, &s.name, &s.group_id);
+        if !out.contains(&label) {
+            out.push(label);
+        }
+    }
+    out
+}
+
+/// Pick the audio rendition of `group_id` matching `language`
+/// (round 11 extension, feature 4): the rendition whose
+/// LANGUAGE, NAME or GROUP-ID equals the choice (case-insensitive
+/// on LANGUAGE). None means the group's first rendition — the
+/// pre-feature-4 behaviour. When a choice matches nothing (the
+/// manifest changed between listing and download) the first
+/// rendition is returned instead: a movie in the wrong language
+/// beats a failed download, and the popup only ever offers
+/// languages the listing found.
+fn pick_audio_rendition<'a>(
+    audio: &'a [HlsAudioGroup],
+    group_id: &str,
+    language: Option<&str>,
+) -> Option<&'a HlsAudioGroup> {
+    let group: Vec<&HlsAudioGroup> = audio.iter().filter(|a| a.group_id == group_id).collect();
+    if group.is_empty() {
+        return None;
+    }
+    if let Some(want) = language {
+        for a in &group {
+            let matches = a
+                .language
+                .as_deref()
+                .is_some_and(|l| l.eq_ignore_ascii_case(want))
+                || a.name.as_deref() == Some(want)
+                || a.group_id == want;
+            if matches {
+                return Some(a);
+            }
+        }
+    }
+    Some(group[0])
+}
+
+/// Pick the subtitle rendition of `group_id` matching `language`
+/// (round 11 extension, feature 2): same matching as
+/// [`pick_audio_rendition`], but a non-match returns None — a
+/// subtitle in the wrong language is worse than none, and the
+/// download continues without subtitles. `group_id` is None when
+/// the variant names no SUBTITLES group; then any subtitle
+/// rendition matches (the common single-group case).
+fn pick_subtitle_rendition<'a>(
+    subtitles: &'a [HlsSubtitleGroup],
+    group_id: Option<&str>,
+    language: Option<&str>,
+) -> Option<&'a HlsSubtitleGroup> {
+    let want = language?;
+    subtitles.iter().find(|s| {
+        let group_ok = group_id.map_or(true, |g| s.group_id == g);
+        group_ok
+            && (s
+                .language
+                .as_deref()
+                .is_some_and(|l| l.eq_ignore_ascii_case(want))
+                || s.name.as_deref() == Some(want)
+                || s.group_id == want)
+    })
 }
 
 /// List the qualities of an HLS manifest: one format per variant
@@ -1073,8 +1613,19 @@ pub fn list_hls_formats(
     referer: &Option<String>,
     captured: Option<&CapturedManifest>,
 ) -> Result<StreamInfo, String> {
+    list_hls_formats_with_proxy(manifest_url, referer, captured, None)
+}
+
+/// [`list_hls_formats`] through the user-configured proxy
+/// (round 11 extension, feature 10).
+pub fn list_hls_formats_with_proxy(
+    manifest_url: &str,
+    referer: &Option<String>,
+    captured: Option<&CapturedManifest>,
+    proxy: Option<&str>,
+) -> Result<StreamInfo, String> {
     let manifest_url = validate_url(manifest_url)?;
-    let client = hls_client()?;
+    let client = hls_client_with_timeout_and_proxy(REQUEST_TIMEOUT, proxy)?;
     let text = manifest_text(&client, &manifest_url, referer, captured)?;
     if text.contains("#EXT-X-KEY") {
         return Err(
@@ -1114,6 +1665,9 @@ pub fn list_hls_formats(
                 needs_merge: false,
             }],
             segment_count: Some(playlist.piece_count() as u64),
+            // A media playlist carries no renditions at all.
+            audio_languages: Vec::new(),
+            subtitle_languages: Vec::new(),
         });
     }
     // Duration + segment count from the default variant's
@@ -1127,14 +1681,10 @@ pub fn list_hls_formats(
         .and_then(|uri| manifest_text(&client, uri, referer, captured).ok());
     let duration_secs = default_text.as_deref().and_then(hls_duration_secs);
     let default_playlist = match (&default_uri, &default_text) {
-        (Some(uri), Some(text)) => {
-            parse_hls_segments(text, &manifest_base_url(uri)).ok()
-        }
+        (Some(uri), Some(text)) => parse_hls_segments(text, &manifest_base_url(uri)).ok(),
         _ => None,
     };
-    let segment_count = default_playlist
-        .as_ref()
-        .map(|p| p.piece_count() as u64);
+    let segment_count = default_playlist.as_ref().map(|p| p.piece_count() as u64);
     // The default variant's exact total, when its playlist is
     // byte-ranged (Atlantic-style): the first ladder rung, and
     // the only one that is exact. Other variants keep the
@@ -1189,6 +1739,8 @@ pub fn list_hls_formats(
         manifest_url,
         formats,
         segment_count,
+        audio_languages: master_audio_languages(&master),
+        subtitle_languages: master_subtitle_languages(&master),
     })
 }
 
@@ -1198,7 +1750,10 @@ pub fn list_hls_formats(
 /// `BANDWIDTH × duration` (a rough upper bound, often 2–4× high
 /// for VBR content). None when the duration is unknown or the
 /// variant declares no bandwidth at all.
-fn variant_size_estimate(v: &HlsVariant, duration_secs: Option<u64>) -> (Option<u64>, Option<SizeKind>) {
+fn variant_size_estimate(
+    v: &HlsVariant,
+    duration_secs: Option<u64>,
+) -> (Option<u64>, Option<SizeKind>) {
     let Some(d) = duration_secs else {
         return (None, None);
     };
@@ -1500,11 +2055,7 @@ fn check_stall(last_progress: Instant, timeout: Duration) -> Result<(), String> 
 /// vary (keyframes, silence), so the UI shows it with "~".
 /// Sanity check against the nime download (2026-11-22): 3,321
 /// pieces, ~1.5 GB total, ~450 KB per piece.
-pub fn estimate_total_bytes(
-    downloaded: u64,
-    done: u64,
-    total: u64,
-) -> Option<u64> {
+pub fn estimate_total_bytes(downloaded: u64, done: u64, total: u64) -> Option<u64> {
     if done == 0 || total == 0 {
         return None;
     }
@@ -1657,6 +2208,44 @@ fn download_segments(
     cancelled: &AtomicBool,
     stall_timeout: Duration,
 ) -> Result<u64, String> {
+    // No speed limit: a no-op limiter (the production paths call
+    // download_segments_with_bandwidth instead).
+    let no_limit = SharedLimiter::new(None);
+    download_segments_with_bandwidth(
+        client,
+        segments,
+        part_path,
+        referer,
+        progress_base,
+        segments_base,
+        progress,
+        paused,
+        cancelled,
+        stall_timeout,
+        &no_limit,
+    )
+}
+
+/// [`download_segments`] with the shared bandwidth limiter
+/// (round 11 extension, feature 3): every segment's bytes are
+/// accounted against the global speed limit, so the parallel
+/// workers together stay under it instead of each taking a
+/// quarter (which the old per-worker split could never enforce
+/// across phases).
+#[allow(clippy::too_many_arguments)]
+fn download_segments_with_bandwidth(
+    client: &reqwest::blocking::Client,
+    segments: &[Segment],
+    part_path: &Path,
+    referer: &Option<String>,
+    progress_base: u64,
+    segments_base: u64,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+    stall_timeout: Duration,
+    bandwidth: &SharedLimiter,
+) -> Result<u64, String> {
     if segments.is_empty() {
         std::fs::File::create(part_path).map_err(|e| e.to_string())?;
         return Ok(0);
@@ -1680,6 +2269,7 @@ fn download_segments(
             paused,
             cancelled,
             stall_timeout,
+            bandwidth,
         );
     }
     let limiter = RateLimiter::new();
@@ -1696,6 +2286,7 @@ fn download_segments(
         stall_timeout,
         HLS_SEGMENT_WORKERS,
         &limiter,
+        bandwidth,
     ) {
         Ok(n) => Ok(n),
         Err(e) if should_fallback_sequential(&e, paused, cancelled) => {
@@ -1731,6 +2322,7 @@ fn download_segments(
                 stall_timeout,
                 1,
                 &limiter,
+                bandwidth,
             ) {
                 Ok(n) => Ok(n),
                 Err(_) => Err(e),
@@ -1764,6 +2356,7 @@ fn download_segments(
                 stall_timeout,
                 1,
                 &limiter,
+                bandwidth,
             ) {
                 Ok(n) => Ok(n),
                 Err(_) => Err(e),
@@ -1807,6 +2400,7 @@ fn download_segments_parallel(
     stall_timeout: Duration,
     workers: usize,
     limiter: &RateLimiter,
+    bandwidth: &SharedLimiter,
 ) -> Result<u64, String> {
     let total = segments.len() as u64;
     let seg_dir = seg_dir_for(part_path);
@@ -1974,6 +2568,12 @@ fn download_segments_parallel(
                     match fetch_segment(&client, &seg.url, seg.range, referer) {
                         Ok(b) => {
                             limiter.note_success();
+                            // Speed limit (feature 3): account
+                            // this segment's bytes against the
+                            // shared window — the sleep keeps the
+                            // parallel workers under the limit
+                            // together.
+                            bandwidth.account(b.len());
                             bytes = Some(b);
                             break;
                         }
@@ -2146,6 +2746,7 @@ fn download_segments_sequential(
     paused: &AtomicBool,
     cancelled: &AtomicBool,
     stall_timeout: Duration,
+    bandwidth: &SharedLimiter,
 ) -> Result<u64, String> {
     let sidecar = part_path.with_file_name(format!(
         "{}.segments",
@@ -2223,6 +2824,9 @@ fn download_segments_sequential(
             attempts = attempt + 1;
             match fetch_bytes_range(client, &seg.url, seg.range, referer) {
                 Ok(b) => {
+                    // Speed limit (feature 3): same accounting
+                    // as the parallel path.
+                    bandwidth.account(b.len());
                     bytes = Some(b);
                     break;
                 }
@@ -2352,6 +2956,9 @@ pub fn download_hls(
 /// from the player's own response (see [`CapturedManifest`]):
 /// used for the master and the variant playlist when its URL
 /// matches, so a signed link is never re-fetched.
+///
+/// No language / subtitle / proxy / speed-limit options: see
+/// [`download_hls_variant_opts`] for those (round 11 extension).
 #[allow(clippy::too_many_arguments)]
 pub fn download_hls_variant(
     manifest_url: &str,
@@ -2365,13 +2972,57 @@ pub fn download_hls_variant(
     cancelled: &AtomicBool,
     captured: Option<&CapturedManifest>,
 ) -> Result<PathBuf, String> {
+    download_hls_variant_opts(
+        manifest_url,
+        variant_uri,
+        destination_dir,
+        filename,
+        referer,
+        ffmpeg,
+        progress,
+        paused,
+        cancelled,
+        captured,
+        &StreamDownloadOptions::default(),
+    )
+}
+
+/// [`download_hls_variant`] with the round 11 extension options
+/// ([`StreamDownloadOptions`]): the audio language (feature 4),
+/// the subtitle language to mux in (feature 2), the proxy
+/// (feature 10), the speed limit (feature 3) and the title
+/// metadata (feature 12).
+///
+/// A subtitle merge re-containerises a muxed `.ts` variant to
+/// `.mp4` (mov_text subtitles are not valid in MPEG-TS), so the
+/// returned path may differ from `filename` in extension — the
+/// caller reconciles the record against the returned path.
+/// A subtitle track that fails to download does NOT fail the
+/// video: the download continues without subtitles and the
+/// failure is logged to stderr (a 404 on one subtitle segment
+/// must not cost the user a two-hour film).
+#[allow(clippy::too_many_arguments)]
+pub fn download_hls_variant_opts(
+    manifest_url: &str,
+    variant_uri: &str,
+    destination_dir: &Path,
+    filename: &str,
+    referer: &Option<String>,
+    ffmpeg: Option<&Path>,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
+    opts: &StreamDownloadOptions,
+) -> Result<PathBuf, String> {
     let manifest_url = validate_url(manifest_url)?;
     let variant_uri = validate_url(variant_uri)?;
-    let client = hls_client()?;
+    let client = hls_client_with_timeout_and_proxy(REQUEST_TIMEOUT, opts.proxy_url.as_deref())?;
+    let bandwidth = SharedLimiter::new(opts.bandwidth_kbps);
     // The master text tells us whether this variant's audio is a
     // separate track (skip the fetch when the "variant" is the
     // manifest itself — a plain media playlist).
-    let audio_uri = if variant_uri != manifest_url {
+    let (audio_uri, subtitle_uri) = if variant_uri != manifest_url {
         let master_text = manifest_text(&client, &manifest_url, referer, captured)?;
         if master_text.contains("#EXT-X-KEY") {
             return Err(
@@ -2380,24 +3031,46 @@ pub fn download_hls_variant(
             );
         }
         let master = parse_hls_master(&master_text, &manifest_base_url(&manifest_url));
-        master
-            .variants
-            .iter()
-            .find(|v| v.uri == variant_uri)
-            .and_then(|v| v.audio_group.clone())
+        let variant = master.variants.iter().find(|v| v.uri == variant_uri);
+        let audio_uri = variant
+            .and_then(|v| v.audio_group.as_deref())
             .and_then(|group| {
-                master
-                    .audio
-                    .iter()
-                    .find(|a| a.group_id == group)
+                pick_audio_rendition(&master.audio, group, opts.audio_language.as_deref())
                     .map(|a| a.uri.clone())
+            });
+        let subtitle_uri = variant
+            .and_then(|v| v.subtitles_group.as_deref())
+            .or_else(|| {
+                // A variant with no SUBTITLES attribute still
+                // gets its subtitles when the master has only one
+                // subtitle group (the common case).
+                if master.subtitles.len() == 1 {
+                    Some(master.subtitles[0].group_id.as_str())
+                } else {
+                    None
+                }
             })
+            .and_then(|group| {
+                pick_subtitle_rendition(
+                    &master.subtitles,
+                    Some(group),
+                    opts.subtitle_language.as_deref(),
+                )
+                .map(|s| s.uri.clone())
+            })
+            .or_else(|| {
+                // No group at all (variant names none, master has
+                // several): match by language across all groups.
+                pick_subtitle_rendition(&master.subtitles, None, opts.subtitle_language.as_deref())
+                    .map(|s| s.uri.clone())
+            });
+        (audio_uri, subtitle_uri)
     } else {
-        None
+        (None, None)
     };
-    if audio_uri.is_some() && ffmpeg.is_none() {
+    if (audio_uri.is_some() || subtitle_uri.is_some()) && ffmpeg.is_none() {
         return Err(
-            "This quality keeps its audio on a separate track, which needs ffmpeg to merge. \
+            "This quality keeps its audio or subtitles on a separate track, which needs ffmpeg to merge. \
              Install ffmpeg (or pick a combined quality) and try again."
                 .to_string(),
         );
@@ -2422,7 +3095,7 @@ pub fn download_hls_variant(
     std::fs::create_dir_all(destination_dir).map_err(|e| e.to_string())?;
     let final_path = crate::filename::unique_path(destination_dir, &clean);
     let video_part = part_path_for(&final_path);
-    let video_bytes = download_segments(
+    let video_bytes = download_segments_with_bandwidth(
         &client,
         &video_segments,
         &video_part,
@@ -2433,8 +3106,64 @@ pub fn download_hls_variant(
         paused,
         cancelled,
         DOWNLOAD_STALL_TIMEOUT,
+        &bandwidth,
     )?;
+    // Subtitles download BEFORE the merge decision: a subtitle
+    // failure must not cost the video, so it is a warning, not an
+    // error — but the merge decision below needs to know whether
+    // a subtitle file actually exists.
+    let subtitle_file: Option<PathBuf> = match &subtitle_uri {
+        Some(uri) => {
+            let subs_path = final_path.with_file_name(format!(
+                "{}.subs.vtt",
+                final_path.file_name().unwrap().to_string_lossy()
+            ));
+            match download_hls_subtitles(&client, uri, referer, &subs_path, paused, cancelled) {
+                Ok(path) => Some(path),
+                Err(e) if e == "__PAUSED__" || e == "__CANCELLED__" => {
+                    let _ = std::fs::remove_file(&subs_path);
+                    return Err(e);
+                }
+                Err(e) => {
+                    eprintln!("FetchForge: subtitles could not be downloaded ({e}); continuing without them.");
+                    let _ = std::fs::remove_file(&subs_path);
+                    None
+                }
+            }
+        }
+        None => None,
+    };
     let Some(audio_segments) = audio_segments else {
+        if let Some(subs) = &subtitle_file {
+            // Muxed variant + subtitles: the merge re-containers
+            // the .ts to .mp4 (mov_text is not valid in MPEG-TS).
+            // The returned path's extension changes — the caller
+            // reconciles the record against it.
+            let ffmpeg = ffmpeg.expect("subtitle merge checked ffmpeg above");
+            let mp4_path = if final_path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("ts"))
+            {
+                let mp4_name = format!("{}.mp4", final_path.file_stem().unwrap().to_string_lossy());
+                crate::filename::unique_path(destination_dir, &mp4_name)
+            } else {
+                final_path.clone()
+            };
+            let lang = opts.subtitle_language.clone().unwrap_or_default();
+            let merged = crate::ffmpeg::merge_tracks(
+                ffmpeg,
+                &video_part,
+                None,
+                Some((subs.as_path(), lang.as_str())),
+                opts.title.as_deref(),
+                &mp4_path,
+            );
+            let _ = std::fs::remove_file(&video_part);
+            let _ = std::fs::remove_file(subs);
+            merged?;
+            remove_seg_dir(&video_part);
+            return Ok(mp4_path);
+        }
         std::fs::rename(&video_part, &final_path).map_err(|e| e.to_string())?;
         remove_seg_dir(&video_part);
         return Ok(final_path);
@@ -2455,7 +3184,7 @@ pub fn download_hls_variant(
         "{}.audio.part",
         final_path.file_name().unwrap().to_string_lossy()
     ));
-    download_segments(
+    download_segments_with_bandwidth(
         &client,
         &audio_segments,
         &audio_part,
@@ -2466,11 +3195,28 @@ pub fn download_hls_variant(
         paused,
         cancelled,
         DOWNLOAD_STALL_TIMEOUT,
+        &bandwidth,
     )?;
     let ffmpeg = ffmpeg.expect("audio merge checked ffmpeg above");
-    let merged = crate::ffmpeg::merge_av(ffmpeg, &video_part, &audio_part, &final_path);
+    let subtitle_arg = subtitle_file.as_ref().map(|p| {
+        (
+            p.as_path(),
+            opts.subtitle_language.clone().unwrap_or_default(),
+        )
+    });
+    let merged = crate::ffmpeg::merge_tracks(
+        ffmpeg,
+        &video_part,
+        Some(&audio_part),
+        subtitle_arg.as_ref().map(|(p, lang)| (*p, lang.as_str())),
+        opts.title.as_deref(),
+        &final_path,
+    );
     let _ = std::fs::remove_file(&video_part);
     let _ = std::fs::remove_file(&audio_part);
+    if let Some(subs) = &subtitle_file {
+        let _ = std::fs::remove_file(subs);
+    }
     merged?;
     remove_seg_dir(&video_part);
     remove_seg_dir(&audio_part);
@@ -2485,6 +3231,10 @@ pub fn download_hls_variant(
 /// extract the audio (see [`crate::ffmpeg::extract_audio`]).
 /// Returns the downloaded file (an audio-only `.ts`, or the full
 /// video when muxed); the caller extracts/remuxes it to `.m4a`.
+///
+/// No language / proxy / speed-limit options: see
+/// [`download_hls_audio_only_opts`] for those (round 11
+/// extension).
 #[allow(clippy::too_many_arguments)]
 pub fn download_hls_audio_only(
     manifest_url: &str,
@@ -2497,13 +3247,46 @@ pub fn download_hls_audio_only(
     cancelled: &AtomicBool,
     captured: Option<&CapturedManifest>,
 ) -> Result<PathBuf, String> {
+    download_hls_audio_only_opts(
+        manifest_url,
+        variant_uri,
+        destination_dir,
+        filename,
+        referer,
+        progress,
+        paused,
+        cancelled,
+        captured,
+        &StreamDownloadOptions::default(),
+    )
+}
+
+/// [`download_hls_audio_only`] with the round 11 extension
+/// options: the audio language picks WHICH separate audio
+/// rendition to download (feature 4 — the pre-extension code
+/// always took the first rendition of the group), the proxy
+/// (feature 10) and the speed limit (feature 3) apply to the
+/// segment fetches.
+#[allow(clippy::too_many_arguments)]
+pub fn download_hls_audio_only_opts(
+    manifest_url: &str,
+    variant_uri: &str,
+    destination_dir: &Path,
+    filename: &str,
+    referer: &Option<String>,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
+    opts: &StreamDownloadOptions,
+) -> Result<PathBuf, String> {
     let manifest_url = validate_url(manifest_url)?;
     let variant_uri = validate_url(variant_uri)?;
     // Resolve the variant's audio group from the master (skip the
     // fetch when the "variant" is the manifest itself — a plain
     // media playlist, whose audio is muxed by definition).
     let audio_uri = if variant_uri != manifest_url {
-        let client = hls_client()?;
+        let client = hls_client_with_timeout_and_proxy(REQUEST_TIMEOUT, opts.proxy_url.as_deref())?;
         let master_text = manifest_text(&client, &manifest_url, referer, captured)?;
         if master_text.contains("#EXT-X-KEY") {
             return Err(
@@ -2516,12 +3299,9 @@ pub fn download_hls_audio_only(
             .variants
             .iter()
             .find(|v| v.uri == variant_uri)
-            .and_then(|v| v.audio_group.clone())
+            .and_then(|v| v.audio_group.as_deref())
             .and_then(|group| {
-                master
-                    .audio
-                    .iter()
-                    .find(|a| a.group_id == group)
+                pick_audio_rendition(&master.audio, group, opts.audio_language.as_deref())
                     .map(|a| a.uri.clone())
             })
     } else {
@@ -2532,7 +3312,9 @@ pub fn download_hls_audio_only(
         // media playlist (no merge — there is no video). The
         // captured text belongs to the video playlist, so it is
         // not passed: the audio playlist is fetched normally.
-        Some(uri) => download_hls_variant(
+        // The language is already baked into the URI, so the
+        // options pass through for proxy + speed limit only.
+        Some(uri) => download_hls_variant_opts(
             &uri,
             &uri,
             destination_dir,
@@ -2543,9 +3325,10 @@ pub fn download_hls_audio_only(
             paused,
             cancelled,
             None,
+            opts,
         ),
         // Muxed: the full variant; the caller extracts the audio.
-        None => download_hls_variant(
+        None => download_hls_variant_opts(
             &manifest_url,
             &variant_uri,
             destination_dir,
@@ -2556,6 +3339,7 @@ pub fn download_hls_audio_only(
             paused,
             cancelled,
             captured,
+            opts,
         ),
     }
 }
@@ -2571,6 +3355,9 @@ pub fn download_hls_audio_only(
 /// playlist text the extension captured for the VIDEO playlist
 /// (see [`CapturedManifest`]); the audio playlist is always
 /// fetched normally.
+///
+/// No proxy / speed-limit / title options: see
+/// [`download_hls_pair_opts`] for those (round 11 extension).
 #[allow(clippy::too_many_arguments)]
 pub fn download_hls_pair(
     video_uri: &str,
@@ -2584,9 +3371,44 @@ pub fn download_hls_pair(
     cancelled: &AtomicBool,
     captured: Option<&CapturedManifest>,
 ) -> Result<PathBuf, String> {
+    download_hls_pair_opts(
+        video_uri,
+        audio_uri,
+        destination_dir,
+        filename,
+        referer,
+        ffmpeg,
+        progress,
+        paused,
+        cancelled,
+        captured,
+        &StreamDownloadOptions::default(),
+    )
+}
+
+/// [`download_hls_pair`] with the round 11 extension options:
+/// the proxy (feature 10), the speed limit (feature 3) and the
+/// title metadata (feature 12). There is no master playlist in
+/// the paired case, so there are no language choices to make —
+/// the two URIs ARE the choice.
+#[allow(clippy::too_many_arguments)]
+pub fn download_hls_pair_opts(
+    video_uri: &str,
+    audio_uri: &str,
+    destination_dir: &Path,
+    filename: &str,
+    referer: &Option<String>,
+    ffmpeg: &Path,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
+    opts: &StreamDownloadOptions,
+) -> Result<PathBuf, String> {
     let video_uri = validate_url(video_uri)?;
     let audio_uri = validate_url(audio_uri)?;
-    let client = hls_client()?;
+    let client = hls_client_with_timeout_and_proxy(REQUEST_TIMEOUT, opts.proxy_url.as_deref())?;
+    let bandwidth = SharedLimiter::new(opts.bandwidth_kbps);
     let video_text = manifest_text(&client, &video_uri, referer, captured)?;
     if video_text.contains("#EXT-X-KEY") {
         return Err(
@@ -2609,7 +3431,7 @@ pub fn download_hls_pair(
     std::fs::create_dir_all(destination_dir).map_err(|e| e.to_string())?;
     let final_path = crate::filename::unique_path(destination_dir, &clean);
     let video_part = part_path_for(&final_path);
-    let video_bytes = download_segments(
+    let video_bytes = download_segments_with_bandwidth(
         &client,
         &video_segments,
         &video_part,
@@ -2620,6 +3442,7 @@ pub fn download_hls_pair(
         paused,
         cancelled,
         DOWNLOAD_STALL_TIMEOUT,
+        &bandwidth,
     )?;
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = std::fs::remove_file(&video_part);
@@ -2633,7 +3456,7 @@ pub fn download_hls_pair(
         "{}.audio.part",
         final_path.file_name().unwrap().to_string_lossy()
     ));
-    download_segments(
+    download_segments_with_bandwidth(
         &client,
         &audio_segments,
         &audio_part,
@@ -2644,8 +3467,16 @@ pub fn download_hls_pair(
         paused,
         cancelled,
         DOWNLOAD_STALL_TIMEOUT,
+        &bandwidth,
     )?;
-    let merged = crate::ffmpeg::merge_av(ffmpeg, &video_part, &audio_part, &final_path);
+    let merged = crate::ffmpeg::merge_tracks(
+        ffmpeg,
+        &video_part,
+        Some(&audio_part),
+        None,
+        opts.title.as_deref(),
+        &final_path,
+    );
     let _ = std::fs::remove_file(&video_part);
     let _ = std::fs::remove_file(&audio_part);
     merged?;
@@ -2653,7 +3484,6 @@ pub fn download_hls_pair(
     remove_seg_dir(&audio_part);
     Ok(final_path)
 }
-
 
 // ---------------------------------------------------------------------------
 // DASH parsing (MPD is XML; parsed with quick-xml, not string scans:
@@ -2680,18 +3510,48 @@ pub struct DashRepresentation {
     /// AdaptationSet's. Mutually exclusive with `segment_list`.
     pub template: Option<SegmentTemplate>,
     pub segment_list: Option<DashSegmentList>,
+    /// The `lang` attribute (Representation, else AdaptationSet):
+    /// the audio/subtitle language (an ISO 639 code such as "en").
+    /// Round 11 extension, features 2 + 4.
+    pub lang: Option<String>,
 }
 
 impl DashRepresentation {
     fn is_video(&self) -> bool {
         self.content_type.eq_ignore_ascii_case("video")
             || self.mime_type.to_ascii_lowercase().starts_with("video/")
-            || (!self.is_audio() && (self.width.is_some() || self.height.is_some()))
+            || (!self.is_audio()
+                && !self.is_text()
+                && (self.width.is_some() || self.height.is_some()))
     }
 
     fn is_audio(&self) -> bool {
         self.content_type.eq_ignore_ascii_case("audio")
             || self.mime_type.to_ascii_lowercase().starts_with("audio/")
+    }
+
+    /// A text (subtitle) representation: contentType "text" or a
+    /// text/* MIME type. Text reps are NOT formats — they never
+    /// appear in the quality list (round 11 extension, feature
+    /// 2); they are offered as subtitle languages instead.
+    fn is_text(&self) -> bool {
+        self.content_type.eq_ignore_ascii_case("text")
+            || self.mime_type.to_ascii_lowercase().starts_with("text/")
+            || self.mime_type.to_ascii_lowercase().contains("ttml")
+    }
+
+    /// A WebVTT text representation — the only subtitle kind the
+    /// engine can assemble (feature 2). TTML reps (`application/
+    /// ttml+xml`, codecs `stpp`) are NOT WebVTT: their segments
+    /// are XML fragments, not complete subtitle documents, and
+    /// assembling them is out of scope (see the notes).
+    fn is_vtt(&self) -> bool {
+        if !self.is_text() {
+            return false;
+        }
+        let mime = self.mime_type.to_ascii_lowercase();
+        let codecs = self.codecs.as_deref().unwrap_or("").to_ascii_lowercase();
+        mime.contains("vtt") || codecs.contains("wvtt") || mime == "text/vtt"
     }
 }
 
@@ -2830,9 +3690,7 @@ fn substitute_template(
             continue;
         }
         let Some(end) = rest[1..].find('$').map(|i| i + 1) else {
-            return Err(format!(
-                "Bad SegmentTemplate: unterminated $ in {tpl:?}"
-            ));
+            return Err(format!("Bad SegmentTemplate: unterminated $ in {tpl:?}"));
         };
         let token = &rest[1..end];
         rest = &rest[end + 1..];
@@ -2842,27 +3700,18 @@ fn substitute_template(
         };
         let value: String = match name {
             "RepresentationID" => rep_id.to_string(),
-            "Bandwidth" => bandwidth
-                .map(|b| b.to_string())
-                .ok_or_else(|| {
-                    "SegmentTemplate uses $Bandwidth$ but the Representation has no bandwidth"
-                        .to_string()
-                })?,
-            "Number" => number
-                .map(|n| n.to_string())
-                .ok_or_else(|| {
-                    "SegmentTemplate uses $Number$ but no segment number is available"
-                        .to_string()
-                })?,
-            "Time" => time
-                .map(|t| t.to_string())
-                .ok_or_else(|| {
-                    "SegmentTemplate uses $Time$ but no segment time is available".to_string()
-                })?,
+            "Bandwidth" => bandwidth.map(|b| b.to_string()).ok_or_else(|| {
+                "SegmentTemplate uses $Bandwidth$ but the Representation has no bandwidth"
+                    .to_string()
+            })?,
+            "Number" => number.map(|n| n.to_string()).ok_or_else(|| {
+                "SegmentTemplate uses $Number$ but no segment number is available".to_string()
+            })?,
+            "Time" => time.map(|t| t.to_string()).ok_or_else(|| {
+                "SegmentTemplate uses $Time$ but no segment time is available".to_string()
+            })?,
             other => {
-                return Err(format!(
-                    "Unsupported SegmentTemplate variable ${other}$"
-                ));
+                return Err(format!("Unsupported SegmentTemplate variable ${other}$"));
             }
         };
         match fmt {
@@ -2908,6 +3757,7 @@ pub fn parse_dash_manifest(text: &str) -> Result<DashManifest, String> {
     // AdaptationSet-level state, inherited by its Representations.
     let mut set_mime = String::new();
     let mut set_content = String::new();
+    let mut set_lang: Option<String> = None;
     let mut set_template: Option<SegmentTemplate> = None;
     let mut set_list: Option<DashSegmentList> = None;
     let mut set_base_url: Option<String> = None;
@@ -2991,6 +3841,7 @@ pub fn parse_dash_manifest(text: &str) -> Result<DashManifest, String> {
                                 rep,
                                 &set_mime,
                                 &set_content,
+                                &set_lang,
                                 &set_template,
                                 &set_list,
                                 &set_base_url,
@@ -3014,192 +3865,191 @@ pub fn parse_dash_manifest(text: &str) -> Result<DashManifest, String> {
         };
         {
             let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
-                let mut attrs: HashMap<String, String> = HashMap::new();
-                for a in e.attributes().flatten() {
-                    let key = String::from_utf8_lossy(a.key.local_name().as_ref()).to_string();
-                    let value = a
-                        .unescape_value()
-                        .map(|v| v.to_string())
-                        .unwrap_or_default();
-                    attrs.insert(key, value);
-                }
-                match name.as_str() {
-                    "MPD" => {
-                        if attrs
-                            .get("type")
-                            .is_some_and(|t| t.eq_ignore_ascii_case("dynamic"))
-                        {
-                            return Err(
+            let mut attrs: HashMap<String, String> = HashMap::new();
+            for a in e.attributes().flatten() {
+                let key = String::from_utf8_lossy(a.key.local_name().as_ref()).to_string();
+                let value = a
+                    .unescape_value()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                attrs.insert(key, value);
+            }
+            match name.as_str() {
+                "MPD" => {
+                    if attrs
+                        .get("type")
+                        .is_some_and(|t| t.eq_ignore_ascii_case("dynamic"))
+                    {
+                        return Err(
                                 "This DASH stream is live (type=\"dynamic\"). FetchForge does not record live streams."
                                     .to_string(),
                             );
-                        }
-                        if let Some(d) = attrs.get("mediaPresentationDuration") {
-                            manifest.duration_secs = parse_iso8601_duration(d);
-                        }
                     }
-                    "Period" => {
-                        period_count += 1;
-                        if period_count > 1 {
-                            return Err(
-                                "Multi-period DASH manifests are not supported in this release"
-                                    .to_string(),
-                            );
-                        }
-                        if let Some(d) = attrs.get("duration") {
-                            period_duration = parse_iso8601_duration(d);
-                        }
+                    if let Some(d) = attrs.get("mediaPresentationDuration") {
+                        manifest.duration_secs = parse_iso8601_duration(d);
                     }
-                    "BaseURL" => {
-                        // Owner = the enclosing element.
-                        base_url_owner = match stack.last().map(String::as_str) {
-                            Some("MPD") => Some("mpd"),
-                            Some("Period") => Some("period"),
-                            Some("AdaptationSet") => Some("set"),
-                            Some("Representation") => Some("rep"),
-                            _ => None,
-                        };
-                    }
-                    "AdaptationSet" => {
-                        set_mime = attrs.get("mimeType").cloned().unwrap_or_default();
-                        set_content = attrs.get("contentType").cloned().unwrap_or_default();
-                        set_template = None;
-                        set_list = None;
-                        set_base_url = None;
-                    }
-                    "SegmentTemplate" => {
-                        let in_rep = current_rep.is_some();
-                        let tpl = SegmentTemplate {
-                            media: attrs.get("media").cloned(),
-                            initialization: attrs.get("initialization").cloned(),
-                            timescale: attrs
-                                .get("timescale")
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(1),
-                            duration: attrs.get("duration").and_then(|v| v.parse().ok()),
-                            start_number: attrs
-                                .get("startNumber")
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(1),
-                            timeline: Vec::new(),
-                        };
-                        if is_empty {
-                            if in_rep {
-                                if let Some(r) = current_rep.as_mut() {
-                                    r.own_template = Some(tpl);
-                                }
-                            } else {
-                                set_template = Some(tpl);
-                            }
-                        } else {
-                            pending_template = Some((in_rep, tpl));
-                        }
-                    }
-                    "S" => {
-                        if let Some((_, tpl)) = pending_template.as_mut() {
-                            if let Some(d) = attrs.get("d").and_then(|v| v.parse::<u64>().ok()) {
-                                tpl.timeline.push(TimelineEntry {
-                                    start: attrs.get("t").and_then(|v| v.parse().ok()),
-                                    duration: d,
-                                    repeat: attrs
-                                        .get("r")
-                                        .and_then(|v| v.parse().ok())
-                                        .unwrap_or(0),
-                                });
-                            }
-                        }
-                    }
-                    "SegmentList" => {
-                        let in_rep = current_rep.is_some();
-                        let list = DashSegmentList {
-                            initialization: None,
-                            segments: Vec::new(),
-                        };
-                        if is_empty {
-                            if in_rep {
-                                if let Some(r) = current_rep.as_mut() {
-                                    r.own_list = Some(list);
-                                }
-                            } else {
-                                set_list = Some(list);
-                            }
-                        } else {
-                            pending_list = Some((in_rep, list));
-                        }
-                    }
-                    "Initialization" => {
-                        if let Some((_, list)) = pending_list.as_mut() {
-                            list.initialization = Some(ListInit {
-                                url: attrs.get("sourceURL").cloned(),
-                                range: attrs
-                                    .get("range")
-                                    .and_then(|v| parse_byte_range(v)),
-                            });
-                        }
-                    }
-                    "SegmentURL" => {
-                        if let Some((_, list)) = pending_list.as_mut() {
-                            list.segments.push(ListSegment {
-                                media: attrs.get("media").cloned(),
-                                range: attrs
-                                    .get("mediaRange")
-                                    .and_then(|v| parse_byte_range(v)),
-                            });
-                        }
-                    }
-                    "Representation" => {
-                        let rep = RepBuilder {
-                            id: attrs.get("id").cloned().unwrap_or_default(),
-                            bandwidth: attrs.get("bandwidth").and_then(|v| v.parse().ok()),
-                            width: attrs.get("width").and_then(|v| v.parse().ok()),
-                            height: attrs.get("height").and_then(|v| v.parse().ok()),
-                            frame_rate: attrs.get("frameRate").and_then(|v| {
-                                // frameRate may be a ratio ("30000/1001").
-                                if let Some((n, d)) = v.split_once('/') {
-                                    let n: f64 = n.parse().ok()?;
-                                    let d: f64 = d.parse().ok()?;
-                                    if d == 0.0 {
-                                        None
-                                    } else {
-                                        Some(n / d)
-                                    }
-                                } else {
-                                    v.parse().ok()
-                                }
-                            }),
-                            codecs: attrs.get("codecs").cloned(),
-                            mime_type: attrs.get("mimeType").cloned(),
-                            content_type: attrs.get("contentType").cloned(),
-                            own_base_url: None,
-                            own_template: None,
-                            own_list: None,
-                        };
-                        if is_empty {
-                            manifest.representations.push(finish_rep(
-                                rep,
-                                &set_mime,
-                                &set_content,
-                                &set_template,
-                                &set_list,
-                                &set_base_url,
-                                &period_base_url,
-                                &mpd_base_url,
-                            ));
-                        } else {
-                            current_rep = Some(rep);
-                        }
-                    }
-                    "ContentProtection" => {
+                }
+                "Period" => {
+                    period_count += 1;
+                    if period_count > 1 {
                         return Err(
-                            "This DASH stream is DRM-protected (ContentProtection). FetchForge does not bypass DRM."
+                            "Multi-period DASH manifests are not supported in this release"
                                 .to_string(),
                         );
                     }
-                    _ => {}
+                    if let Some(d) = attrs.get("duration") {
+                        period_duration = parse_iso8601_duration(d);
+                    }
                 }
-                if !is_empty {
-                    stack.push(name);
+                "BaseURL" => {
+                    // Owner = the enclosing element.
+                    base_url_owner = match stack.last().map(String::as_str) {
+                        Some("MPD") => Some("mpd"),
+                        Some("Period") => Some("period"),
+                        Some("AdaptationSet") => Some("set"),
+                        Some("Representation") => Some("rep"),
+                        _ => None,
+                    };
                 }
+                "AdaptationSet" => {
+                    set_mime = attrs.get("mimeType").cloned().unwrap_or_default();
+                    set_content = attrs.get("contentType").cloned().unwrap_or_default();
+                    // `lang` covers both lang="en" and
+                    // xml:lang="en" (quick-xml's local_name
+                    // strips the prefix).
+                    set_lang = attrs.get("lang").cloned();
+                    set_template = None;
+                    set_list = None;
+                    set_base_url = None;
+                }
+                "SegmentTemplate" => {
+                    let in_rep = current_rep.is_some();
+                    let tpl = SegmentTemplate {
+                        media: attrs.get("media").cloned(),
+                        initialization: attrs.get("initialization").cloned(),
+                        timescale: attrs
+                            .get("timescale")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(1),
+                        duration: attrs.get("duration").and_then(|v| v.parse().ok()),
+                        start_number: attrs
+                            .get("startNumber")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(1),
+                        timeline: Vec::new(),
+                    };
+                    if is_empty {
+                        if in_rep {
+                            if let Some(r) = current_rep.as_mut() {
+                                r.own_template = Some(tpl);
+                            }
+                        } else {
+                            set_template = Some(tpl);
+                        }
+                    } else {
+                        pending_template = Some((in_rep, tpl));
+                    }
+                }
+                "S" => {
+                    if let Some((_, tpl)) = pending_template.as_mut() {
+                        if let Some(d) = attrs.get("d").and_then(|v| v.parse::<u64>().ok()) {
+                            tpl.timeline.push(TimelineEntry {
+                                start: attrs.get("t").and_then(|v| v.parse().ok()),
+                                duration: d,
+                                repeat: attrs.get("r").and_then(|v| v.parse().ok()).unwrap_or(0),
+                            });
+                        }
+                    }
+                }
+                "SegmentList" => {
+                    let in_rep = current_rep.is_some();
+                    let list = DashSegmentList {
+                        initialization: None,
+                        segments: Vec::new(),
+                    };
+                    if is_empty {
+                        if in_rep {
+                            if let Some(r) = current_rep.as_mut() {
+                                r.own_list = Some(list);
+                            }
+                        } else {
+                            set_list = Some(list);
+                        }
+                    } else {
+                        pending_list = Some((in_rep, list));
+                    }
+                }
+                "Initialization" => {
+                    if let Some((_, list)) = pending_list.as_mut() {
+                        list.initialization = Some(ListInit {
+                            url: attrs.get("sourceURL").cloned(),
+                            range: attrs.get("range").and_then(|v| parse_byte_range(v)),
+                        });
+                    }
+                }
+                "SegmentURL" => {
+                    if let Some((_, list)) = pending_list.as_mut() {
+                        list.segments.push(ListSegment {
+                            media: attrs.get("media").cloned(),
+                            range: attrs.get("mediaRange").and_then(|v| parse_byte_range(v)),
+                        });
+                    }
+                }
+                "Representation" => {
+                    let rep = RepBuilder {
+                        id: attrs.get("id").cloned().unwrap_or_default(),
+                        bandwidth: attrs.get("bandwidth").and_then(|v| v.parse().ok()),
+                        width: attrs.get("width").and_then(|v| v.parse().ok()),
+                        height: attrs.get("height").and_then(|v| v.parse().ok()),
+                        frame_rate: attrs.get("frameRate").and_then(|v| {
+                            // frameRate may be a ratio ("30000/1001").
+                            if let Some((n, d)) = v.split_once('/') {
+                                let n: f64 = n.parse().ok()?;
+                                let d: f64 = d.parse().ok()?;
+                                if d == 0.0 {
+                                    None
+                                } else {
+                                    Some(n / d)
+                                }
+                            } else {
+                                v.parse().ok()
+                            }
+                        }),
+                        codecs: attrs.get("codecs").cloned(),
+                        mime_type: attrs.get("mimeType").cloned(),
+                        content_type: attrs.get("contentType").cloned(),
+                        lang: attrs.get("lang").cloned(),
+                        own_base_url: None,
+                        own_template: None,
+                        own_list: None,
+                    };
+                    if is_empty {
+                        manifest.representations.push(finish_rep(
+                            rep,
+                            &set_mime,
+                            &set_content,
+                            &set_lang,
+                            &set_template,
+                            &set_list,
+                            &set_base_url,
+                            &period_base_url,
+                            &mpd_base_url,
+                        ));
+                    } else {
+                        current_rep = Some(rep);
+                    }
+                }
+                "ContentProtection" => {
+                    return Err(
+                            "This DASH stream is DRM-protected (ContentProtection). FetchForge does not bypass DRM."
+                                .to_string(),
+                        );
+                }
+                _ => {}
+            }
+            if !is_empty {
+                stack.push(name);
+            }
         }
     }
     if period_count == 0 {
@@ -3224,6 +4074,7 @@ struct RepBuilder {
     codecs: Option<String>,
     mime_type: Option<String>,
     content_type: Option<String>,
+    lang: Option<String>,
     own_base_url: Option<String>,
     own_template: Option<SegmentTemplate>,
     own_list: Option<DashSegmentList>,
@@ -3236,6 +4087,7 @@ fn finish_rep(
     rep: RepBuilder,
     set_mime: &str,
     set_content: &str,
+    set_lang: &Option<String>,
     set_template: &Option<SegmentTemplate>,
     set_list: &Option<DashSegmentList>,
     set_base_url: &Option<String>,
@@ -3251,6 +4103,7 @@ fn finish_rep(
         codecs: rep.codecs,
         mime_type: rep.mime_type.unwrap_or_else(|| set_mime.to_string()),
         content_type: rep.content_type.unwrap_or_else(|| set_content.to_string()),
+        lang: rep.lang.or_else(|| set_lang.clone()),
         base_url: rep
             .own_base_url
             .or_else(|| set_base_url.clone())
@@ -3285,12 +4138,80 @@ fn dash_segments(
     ))
 }
 
+/// [`dash_segments`] with each segment's start time in seconds
+/// (round 11 extension, feature 2 — subtitle cues are relative
+/// to their segment's start). A SegmentList carries no durations,
+/// so its starts are the equal division of the presentation
+/// duration across the listed segments — an estimate, but
+/// SegmentList subtitle tracks are rare, and a slightly-off
+/// subtitle beats none at all.
+fn dash_segments_with_times(
+    rep: &DashRepresentation,
+    manifest_url: &str,
+    duration_secs: Option<f64>,
+) -> Result<(Option<Segment>, Vec<(Segment, f64)>), String> {
+    let base = match &rep.base_url {
+        Some(b) => resolve(manifest_url, b),
+        None => manifest_url.to_string(),
+    };
+    if let Some(t) = &rep.template {
+        return template_segments_with_times(rep, t, &base, duration_secs);
+    }
+    if let Some(list) = &rep.segment_list {
+        return list_segments_with_times(list, &base, duration_secs);
+    }
+    Err(format!(
+        "Representation {} has neither a SegmentTemplate nor a SegmentList, so its segments cannot be found.",
+        rep.id
+    ))
+}
+
+/// [`list_segments`] with start times: the equal division of the
+/// presentation duration across the listed segments (a
+/// SegmentList carries no durations of its own). Without a
+/// duration the starts are all 0 — the cues stay relative to
+/// their segment, which is wrong, but the alternative is no
+/// subtitles at all.
+fn list_segments_with_times(
+    list: &DashSegmentList,
+    base: &str,
+    duration_secs: Option<f64>,
+) -> Result<(Option<Segment>, Vec<(Segment, f64)>), String> {
+    let (init, segments) = list_segments(list, base)?;
+    let step = match duration_secs {
+        Some(d) if d > 0.0 && !segments.is_empty() => d / segments.len() as f64,
+        _ => 0.0,
+    };
+    let timed = segments
+        .into_iter()
+        .enumerate()
+        .map(|(i, seg)| (seg, i as f64 * step))
+        .collect();
+    Ok((init, timed))
+}
+
 fn template_segments(
     rep: &DashRepresentation,
     t: &SegmentTemplate,
     base: &str,
     duration_secs: Option<f64>,
 ) -> Result<(Option<Segment>, Vec<Segment>), String> {
+    let (init, timed) = template_segments_with_times(rep, t, base, duration_secs)?;
+    Ok((init, timed.into_iter().map(|(seg, _)| seg).collect()))
+}
+
+/// [`template_segments`] with each segment's start time in
+/// seconds (round 11 extension, feature 2): subtitle cues are
+/// relative to their segment's start, so the merge needs the
+/// starts, not just the URLs. Timeline segments carry their
+/// start directly; number-based segments start at
+/// `n × segment duration`.
+fn template_segments_with_times(
+    rep: &DashRepresentation,
+    t: &SegmentTemplate,
+    base: &str,
+    duration_secs: Option<f64>,
+) -> Result<(Option<Segment>, Vec<(Segment, f64)>), String> {
     let init = match &t.initialization {
         Some(init_tpl) => {
             let url = substitute_template(init_tpl, &rep.id, rep.bandwidth, None, None)?;
@@ -3306,6 +4227,7 @@ fn template_segments(
             .to_string()
     })?;
     let uses_time = media_tpl.contains("$Time");
+    let timescale = t.timescale.max(1) as f64;
     let mut segments = Vec::new();
     if !t.timeline.is_empty() {
         // SegmentTimeline: expand S entries (r repeats each). Times
@@ -3326,24 +4248,26 @@ fn template_segments(
                     Some(number),
                     Some(time),
                 )?;
-                segments.push(Segment {
-                    url: resolve(base, &url),
-                    range: None,
-                });
+                segments.push((
+                    Segment {
+                        url: resolve(base, &url),
+                        range: None,
+                    },
+                    time as f64 / timescale,
+                ));
                 number += 1;
                 time += s.duration;
             }
         }
     } else if uses_time {
         return Err(
-            "This SegmentTemplate uses $Time$ but the manifest has no SegmentTimeline."
-                .to_string(),
+            "This SegmentTemplate uses $Time$ but the manifest has no SegmentTimeline.".to_string(),
         );
     } else if let Some(d) = t.duration {
         // Number-based: ceil(manifest duration / segment duration).
         // The last segment is the partial remainder; it is a real
         // segment on the server, not an overshoot.
-        let seg_secs = d as f64 / t.timescale.max(1) as f64;
+        let seg_secs = d as f64 / timescale;
         let total = duration_secs.ok_or_else(|| {
             "Cannot determine how many segments this stream has: no SegmentTimeline and no manifest duration."
                 .to_string()
@@ -3360,10 +4284,13 @@ fn template_segments(
                 Some(t.start_number + n),
                 None,
             )?;
-            segments.push(Segment {
-                url: resolve(base, &url),
-                range: None,
-            });
+            segments.push((
+                Segment {
+                    url: resolve(base, &url),
+                    range: None,
+                },
+                n as f64 * seg_secs,
+            ));
         }
     } else {
         return Err(
@@ -3439,10 +4366,16 @@ fn pick_default_representation<'a>(
 /// Choose a representation by id (or the default), plus the audio
 /// representation it must merge with when the chosen one is video
 /// and the manifest keeps audio separate. Returns
-/// (chosen, audio pair or None).
+/// (chosen, audio pair or None). `audio_language` (round 11
+/// extension, feature 4) picks the audio representation whose
+/// `lang` matches; when no audio rep matches (the manifest
+/// changed between listing and download) the highest-bandwidth
+/// audio is used instead — a movie in the wrong language beats a
+/// failed download.
 fn choose_dash_representation<'a>(
     manifest: &'a DashManifest,
     representation_id: Option<&str>,
+    audio_language: Option<&str>,
 ) -> Result<(&'a DashRepresentation, Option<&'a DashRepresentation>), String> {
     let chosen = match representation_id {
         Some(id) => manifest
@@ -3458,15 +4391,59 @@ fn choose_dash_representation<'a>(
             .ok_or_else(|| "No downloadable representation was found in this manifest.".to_string())?,
     };
     let audio = if chosen.is_video() {
-        manifest
+        let audio_reps: Vec<&DashRepresentation> = manifest
             .representations
             .iter()
             .filter(|r| r.is_audio())
-            .max_by_key(|r| r.bandwidth.unwrap_or(0))
+            .collect();
+        if let Some(want) = audio_language {
+            audio_reps
+                .iter()
+                .find(|r| {
+                    r.lang
+                        .as_deref()
+                        .is_some_and(|l| l.eq_ignore_ascii_case(want))
+                        || r.id == want
+                })
+                .copied()
+                .or_else(|| {
+                    audio_reps
+                        .iter()
+                        .max_by_key(|r| r.bandwidth.unwrap_or(0))
+                        .copied()
+                })
+        } else {
+            audio_reps
+                .iter()
+                .max_by_key(|r| r.bandwidth.unwrap_or(0))
+                .copied()
+        }
     } else {
         None
     };
     Ok((chosen, audio))
+}
+
+/// Choose the WebVTT subtitle representation matching `language`
+/// (round 11 extension, feature 2): the text rep whose `lang`
+/// (or id) equals the choice. None when no language was
+/// requested, or no VTT rep matches — a subtitle in the wrong
+/// language is worse than none, and the download continues
+/// without subtitles. TTML reps never match (see
+/// [`DashRepresentation::is_vtt`]).
+fn choose_dash_subtitle<'a>(
+    manifest: &'a DashManifest,
+    language: Option<&str>,
+) -> Option<&'a DashRepresentation> {
+    let want = language?;
+    manifest.representations.iter().find(|r| {
+        r.is_vtt()
+            && (r
+                .lang
+                .as_deref()
+                .is_some_and(|l| l.eq_ignore_ascii_case(want))
+                || r.id == want)
+    })
 }
 
 /// List the qualities of a DASH manifest: one format per
@@ -3488,8 +4465,19 @@ pub fn list_dash_formats(
     referer: &Option<String>,
     captured: Option<&CapturedManifest>,
 ) -> Result<StreamInfo, String> {
+    list_dash_formats_with_proxy(manifest_url, referer, captured, None)
+}
+
+/// [`list_dash_formats`] through the user-configured proxy
+/// (round 11 extension, feature 10).
+pub fn list_dash_formats_with_proxy(
+    manifest_url: &str,
+    referer: &Option<String>,
+    captured: Option<&CapturedManifest>,
+    proxy: Option<&str>,
+) -> Result<StreamInfo, String> {
     let manifest_url = validate_url(manifest_url)?;
-    let client = hls_client()?;
+    let client = hls_client_with_timeout_and_proxy(REQUEST_TIMEOUT, proxy)?;
     let text = manifest_text(&client, &manifest_url, referer, captured)?;
     if text.contains("ContentProtection") || text.contains("cenc:") {
         return Err(
@@ -3498,21 +4486,16 @@ pub fn list_dash_formats(
         );
     }
     let manifest = parse_dash_manifest(&text)?;
-    let has_audio = manifest
-        .representations
-        .iter()
-        .any(|r| r.is_audio());
+    let has_audio = manifest.representations.iter().any(|r| r.is_audio());
     // Segment count + exact total from the default representation
     // (best effort): the template/timeline expands to a concrete
     // list, so the plan can show the piece count up front like
     // HLS — and a fully ranged list yields the exact total. The
     // init segment counts too — it is a piece the worker
     // downloads.
-    let default_segments = choose_dash_representation(&manifest, None)
+    let default_segments = choose_dash_representation(&manifest, None, None)
         .ok()
-        .and_then(|(chosen, _)| {
-            dash_segments(chosen, &manifest_url, manifest.duration_secs).ok()
-        });
+        .and_then(|(chosen, _)| dash_segments(chosen, &manifest_url, manifest.duration_secs).ok());
     let segment_count = default_segments
         .as_ref()
         .map(|(init, segments)| segments.len() as u64 + init.is_some() as u64);
@@ -3524,12 +4507,17 @@ pub fn list_dash_formats(
         all.extend(segments.iter().cloned());
         exact_total_bytes(&all)
     });
-    let default_id = pick_default_representation(&manifest.representations)
-        .map(|r| r.id.clone());
+    let default_id = pick_default_representation(&manifest.representations).map(|r| r.id.clone());
     let duration_secs = manifest.duration_secs.map(|d| d as u64);
     let formats = manifest
         .representations
         .iter()
+        // Text (subtitle) representations are not formats: they
+        // carry no video or audio, and listing them as qualities
+        // would offer the user a "quality" that downloads
+        // subtitles as a video file. They are offered as subtitle
+        // languages instead (round 11 extension, feature 2).
+        .filter(|r| !r.is_text())
         .map(|r| {
             let is_video = r.is_video();
             let is_audio = r.is_audio();
@@ -3549,12 +4537,7 @@ pub fn list_dash_formats(
             };
             StreamFormat {
                 id: r.id.clone(),
-                ext: if is_audio && !is_video {
-                    "m4a"
-                } else {
-                    "mp4"
-                }
-                .to_string(),
+                ext: if is_audio && !is_video { "m4a" } else { "mp4" }.to_string(),
                 is_video,
                 is_audio,
                 height: r.height,
@@ -3576,6 +4559,23 @@ pub fn list_dash_formats(
             }
         })
         .collect();
+    // Audio languages: the distinct `lang` of the audio
+    // representations (falling back to the representation id
+    // when a rep declares no language — the chooser matches on
+    // either). Subtitle languages: the distinct `lang` of the
+    // WebVTT text representations only (TTML is not offered;
+    // see DashRepresentation::is_vtt).
+    let mut audio_languages: Vec<String> = Vec::new();
+    let mut subtitle_languages: Vec<String> = Vec::new();
+    for r in &manifest.representations {
+        let label = r.lang.clone().unwrap_or_else(|| r.id.clone());
+        if r.is_audio() && !audio_languages.contains(&label) {
+            audio_languages.push(label.clone());
+        }
+        if r.is_vtt() && !subtitle_languages.contains(&label) {
+            subtitle_languages.push(label);
+        }
+    }
     Ok(StreamInfo {
         kind: StreamKind::Dash,
         title: title_from_manifest_url(&manifest_url),
@@ -3583,6 +4583,8 @@ pub fn list_dash_formats(
         manifest_url,
         formats,
         segment_count,
+        audio_languages,
+        subtitle_languages,
     })
 }
 
@@ -3590,7 +4592,10 @@ pub fn list_dash_formats(
 /// representation (round 11, item 10): a rough upper bound, since
 /// DASH declares no average bandwidth. None when the duration is
 /// unknown or the representation declares no bandwidth.
-fn dash_size_estimate(r: &DashRepresentation, duration_secs: Option<u64>) -> (Option<u64>, Option<SizeKind>) {
+fn dash_size_estimate(
+    r: &DashRepresentation,
+    duration_secs: Option<u64>,
+) -> (Option<u64>, Option<SizeKind>) {
     let (Some(d), Some(bw)) = (duration_secs, r.bandwidth) else {
         return (None, None);
     };
@@ -3616,6 +4621,23 @@ pub struct DashDownloadOptions {
     /// Full filename (stem + extension from the plan).
     pub filename: String,
     pub referer: Option<String>,
+    /// Audio language chosen in the popup (round 11 extension,
+    /// feature 4): the `lang` of the audio representation to
+    /// merge with. None means the highest-bandwidth audio.
+    pub audio_language: Option<String>,
+    /// Subtitle language chosen in the popup (round 11
+    /// extension, feature 2): the `lang` of the WebVTT text
+    /// representation to mux in. None means no subtitles.
+    pub subtitle_language: Option<String>,
+    /// User-configured proxy (round 11 extension, feature 10),
+    /// validated at settings-save time. Never logged.
+    pub proxy_url: Option<String>,
+    /// Global speed limit in KB/s (round 11 extension, feature
+    /// 3), enforced across the segment workers.
+    pub bandwidth_kbps: Option<u64>,
+    /// Title metadata for the merged output (round 11 extension,
+    /// feature 12).
+    pub title: Option<String>,
 }
 
 /// Download a DASH manifest: resolve ffmpeg when the manifest
@@ -3633,7 +4655,7 @@ pub fn download_dash(
     // One manifest fetch to decide whether a merge is needed; the
     // assembly fetch is a second cheap GET of the same small file.
     let manifest_url = validate_url(&opts.manifest_url)?;
-    let client = hls_client()?;
+    let client = hls_client_with_timeout_and_proxy(REQUEST_TIMEOUT, opts.proxy_url.as_deref())?;
     let text = manifest_text(&client, &manifest_url, &opts.referer, captured)?;
     if text.contains("ContentProtection") || text.contains("cenc:") {
         return Err(
@@ -3642,14 +4664,32 @@ pub fn download_dash(
         );
     }
     let manifest = parse_dash_manifest(&text)?;
-    let (_, audio) =
-        choose_dash_representation(&manifest, opts.representation_id.as_deref())?;
-    let ffmpeg = if audio.is_some() {
+    let (chosen, audio) = choose_dash_representation(
+        &manifest,
+        opts.representation_id.as_deref(),
+        opts.audio_language.as_deref(),
+    )?;
+    // Subtitles need a merge too (muxing), but only for a video
+    // representation — an audio-only download has no video track
+    // to mux subtitles into.
+    let subtitle = if chosen.is_video() {
+        choose_dash_subtitle(&manifest, opts.subtitle_language.as_deref())
+    } else {
+        None
+    };
+    let ffmpeg = if audio.is_some() || subtitle.is_some() {
         Some(crate::ffmpeg::ensure_ffmpeg(data_dir)?)
     } else {
         None
     };
-    download_dash_with(ffmpeg.as_deref(), opts, progress, paused, cancelled, captured)
+    download_dash_with(
+        ffmpeg.as_deref(),
+        opts,
+        progress,
+        paused,
+        cancelled,
+        captured,
+    )
 }
 
 /// The testable core of [`download_dash`]: ffmpeg is explicit, so
@@ -3669,7 +4709,8 @@ pub fn download_dash_with(
     captured: Option<&CapturedManifest>,
 ) -> Result<PathBuf, String> {
     let manifest_url = validate_url(&opts.manifest_url)?;
-    let client = hls_client()?;
+    let client = hls_client_with_timeout_and_proxy(REQUEST_TIMEOUT, opts.proxy_url.as_deref())?;
+    let bandwidth = SharedLimiter::new(opts.bandwidth_kbps);
     let text = manifest_text(&client, &manifest_url, &opts.referer, captured)?;
     if text.contains("ContentProtection") || text.contains("cenc:") {
         return Err(
@@ -3678,11 +4719,22 @@ pub fn download_dash_with(
         );
     }
     let manifest = parse_dash_manifest(&text)?;
-    let (chosen, audio) =
-        choose_dash_representation(&manifest, opts.representation_id.as_deref())?;
-    if audio.is_some() && ffmpeg.is_none() {
+    let (chosen, audio) = choose_dash_representation(
+        &manifest,
+        opts.representation_id.as_deref(),
+        opts.audio_language.as_deref(),
+    )?;
+    // Subtitles need ffmpeg too (muxing), but only for a video
+    // representation — an audio-only download has no video track
+    // to mux subtitles into.
+    let subtitle_rep = if chosen.is_video() {
+        choose_dash_subtitle(&manifest, opts.subtitle_language.as_deref())
+    } else {
+        None
+    };
+    if (audio.is_some() || subtitle_rep.is_some()) && ffmpeg.is_none() {
         return Err(
-            "This quality keeps its audio on a separate track, which needs ffmpeg to merge. \
+            "This quality keeps its audio or subtitles on a separate track, which needs ffmpeg to merge. \
              Install ffmpeg (or pick a combined quality) and try again."
                 .to_string(),
         );
@@ -3691,12 +4743,11 @@ pub fn download_dash_with(
     std::fs::create_dir_all(&opts.destination_dir).map_err(|e| e.to_string())?;
     let final_path = crate::filename::unique_path(&opts.destination_dir, &clean);
     let video_part = part_path_for(&final_path);
-    let (init, mut segments) =
-        dash_segments(chosen, &manifest_url, manifest.duration_secs)?;
+    let (init, mut segments) = dash_segments(chosen, &manifest_url, manifest.duration_secs)?;
     if let Some(init) = init {
         segments.insert(0, init);
     }
-    let video_bytes = download_segments(
+    let video_bytes = download_segments_with_bandwidth(
         &client,
         &segments,
         &video_part,
@@ -3707,8 +4758,63 @@ pub fn download_dash_with(
         paused,
         cancelled,
         DOWNLOAD_STALL_TIMEOUT,
+        &bandwidth,
     )?;
+    // Subtitles download BEFORE the merge decision: a subtitle
+    // failure must not cost the video, so it is a warning, not an
+    // error — but the merge decision below needs to know whether
+    // a subtitle file actually exists.
+    let subtitle_file: Option<PathBuf> = match subtitle_rep {
+        Some(rep) => {
+            let subs_path = final_path.with_file_name(format!(
+                "{}.subs.vtt",
+                final_path.file_name().unwrap().to_string_lossy()
+            ));
+            match download_dash_subtitles(
+                &client,
+                rep,
+                &manifest_url,
+                manifest.duration_secs,
+                &opts.referer,
+                &subs_path,
+                paused,
+                cancelled,
+            ) {
+                Ok(path) => Some(path),
+                Err(e) if e == "__PAUSED__" || e == "__CANCELLED__" => {
+                    let _ = std::fs::remove_file(&subs_path);
+                    return Err(e);
+                }
+                Err(e) => {
+                    eprintln!("FetchForge: subtitles could not be downloaded ({e}); continuing without them.");
+                    let _ = std::fs::remove_file(&subs_path);
+                    None
+                }
+            }
+        }
+        None => None,
+    };
     let Some(audio_rep) = audio else {
+        if let Some(subs) = &subtitle_file {
+            // Video-only representation + subtitles: mux the
+            // subtitles in (the output is already .mp4, so no
+            // re-containerising is needed).
+            let ffmpeg = ffmpeg.expect("subtitle merge checked ffmpeg above");
+            let lang = opts.subtitle_language.clone().unwrap_or_default();
+            let merged = crate::ffmpeg::merge_tracks(
+                ffmpeg,
+                &video_part,
+                None,
+                Some((subs.as_path(), lang.as_str())),
+                opts.title.as_deref(),
+                &final_path,
+            );
+            let _ = std::fs::remove_file(&video_part);
+            let _ = std::fs::remove_file(subs);
+            merged?;
+            remove_seg_dir(&video_part);
+            return Ok(final_path);
+        }
         std::fs::rename(&video_part, &final_path).map_err(|e| e.to_string())?;
         remove_seg_dir(&video_part);
         return Ok(final_path);
@@ -3730,7 +4836,7 @@ pub fn download_dash_with(
     if let Some(init) = audio_init {
         audio_segments.insert(0, init);
     }
-    download_segments(
+    download_segments_with_bandwidth(
         &client,
         &audio_segments,
         &audio_part,
@@ -3741,11 +4847,28 @@ pub fn download_dash_with(
         paused,
         cancelled,
         DOWNLOAD_STALL_TIMEOUT,
+        &bandwidth,
     )?;
     let ffmpeg = ffmpeg.expect("audio merge checked ffmpeg above");
-    let merged = crate::ffmpeg::merge_av(ffmpeg, &video_part, &audio_part, &final_path);
+    let subtitle_arg = subtitle_file.as_ref().map(|p| {
+        (
+            p.as_path(),
+            opts.subtitle_language.clone().unwrap_or_default(),
+        )
+    });
+    let merged = crate::ffmpeg::merge_tracks(
+        ffmpeg,
+        &video_part,
+        Some(&audio_part),
+        subtitle_arg.as_ref().map(|(p, lang)| (*p, lang.as_str())),
+        opts.title.as_deref(),
+        &final_path,
+    );
     let _ = std::fs::remove_file(&video_part);
     let _ = std::fs::remove_file(&audio_part);
+    if let Some(subs) = &subtitle_file {
+        let _ = std::fs::remove_file(subs);
+    }
     merged?;
     remove_seg_dir(&video_part);
     remove_seg_dir(&audio_part);
@@ -3956,7 +5079,10 @@ mod tests {
         let m = parse_hls_master(MASTER, "https://example.com/v/master.m3u8");
         // 1080p exists, so it is the default despite 720p also
         // being <= 1080p (highest wins within the cap).
-        assert_eq!(pick_default_variant(&m.variants).unwrap().height, Some(1080));
+        assert_eq!(
+            pick_default_variant(&m.variants).unwrap().height,
+            Some(1080)
+        );
         let no_res = vec![
             HlsVariant {
                 uri: "a".into(),
@@ -3967,6 +5093,7 @@ mod tests {
                 codecs: None,
                 fps: None,
                 audio_group: None,
+                subtitles_group: None,
             },
             HlsVariant {
                 uri: "b".into(),
@@ -3977,6 +5104,7 @@ mod tests {
                 codecs: None,
                 fps: None,
                 audio_group: None,
+                subtitles_group: None,
             },
         ];
         assert_eq!(pick_default_variant(&no_res).unwrap().uri, "b");
@@ -4008,6 +5136,7 @@ mod tests {
             codecs: None,
             fps: None,
             audio_group: None,
+            subtitles_group: None,
         };
         // 1,820,000 bps / 8 * 600 s = 136,500,000 bytes.
         assert_eq!(
@@ -4048,6 +5177,7 @@ mod tests {
             base_url: None,
             template: None,
             segment_list: None,
+            lang: None,
         };
         // 1,780,000 / 8 * 100 = 22,250,000 bytes, peak kind.
         assert_eq!(
@@ -4064,10 +5194,7 @@ mod tests {
         assert_eq!(SizeKind::Peak.marker(), "~");
         assert_eq!(SizeKind::Measured.marker(), "~");
         assert_eq!(SizeKind::Exact.weaker(SizeKind::Peak), SizeKind::Peak);
-        assert_eq!(
-            SizeKind::Average.weaker(SizeKind::Exact),
-            SizeKind::Average
-        );
+        assert_eq!(SizeKind::Average.weaker(SizeKind::Exact), SizeKind::Average);
         assert_eq!(
             SizeKind::Measured.weaker(SizeKind::Average),
             SizeKind::Measured
@@ -4263,7 +5390,10 @@ mod tests {
         files.insert("/low.m3u8".to_string(), MEDIA_PLAYLIST.as_bytes().to_vec());
         files.insert("/mid.m3u8".to_string(), MEDIA_PLAYLIST.as_bytes().to_vec());
         files.insert("/high.m3u8".to_string(), MEDIA_PLAYLIST.as_bytes().to_vec());
-        files.insert("/audio.m3u8".to_string(), MEDIA_PLAYLIST.as_bytes().to_vec());
+        files.insert(
+            "/audio.m3u8".to_string(),
+            MEDIA_PLAYLIST.as_bytes().to_vec(),
+        );
         let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (port, server) = serve_map(files, hits, stop.clone());
@@ -4301,7 +5431,10 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
         assert_eq!(info.formats.len(), 1);
-        assert_eq!(info.formats[0].id, format!("http://127.0.0.1:{port}/play.m3u8"));
+        assert_eq!(
+            info.formats[0].id,
+            format!("http://127.0.0.1:{port}/play.m3u8")
+        );
         assert_eq!(info.duration_secs, Some(25));
     }
 
@@ -4340,7 +5473,10 @@ mod tests {
         .unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
-        assert_eq!(std::fs::read(&out).unwrap(), b"SEGMENT-ZERO-SEGMENT-ONE-SEGMENT-TWO");
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            b"SEGMENT-ZERO-SEGMENT-ONE-SEGMENT-TWO"
+        );
         assert_eq!(*seen.lock().unwrap().last().unwrap(), 36);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4385,7 +5521,10 @@ mod tests {
         .unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
-        assert_eq!(std::fs::read(&out).unwrap(), b"SEGMENT-ZERO-SEGMENT-ONE-SEGMENT-TWO");
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            b"SEGMENT-ZERO-SEGMENT-ONE-SEGMENT-TWO"
+        );
         // Segment 0 was NOT re-downloaded; the sidecar is gone.
         let hits = hits.lock().unwrap();
         assert!(!hits.contains(&"/seg0.ts".to_string()), "hits: {hits:?}");
@@ -4427,7 +5566,10 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
         // Restarted from segment 0: no stale bytes in the output.
-        assert_eq!(std::fs::read(&out).unwrap(), b"SEGMENT-ZERO-SEGMENT-ONE-SEGMENT-TWO");
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            b"SEGMENT-ZERO-SEGMENT-ONE-SEGMENT-TWO"
+        );
         assert!(hits.lock().unwrap().contains(&"/seg0.ts".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4490,13 +5632,30 @@ mod tests {
         let vts = dir.join("v.ts");
         let ats = dir.join("a.ts");
         assert!(mk(&[
-            "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "mpegts",
             vts.to_str().unwrap()
         ]));
         assert!(mk(&[
-            "-y", "-f", "lavfi", "-i", "sine=frequency=440:d=1",
-            "-c:a", "aac", "-f", "mpegts", ats.to_str().unwrap()
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:d=1",
+            "-c:a",
+            "aac",
+            "-f",
+            "mpegts",
+            ats.to_str().unwrap()
         ]));
         let vbytes = std::fs::read(&vts).unwrap();
         let abytes = std::fs::read(&ats).unwrap();
@@ -4611,7 +5770,10 @@ mod tests {
             "/audio_1.m3u8?sign=s3cret".to_string(),
             b"#EXTM3U\n#EXTINF:10,\nseg0.ts\n#EXTINF:10,\nseg1.ts\n#EXT-X-ENDLIST\n".to_vec(),
         );
-        files.insert("/seg0.ts?sign=s3cret".to_string(), b"SEGMENT-ZERO-".to_vec());
+        files.insert(
+            "/seg0.ts?sign=s3cret".to_string(),
+            b"SEGMENT-ZERO-".to_vec(),
+        );
         files.insert("/seg1.ts?sign=s3cret".to_string(), b"SEGMENT-ONE".to_vec());
         let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
         let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -4889,18 +6051,25 @@ mod tests {
             Some("https://img.rousav.tech/media/abc/index.m3u8")
         );
         assert_eq!(
-            proxy_inner_manifest_url("https://proxy.example/?u=https://cdn.example.com/v/play.m3u8").as_deref(),
+            proxy_inner_manifest_url(
+                "https://proxy.example/?u=https://cdn.example.com/v/play.m3u8"
+            )
+            .as_deref(),
             Some("https://cdn.example.com/v/play.m3u8")
         );
         // Not a manifest wrapper: no url param, or the param is not
         // an HLS manifest (DASH wrappers keep yt-dlp routing).
         assert_eq!(proxy_inner_manifest_url("https://proxy.example/?q=1"), None);
         assert_eq!(
-            proxy_inner_manifest_url("https://proxy.example/?url=https://cdn.example.com/v/movie.mp4"),
+            proxy_inner_manifest_url(
+                "https://proxy.example/?url=https://cdn.example.com/v/movie.mp4"
+            ),
             None
         );
         assert_eq!(
-            proxy_inner_manifest_url("https://proxy.example/?url=https://cdn.example.com/v/manifest.mpd"),
+            proxy_inner_manifest_url(
+                "https://proxy.example/?url=https://cdn.example.com/v/manifest.mpd"
+            ),
             None
         );
         // And the wrapper itself routes to the HLS engine.
@@ -4908,7 +6077,10 @@ mod tests {
             stream_kind_of_url("https://proxy.example/?url=https://cdn.example.com/v/play.m3u8"),
             Some(StreamKind::Hls)
         );
-        assert_eq!(stream_kind_of_url("https://proxy.example/?url=https://cdn.example.com/v/manifest.mpd"), None);
+        assert_eq!(
+            stream_kind_of_url("https://proxy.example/?url=https://cdn.example.com/v/manifest.mpd"),
+            None
+        );
     }
 
     #[test]
@@ -4970,8 +6142,14 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), b"SEGMENT-ZERO-SEGMENT-ONE");
         // Segments came from the inner paths, never the proxy origin.
         let hits = hits.lock().unwrap();
-        assert!(hits.contains(&"/media/seg0.ts".to_string()), "hits: {hits:?}");
-        assert!(hits.contains(&"/media/seg1.ts".to_string()), "hits: {hits:?}");
+        assert!(
+            hits.contains(&"/media/seg0.ts".to_string()),
+            "hits: {hits:?}"
+        );
+        assert!(
+            hits.contains(&"/media/seg1.ts".to_string()),
+            "hits: {hits:?}"
+        );
         assert!(
             !hits.iter().any(|h| h == "/seg0.ts" || h == "/seg1.ts"),
             "segments must not resolve against the proxy origin: {hits:?}"
@@ -5004,13 +6182,30 @@ mod tests {
         let vts = dir.join("v.ts");
         let ats = dir.join("a.ts");
         assert!(mk(&[
-            "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "mpegts",
             vts.to_str().unwrap()
         ]));
         assert!(mk(&[
-            "-y", "-f", "lavfi", "-i", "sine=frequency=440:d=1",
-            "-c:a", "aac", "-f", "mpegts", ats.to_str().unwrap()
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:d=1",
+            "-c:a",
+            "aac",
+            "-f",
+            "mpegts",
+            ats.to_str().unwrap()
         ]));
         let vbytes = std::fs::read(&vts).unwrap();
         let abytes = std::fs::read(&ats).unwrap();
@@ -5056,7 +6251,9 @@ mod tests {
     #[test]
     fn segment_retry_and_stall_helpers() {
         // Timeout-looking errors…
-        assert!(looks_like_timeout("error sending request: operation timed out"));
+        assert!(looks_like_timeout(
+            "error sending request: operation timed out"
+        ));
         assert!(looks_like_timeout("request timeout"));
         assert!(looks_like_timeout("deadline exceeded"));
         assert!(!looks_like_timeout("Segment request failed: HTTP 404"));
@@ -5065,9 +6262,21 @@ mod tests {
         // mid-download and for fast refusals.
         assert!(!should_retry_segment(0, 0, "operation timed out"));
         assert!(should_retry_segment(0, 1024, "operation timed out"));
-        assert!(should_retry_segment(0, 0, "Segment request failed: HTTP 500"));
-        assert!(should_retry_segment(1, 0, "Segment request failed: HTTP 500"));
-        assert!(!should_retry_segment(2, 0, "Segment request failed: HTTP 500"));
+        assert!(should_retry_segment(
+            0,
+            0,
+            "Segment request failed: HTTP 500"
+        ));
+        assert!(should_retry_segment(
+            1,
+            0,
+            "Segment request failed: HTTP 500"
+        ));
+        assert!(!should_retry_segment(
+            2,
+            0,
+            "Segment request failed: HTTP 500"
+        ));
         // Stall check: fresh is fine, expired fails plainly.
         assert!(check_stall(Instant::now(), Duration::from_secs(300)).is_ok());
         let old = Instant::now() - Duration::from_secs(301);
@@ -5185,10 +6394,7 @@ mod tests {
         .unwrap_err();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
-        assert!(
-            err.contains("after 3 tries"),
-            "error: {err}"
-        );
+        assert!(err.contains("after 3 tries"), "error: {err}");
         // Bind the guard once: locking twice in one assert deadlocks
         // (the first guard lives until the end of the statement).
         let hits = hits.lock().unwrap();
@@ -5214,9 +6420,9 @@ mod tests {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 let mut buf = [0u8; 8192];
                 let n = stream.read(&mut buf).unwrap_or(0);
-                seen.lock().unwrap().push(
-                    String::from_utf8_lossy(&buf[..n]).to_string(),
-                );
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).to_string());
                 let _ = stream.write_all(
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
@@ -5248,9 +6454,9 @@ mod tests {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 let mut buf = [0u8; 8192];
                 let n = stream.read(&mut buf).unwrap_or(0);
-                seen.lock().unwrap().push(
-                    String::from_utf8_lossy(&buf[..n]).to_string(),
-                );
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).to_string());
                 let _ = stream.write_all(
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
@@ -5312,8 +6518,7 @@ mod tests {
         // ask for identity encoding (segments are already
         // compressed; a compressed body only adds failure modes).
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let (port, server) =
-            serve_truncated_body(100, b"0123456789", seen.clone());
+        let (port, server) = serve_truncated_body(100, b"0123456789", seen.clone());
         let client = hls_client().unwrap();
         let err = fetch_bytes_range(
             &client,
@@ -5334,7 +6539,9 @@ mod tests {
         let reqs = seen.lock().unwrap();
         assert_eq!(reqs.len(), 1, "one request expected: {reqs:?}");
         assert!(
-            reqs[0].to_ascii_lowercase().contains("accept-encoding: identity"),
+            reqs[0]
+                .to_ascii_lowercase()
+                .contains("accept-encoding: identity"),
             "segment fetch must request identity encoding: {:?}",
             reqs[0]
         );
@@ -5360,7 +6567,12 @@ mod tests {
             substitute_template(t, "v720", Some(4000000), n, time)
         };
         assert_eq!(
-            sub("$RepresentationID$/$RepresentationID$_$Number$.m4v", Some(3), None).unwrap(),
+            sub(
+                "$RepresentationID$/$RepresentationID$_$Number$.m4v",
+                Some(3),
+                None
+            )
+            .unwrap(),
             "v720/v720_3.m4v"
         );
         assert_eq!(
@@ -5372,10 +6584,7 @@ mod tests {
             "seg_007.m4v"
         );
         assert_eq!(sub("100$$-off.m4v", None, None).unwrap(), "100$-off.m4v");
-        assert_eq!(
-            sub("$Bandwidth$.m4v", None, None).unwrap(),
-            "4000000.m4v"
-        );
+        assert_eq!(sub("$Bandwidth$.m4v", None, None).unwrap(), "4000000.m4v");
         assert!(sub("$Nope$.m4v", None, None).is_err());
         assert!(sub("$Number.m4v", Some(1), None).is_err());
         assert!(sub("$Number$.m4v", None, None).is_err());
@@ -5408,11 +6617,7 @@ mod tests {
         let m = parse_dash_manifest(BBB_MPD).unwrap();
         assert_eq!(m.duration_secs, Some(8.0));
         assert_eq!(m.representations.len(), 3);
-        let v720 = m
-            .representations
-            .iter()
-            .find(|r| r.id == "v720")
-            .unwrap();
+        let v720 = m.representations.iter().find(|r| r.id == "v720").unwrap();
         assert_eq!((v720.width, v720.height), (Some(1280), Some(720)));
         assert_eq!(v720.bandwidth, Some(4_000_000));
         // frameRate may be a ratio: 30000/1001 ≈ 29.97.
@@ -5429,14 +6634,14 @@ mod tests {
         let a = m.representations.iter().find(|r| r.id == "a64k").unwrap();
         assert!(a.is_audio());
         // Default: best video at or below 1080p (720p, not 360p).
-        assert_eq!(pick_default_representation(&m.representations).unwrap().id, "v720");
+        assert_eq!(
+            pick_default_representation(&m.representations).unwrap().id,
+            "v720"
+        );
         // Segments for 8 s at 4 s each: init + 2 media segments.
         let (init, segs) =
             dash_segments(v720, "https://example.com/bbb/bbb.mpd", m.duration_secs).unwrap();
-        assert_eq!(
-            init.unwrap().url,
-            "https://example.com/bbb/v720/v720_0.m4v"
-        );
+        assert_eq!(init.unwrap().url, "https://example.com/bbb/v720/v720_0.m4v");
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].url, "https://example.com/bbb/v720/v720_1.m4v");
         assert_eq!(segs[1].url, "https://example.com/bbb/v720/v720_2.m4v");
@@ -5511,10 +6716,13 @@ mod tests {
         let live = BBB_MPD.replace("type=\"static\"", "type=\"dynamic\"");
         assert!(parse_dash_manifest(&live).unwrap_err().contains("live"));
         let multi = BBB_MPD.replace("</Period>", "</Period><Period></Period>");
-        assert!(parse_dash_manifest(&multi).unwrap_err().contains("Multi-period"));
+        assert!(parse_dash_manifest(&multi)
+            .unwrap_err()
+            .contains("Multi-period"));
         let no_period = "<MPD type=\"static\" xmlns=\"urn:mpeg:dash:schema:mpd:2011\"></MPD>";
         assert!(parse_dash_manifest(no_period).is_err());
-        let no_reps = "<MPD type=\"static\" xmlns=\"urn:mpeg:dash:schema:mpd:2011\"><Period></Period></MPD>";
+        let no_reps =
+            "<MPD type=\"static\" xmlns=\"urn:mpeg:dash:schema:mpd:2011\"><Period></Period></MPD>";
         assert!(parse_dash_manifest(no_reps).is_err());
         // $Time$ without a timeline: the template still uses $Time$
         // but the timeline is commented out. Parsing succeeds;
@@ -5523,8 +6731,12 @@ mod tests {
             .replace("<SegmentTimeline>", "<!--")
             .replace("</SegmentTimeline>", "-->");
         let m = parse_dash_manifest(&no_timeline).unwrap();
-        let err = dash_segments(&m.representations[0], "https://example.com/x.mpd", m.duration_secs)
-            .unwrap_err();
+        let err = dash_segments(
+            &m.representations[0],
+            "https://example.com/x.mpd",
+            m.duration_secs,
+        )
+        .unwrap_err();
         assert!(err.contains("$Time$"), "error: {err}");
     }
 
@@ -5535,7 +6747,8 @@ mod tests {
         let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (port, server) = serve_map(files, hits, stop.clone());
-        let info = list_dash_formats(&format!("http://127.0.0.1:{port}/bbb.mpd"), &None, None).unwrap();
+        let info =
+            list_dash_formats(&format!("http://127.0.0.1:{port}/bbb.mpd"), &None, None).unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
         assert_eq!(info.kind, StreamKind::Dash);
@@ -5578,6 +6791,11 @@ mod tests {
             destination_dir: dir.clone(),
             filename: "clip.mp4".to_string(),
             referer: None,
+            audio_language: None,
+            subtitle_language: None,
+            proxy_url: None,
+            bandwidth_kbps: None,
+            title: None,
         };
         let out = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled, None).unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5609,6 +6827,11 @@ mod tests {
             destination_dir: dir.clone(),
             filename: "clip.mp4".to_string(),
             referer: None,
+            audio_language: None,
+            subtitle_language: None,
+            proxy_url: None,
+            bandwidth_kbps: None,
+            title: None,
         };
         let out = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled, None).unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5645,12 +6868,26 @@ mod tests {
         let vmp4 = dir.join("v.mp4");
         let am4a = dir.join("a.m4a");
         assert!(mk(&[
-            "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", vmp4.to_str().unwrap()
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            vmp4.to_str().unwrap()
         ]));
         assert!(mk(&[
-            "-y", "-f", "lavfi", "-i", "sine=frequency=440:d=1",
-            "-c:a", "aac", am4a.to_str().unwrap()
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:d=1",
+            "-c:a",
+            "aac",
+            am4a.to_str().unwrap()
         ]));
         let vbytes = std::fs::read(&vmp4).unwrap();
         let abytes = std::fs::read(&am4a).unwrap();
@@ -5685,6 +6922,11 @@ mod tests {
             destination_dir: dir.clone(),
             filename: "merged.mp4".to_string(),
             referer: None,
+            audio_language: None,
+            subtitle_language: None,
+            proxy_url: None,
+            bandwidth_kbps: None,
+            title: None,
         };
         let out =
             download_dash_with(Some(&ffmpeg), &opts, &|_| {}, &paused, &cancelled, None).unwrap();
@@ -5783,12 +7025,26 @@ mod tests {
         let vmp4 = dir.join("v.mp4");
         let am4a = dir.join("a.m4a");
         assert!(mk(&[
-            "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", vmp4.to_str().unwrap()
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            vmp4.to_str().unwrap()
         ]));
         assert!(mk(&[
-            "-y", "-f", "lavfi", "-i", "sine=frequency=440:d=1",
-            "-c:a", "aac", am4a.to_str().unwrap()
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:d=1",
+            "-c:a",
+            "aac",
+            am4a.to_str().unwrap()
         ]));
         let vbytes = std::fs::read(&vmp4).unwrap();
         let abytes = std::fs::read(&am4a).unwrap();
@@ -5832,11 +7088,15 @@ mod tests {
             destination_dir: dir.clone(),
             filename: "merged.mp4".to_string(),
             referer: None,
+            audio_language: None,
+            subtitle_language: None,
+            proxy_url: None,
+            bandwidth_kbps: None,
+            title: None,
         };
         // Run 1: video completes, audio fails on its last segment.
-        let err =
-            download_dash_with(Some(&ffmpeg), &opts, &|_| {}, &paused, &cancelled, None)
-                .unwrap_err();
+        let err = download_dash_with(Some(&ffmpeg), &opts, &|_| {}, &paused, &cancelled, None)
+            .unwrap_err();
         assert!(err.contains("Segment 3 of 3"), "error: {err}");
         let video_part = dir.join("merged.mp4.part");
         let video_seg_dir = dir.join("merged.mp4.part.seg");
@@ -5860,9 +7120,8 @@ mod tests {
         // Run 2 (resume): must fetch ONLY the missing audio
         // segment — no video piece, no already-downloaded audio
         // piece — then merge and clean up.
-        let out =
-            download_dash_with(Some(&ffmpeg), &opts, &|_| {}, &paused, &cancelled, None)
-                .expect("resume must complete from the saved pieces");
+        let out = download_dash_with(Some(&ffmpeg), &opts, &|_| {}, &paused, &cancelled, None)
+            .expect("resume must complete from the saved pieces");
         assert!(out.is_file());
         assert!(std::fs::metadata(&out).unwrap().len() > 0);
         let hits = hits.lock().unwrap().clone();
@@ -5906,6 +7165,11 @@ mod tests {
             destination_dir: dir.clone(),
             filename: "x.mp4".to_string(),
             referer: None,
+            audio_language: None,
+            subtitle_language: None,
+            proxy_url: None,
+            bandwidth_kbps: None,
+            title: None,
         };
         let err = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled, None).unwrap_err();
         assert!(err.contains("DRM"), "error: {err}");
@@ -6059,6 +7323,7 @@ mod tests {
         let dir_s = unique_temp_dir("seg-sequential");
         std::fs::create_dir_all(&dir_s).unwrap();
         let part_s = dir_s.join("movie.ts.part");
+        let no_limit = SharedLimiter::new(None);
         let n_s = download_segments_sequential(
             &client,
             &segments,
@@ -6070,6 +7335,7 @@ mod tests {
             &paused,
             &cancelled,
             DOWNLOAD_STALL_TIMEOUT,
+            &no_limit,
         )
         .unwrap();
         assert_eq!(n_s as usize, expected.len());
@@ -6193,6 +7459,7 @@ mod tests {
         let reports2: std::sync::Arc<Mutex<Vec<Progress>>> =
             std::sync::Arc::new(Mutex::new(Vec::new()));
         let reports2_c = reports2.clone();
+        let no_limit = SharedLimiter::new(None);
         download_segments_sequential(
             &client,
             &segments,
@@ -6204,6 +7471,7 @@ mod tests {
             &paused,
             &cancelled,
             DOWNLOAD_STALL_TIMEOUT,
+            &no_limit,
         )
         .unwrap();
         let reports2 = reports2.lock().unwrap();
@@ -6382,13 +7650,8 @@ mod tests {
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         // The first 4 requests (the parallel pass, 4 workers) stall
         // past the 300 ms client timeout; later requests serve.
-        let (port, server) = serve_stall_first_n(
-            files,
-            4,
-            Duration::from_secs(2),
-            hits.clone(),
-            stop.clone(),
-        );
+        let (port, server) =
+            serve_stall_first_n(files, 4, Duration::from_secs(2), hits.clone(), stop.clone());
         let segments: Vec<Segment> = (0..8)
             .map(|i| Segment {
                 url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
@@ -6513,8 +7776,16 @@ mod tests {
             &paused,
             &cancelled
         ));
-        assert!(!should_fallback_sequential("__PAUSED__", &paused, &cancelled));
-        assert!(!should_fallback_sequential("__CANCELLED__", &paused, &cancelled));
+        assert!(!should_fallback_sequential(
+            "__PAUSED__",
+            &paused,
+            &cancelled
+        ));
+        assert!(!should_fallback_sequential(
+            "__CANCELLED__",
+            &paused,
+            &cancelled
+        ));
         paused.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(!should_fallback_sequential(
             "Segment 2 of 1730 could not be downloaded after 1 try. (operation timed out)",
@@ -7280,10 +8551,7 @@ mod tests {
         // Bind the guard once: locking twice in one assert deadlocks
         // (the first guard lives until the end of the statement).
         let hits = hits.lock().unwrap();
-        assert!(
-            hits.is_empty(),
-            "resume re-fetched segments: {hits:?}"
-        );
+        assert!(hits.is_empty(), "resume re-fetched segments: {hits:?}");
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -7327,7 +8595,12 @@ mod tests {
             &None,
             1_000_000,
             0,
-            &move |p| reports_clone.lock().unwrap().push((p.downloaded, p.estimated_total)),
+            &move |p| {
+                reports_clone
+                    .lock()
+                    .unwrap()
+                    .push((p.downloaded, p.estimated_total))
+            },
             &paused,
             &cancelled,
             DOWNLOAD_STALL_TIMEOUT,
@@ -7404,5 +8677,215 @@ mod tests {
         );
         assert!(hits.iter().any(|h| h == "/var.m3u8"), "hits: {hits:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Round 11 extension: languages, subtitles, DASH lang ---
+
+    #[test]
+    fn parse_hls_master_keeps_all_audio_renditions_and_subtitles() {
+        // novahd carries 7 audio tracks in one group; the parser
+        // must keep every rendition (language + name + uri), not
+        // just the first, and must read SUBTITLES renditions too.
+        let text = "#EXTM3U\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",LANGUAGE=\"en\",NAME=\"English\",URI=\"en.m3u8\"\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",LANGUAGE=\"es\",NAME=\"Spanish\",URI=\"es.m3u8\"\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",LANGUAGE=\"fr\",NAME=\"French\",URI=\"fr.m3u8\"\n\
+            #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",LANGUAGE=\"en\",NAME=\"English\",URI=\"en.vtt.m3u8\"\n\
+            #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",LANGUAGE=\"de\",NAME=\"German\",URI=\"de.vtt.m3u8\"\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720,AUDIO=\"aac\",SUBTITLES=\"subs\"\n\
+            v.m3u8\n";
+        let m = parse_hls_master(text, "https://example.com/v/master.m3u8");
+        assert_eq!(m.audio.len(), 3);
+        assert_eq!(m.audio[1].language.as_deref(), Some("es"));
+        assert_eq!(m.audio[1].uri, "https://example.com/v/es.m3u8");
+        assert_eq!(m.subtitles.len(), 2);
+        assert_eq!(m.subtitles[1].language.as_deref(), Some("de"));
+        assert_eq!(m.variants[0].audio_group.as_deref(), Some("aac"));
+        assert_eq!(m.variants[0].subtitles_group.as_deref(), Some("subs"));
+        assert_eq!(
+            master_audio_languages(&m),
+            vec!["en".to_string(), "es".to_string(), "fr".to_string()]
+        );
+        assert_eq!(
+            master_subtitle_languages(&m),
+            vec!["en".to_string(), "de".to_string()]
+        );
+        // The picker matches by language, by name, and falls back
+        // to the first rendition for an unknown language.
+        assert_eq!(
+            pick_audio_rendition(&m.audio, "aac", Some("es"))
+                .unwrap()
+                .uri,
+            "https://example.com/v/es.m3u8"
+        );
+        assert_eq!(
+            pick_audio_rendition(&m.audio, "aac", Some("French"))
+                .unwrap()
+                .uri,
+            "https://example.com/v/fr.m3u8"
+        );
+        assert_eq!(
+            pick_audio_rendition(&m.audio, "aac", Some("xx"))
+                .unwrap()
+                .uri,
+            "https://example.com/v/en.m3u8"
+        );
+        assert_eq!(
+            pick_subtitle_rendition(&m.subtitles, Some("subs"), Some("de"))
+                .unwrap()
+                .uri,
+            "https://example.com/v/de.vtt.m3u8"
+        );
+        // A subtitle in the wrong language is worse than none.
+        assert!(pick_subtitle_rendition(&m.subtitles, Some("subs"), Some("xx")).is_none());
+        assert!(pick_subtitle_rendition(&m.subtitles, Some("subs"), None).is_none());
+    }
+
+    #[test]
+    fn merge_vtt_segments_shifts_cues_by_extinf_and_timestamp_map() {
+        // EXTINF offsets: segment 2's cues shift by segment 1's
+        // 10 s; cue settings and identifiers survive.
+        let segs = vec![
+            (
+                10.0,
+                "WEBVTT\n\n00:00:01.000 --> 00:00:03.000 line:90%\nHello\n".to_string(),
+            ),
+            (
+                10.0,
+                "WEBVTT\n\ncue-2\n00:00:02.500 --> 00:00:04.000\nWorld\n".to_string(),
+            ),
+        ];
+        let merged = merge_vtt_segments(&segs);
+        assert!(merged.starts_with("WEBVTT\n\n"), "merged: {merged}");
+        assert!(
+            merged.contains("00:00:01.000 --> 00:00:03.000 line:90%"),
+            "merged: {merged}"
+        );
+        assert!(merged.contains("cue-2"), "merged: {merged}");
+        assert!(
+            merged.contains("00:00:12.500 --> 00:00:14.000"),
+            "merged: {merged}"
+        );
+        // X-TIMESTAMP-MAP: the MPEG-TS clock anchors the cues
+        // absolutely (90000 ticks = 1 s), independent of EXTINF.
+        let mapped = vec![
+            (
+                10.0,
+                "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:02.000\nOne\n"
+                    .to_string(),
+            ),
+            (
+                10.0,
+                "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:1800000,LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:02.000\nTwo\n"
+                    .to_string(),
+            ),
+        ];
+        let merged = merge_vtt_segments(&mapped);
+        assert!(
+            merged.contains("00:00:01.000 --> 00:00:02.000\nOne"),
+            "merged: {merged}"
+        );
+        // Second segment's clock is 10 s ahead of the first's.
+        assert!(
+            merged.contains("00:00:11.000 --> 00:00:12.000\nTwo"),
+            "merged: {merged}"
+        );
+        // DASH start times: the offset is the segment start.
+        let dash = vec![
+            (
+                0.0,
+                "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nA\n".to_string(),
+            ),
+            (
+                6.0,
+                "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nB\n".to_string(),
+            ),
+        ];
+        let merged = merge_vtt_segments_with_start_times(&dash);
+        assert!(
+            merged.contains("00:00:07.000 --> 00:00:08.000\nB"),
+            "merged: {merged}"
+        );
+    }
+
+    #[test]
+    fn parse_hls_subtitle_playlist_reads_durations_and_urls() {
+        let text = "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:6.0,\nsub0.vtt\n#EXTINF:6.0,\nsub1.vtt\n#EXT-X-ENDLIST\n";
+        let segs = parse_hls_subtitle_playlist(text, "https://example.com/s/play.m3u8").unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].url, "https://example.com/s/sub0.vtt");
+        assert_eq!(segs[0].duration_secs, 6.0);
+        let enc = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:6,\nsub0.vtt\n";
+        assert!(parse_hls_subtitle_playlist(enc, "https://example.com/s/").is_err());
+    }
+
+    #[test]
+    fn parse_dash_manifest_reads_lang_and_vtt_text_reps() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT10S" xmlns="urn:mpeg:dash:schema:mpd:2011">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <Representation id="v1" bandwidth="1000000" width="1280" height="720">
+        <BaseURL>video/</BaseURL>
+        <SegmentTemplate media="$RepresentationID$/$Number$.m4s" initialization="$RepresentationID$/init.mp4" duration="2" timescale="1" startNumber="1"/>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio" lang="en">
+      <Representation id="a1" bandwidth="128000">
+        <BaseURL>audio-en/</BaseURL>
+        <SegmentTemplate media="$RepresentationID$/$Number$.m4s" initialization="$RepresentationID$/init.mp4" duration="2" timescale="1" startNumber="1"/>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio" lang="es">
+      <Representation id="a2" bandwidth="128000">
+        <BaseURL>audio-es/</BaseURL>
+        <SegmentTemplate media="$RepresentationID$/$Number$.m4s" initialization="$RepresentationID$/init.mp4" duration="2" timescale="1" startNumber="1"/>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="text/vtt" contentType="text" lang="en">
+      <Representation id="s1" bandwidth="1000">
+        <BaseURL>subs-en/</BaseURL>
+        <SegmentTemplate media="$RepresentationID$/$Number$.vtt" duration="2" timescale="1" startNumber="1"/>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="application/ttml+xml" contentType="text" lang="fr">
+      <Representation id="s2" bandwidth="1000">
+        <BaseURL>subs-fr/</BaseURL>
+        <SegmentTemplate media="$RepresentationID$/$Number$.ttml" duration="2" timescale="1" startNumber="1"/>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let m = parse_dash_manifest(mpd).unwrap();
+        assert_eq!(m.representations.len(), 5);
+        let a1 = m.representations.iter().find(|r| r.id == "a1").unwrap();
+        assert!(a1.is_audio());
+        assert_eq!(a1.lang.as_deref(), Some("en"));
+        let s1 = m.representations.iter().find(|r| r.id == "s1").unwrap();
+        assert!(s1.is_text());
+        assert!(s1.is_vtt());
+        assert!(!s1.is_video());
+        let s2 = m.representations.iter().find(|r| r.id == "s2").unwrap();
+        assert!(s2.is_text());
+        assert!(!s2.is_vtt(), "TTML is not WebVTT");
+        // Language-aware audio choice + subtitle choice.
+        let (_, audio) = choose_dash_representation(&m, Some("v1"), Some("es")).unwrap();
+        assert_eq!(audio.unwrap().id, "a2");
+        let (_, audio) = choose_dash_representation(&m, Some("v1"), None).unwrap();
+        assert!(audio.is_some(), "no language = best audio");
+        assert_eq!(choose_dash_subtitle(&m, Some("en")).unwrap().id, "s1");
+        assert!(
+            choose_dash_subtitle(&m, Some("fr")).is_none(),
+            "TTML never matches"
+        );
+        assert!(choose_dash_subtitle(&m, None).is_none());
+        // Timed segments for the subtitle rep: 5 segments at 2 s
+        // starts (10 s / 2 s), no init.
+        let (init, timed) =
+            dash_segments_with_times(s1, "https://example.com/m.mpd", m.duration_secs).unwrap();
+        assert!(init.is_none());
+        assert_eq!(timed.len(), 5);
+        assert_eq!(timed[2].1, 4.0);
+        assert_eq!(timed[2].0.url, "https://example.com/subs-en/s1/3.vtt");
     }
 }

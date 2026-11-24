@@ -43,8 +43,7 @@ pub fn url_path_extension(url: &str) -> Option<String> {
 
 /// True when the URL points at an image file by extension.
 pub fn is_image_url(url: &str) -> bool {
-    url_path_extension(url)
-        .is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext.as_str()))
+    url_path_extension(url).is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext.as_str()))
 }
 
 /// True when a probed `Content-Type` is an image type (`image/*`,
@@ -236,10 +235,7 @@ mod tests {
         );
         // Unknown content type: no guessing.
         assert_eq!(ensure_image_extension("photo", None), "photo");
-        assert_eq!(
-            ensure_image_extension("photo", Some("text/html")),
-            "photo"
-        );
+        assert_eq!(ensure_image_extension("photo", Some("text/html")), "photo");
     }
 
     #[test]

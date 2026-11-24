@@ -18,13 +18,17 @@
 //!   fetchforge-bridge print-token [--data-dir DIR]
 
 use fetchforge_engine::{
-    category_for_filename, download, download_dash, download_gltf_bundle, download_hls_audio_only,
-    download_hls_pair, download_hls_variant, download_media, ensure_ffmpeg, ensure_image_extension,
-    extract_audio, fetch_gltf_plan, find_ytdlp, generate_download_id, generate_secure_token,
-    is_gltf_url, is_image_content_type, list_formats_with_referer,
-    plan_media_download_or_drive_fallback, probe, sanitize_filename, stop_reason, unique_path,
+    category_for_filename, download, download_dash, download_gltf_bundle,
+    download_hls_audio_only_opts, download_hls_pair_opts, download_hls_variant_opts,
+    download_media, ensure_ffmpeg, ensure_image_extension, extract_audio_as,
+    fetch_gltf_plan_with_proxy, find_ytdlp, generate_download_id, generate_secure_token,
+    is_gltf_url, is_image_content_type, list_formats_with_referer_and_proxy,
+    list_playlist_with_proxy, next_lower_format,
+    plan_media_download_or_drive_fallback_with_options, probe, remove_partial_files,
+    sanitize_filename, sniff_stream_kind_with_proxy, stop_reason, unique_path, validate_proxy_url,
     CapturedManifest, DashDownloadOptions, DownloadOptions, DownloadRecord, GltfDownloadOptions,
-    MediaDownloadOptions, PlanOutcome, SizeKind, Status, Store, MAX_CAPTURED_MANIFEST_BYTES,
+    MediaDownloadOptions, PlanOutcome, SizeKind, Status, Store, StreamDownloadOptions,
+    MAX_CAPTURED_MANIFEST_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -45,6 +49,23 @@ struct Settings {
     max_retries: u32,
     bandwidth_kbps: Option<u64>,
     organise_by_category: bool,
+    /// User-configured proxy (round 11 extension, feature 10):
+    /// `http(s)://` or `socks5://`, optionally with credentials.
+    /// Validated at save time; NEVER logged anywhere.
+    #[serde(default)]
+    proxy_url: Option<String>,
+    /// Shut the computer down when all downloads finish (round
+    /// 11 extension, feature 7): explicit opt-in, default OFF.
+    #[serde(default)]
+    shutdown_when_finished: bool,
+    /// Desktop notifications on download completion (round 11
+    /// extension, feature 8): default ON.
+    #[serde(default = "default_true")]
+    notifications_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -56,6 +77,9 @@ impl Default for Settings {
             max_retries: 3,
             bandwidth_kbps: None,
             organise_by_category: true,
+            proxy_url: None,
+            shutdown_when_finished: false,
+            notifications_enabled: true,
         }
     }
 }
@@ -176,6 +200,36 @@ fn load_settings_with_warning(data_dir: &std::path::Path) -> (Settings, Option<S
             None => bad.push("organise_by_category"),
         },
     }
+    // proxy_url: null/empty = no proxy; a non-empty string must
+    // validate (http/https/socks5 + host), else it is ignored —
+    // a bad proxy must never break every download. The value is
+    // NEVER logged (it may contain credentials).
+    match obj.get("proxy_url") {
+        None => {}
+        Some(serde_json::Value::Null) => s.proxy_url = None,
+        Some(v) => match v.as_str() {
+            Some(p) if p.trim().is_empty() => s.proxy_url = None,
+            Some(p) => match fetchforge_engine::validate_proxy_url(p) {
+                Ok(clean) => s.proxy_url = Some(clean),
+                Err(_) => bad.push("proxy_url"),
+            },
+            None => bad.push("proxy_url"),
+        },
+    }
+    match obj.get("shutdown_when_finished") {
+        None => {}
+        Some(v) => match v.as_bool() {
+            Some(b) => s.shutdown_when_finished = b,
+            None => bad.push("shutdown_when_finished"),
+        },
+    }
+    match obj.get("notifications_enabled") {
+        None => {}
+        Some(v) => match v.as_bool() {
+            Some(b) => s.notifications_enabled = b,
+            None => bad.push("notifications_enabled"),
+        },
+    }
     let warning = if bad.is_empty() {
         None
     } else {
@@ -185,6 +239,22 @@ fn load_settings_with_warning(data_dir: &std::path::Path) -> (Settings, Option<S
         ))
     };
     (s, warning)
+}
+
+/// Persist settings (round 11 extension, feature 3/7/10):
+/// write to a temp file and atomically rename over
+/// settings.json, so a crash mid-save never leaves a corrupt
+/// settings file. The proxy value is written as-is (it lives
+/// in the user's own data dir, like the bridge token) and is
+/// never logged.
+fn save_settings(data_dir: &std::path::Path, settings: &Settings) -> Result<(), String> {
+    let path = data_dir.join("settings.json");
+    let tmp = data_dir.join("settings.json.tmp");
+    let text = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, &text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn load_or_create_token(data_dir: &std::path::Path) -> String {
@@ -228,7 +298,6 @@ struct PairedBrowser {
 }
 
 struct App {
-    settings: Settings,
     data_dir: PathBuf,
     token: Mutex<String>,
     pairing: Mutex<fetchforge_engine::pairing::PairingState>,
@@ -242,12 +311,21 @@ struct App {
     /// Browsers paired by code (POST /pair/verify). Persisted to
     /// paired.json; cleared by rotate_token ("Unpair all").
     paired: Mutex<Vec<PairedBrowser>>,
+    /// Shutdown-when-finished guard (round 11 extension, feature
+    /// 7): once the shutdown command has fired, it must never
+    /// fire again in this process — two workers finishing at the
+    /// same moment must not both run `shutdown`.
+    shutdown_triggered: AtomicBool,
 }
 
 impl App {
     fn new(data_dir: PathBuf) -> Arc<Self> {
         let _ = std::fs::create_dir_all(&data_dir);
-        let (settings, settings_warning) = load_settings_with_warning(&data_dir);
+        // The settings themselves are NOT kept in memory: every
+        // read goes to disk (see current_settings), so a POST
+        // /settings takes effect on the next download without a
+        // restart. Only the load warning is needed here.
+        let (_settings, settings_warning) = load_settings_with_warning(&data_dir);
         if let Some(w) = &settings_warning {
             eprintln!("FetchForge WARNING: {w}");
         }
@@ -286,7 +364,6 @@ impl App {
             Err(_) => Vec::new(),
         };
         Arc::new(Self {
-            settings,
             data_dir,
             token: Mutex::new(token),
             pairing: Mutex::new(fetchforge_engine::pairing::PairingState::new()),
@@ -295,7 +372,104 @@ impl App {
             active: Mutex::new(0),
             detected: Mutex::new(detected),
             paired: Mutex::new(paired),
+            shutdown_triggered: AtomicBool::new(false),
         })
+    }
+
+    /// Current settings, loaded fresh from settings.json (round
+    /// 11 extension): the file on disk is the single source of
+    /// truth, so a POST /settings takes effect on the next
+    /// download without restarting the bridge. Each worker loads
+    /// once at its start — a settings change mid-download
+    /// applies to the NEXT download, never to a running one.
+    fn current_settings(&self) -> Settings {
+        load_settings_with_warning(&self.data_dir).0
+    }
+
+    /// Update settings from a POST /settings body (round 11
+    /// extension, features 3/7/10): merge the known fields the
+    /// body carries into the current settings, validate, and
+    /// persist. Unknown fields are ignored; a wrongly-typed or
+    /// invalid field fails the whole save with the field NAME
+    /// only — the proxy value is never echoed back (it may
+    /// contain credentials). Numeric fields are clamped to sane
+    /// ranges instead of failing: a UI slider cannot wedge the
+    /// queue gate with max_simultaneous 0.
+    fn update_settings(&self, body: &serde_json::Value) -> Result<Settings, String> {
+        let obj = body
+            .as_object()
+            .ok_or_else(|| "Settings must be a JSON object".to_string())?;
+        let mut s = self.current_settings();
+        if let Some(v) = obj.get("download_dir") {
+            match v.as_str() {
+                Some(d) if !d.trim().is_empty() => s.download_dir = d.trim().to_string(),
+                _ => return Err("download_dir must be a non-empty string".to_string()),
+            }
+        }
+        if let Some(v) = obj.get("max_simultaneous") {
+            match v.as_u64() {
+                Some(n) => s.max_simultaneous = (n as usize).clamp(1, 10),
+                None => return Err("max_simultaneous must be a number".to_string()),
+            }
+        }
+        if let Some(v) = obj.get("max_segments") {
+            match v.as_u64() {
+                Some(n) => s.max_segments = (n as usize).clamp(1, 16),
+                None => return Err("max_segments must be a number".to_string()),
+            }
+        }
+        if let Some(v) = obj.get("max_retries") {
+            match v.as_u64() {
+                Some(n) => s.max_retries = (n as u32).min(10),
+                None => return Err("max_retries must be a number".to_string()),
+            }
+        }
+        if let Some(v) = obj.get("bandwidth_kbps") {
+            match v {
+                serde_json::Value::Null => s.bandwidth_kbps = None,
+                _ => match v.as_u64() {
+                    Some(0) => s.bandwidth_kbps = None,
+                    Some(n) => s.bandwidth_kbps = Some(n),
+                    None => return Err("bandwidth_kbps must be a number or null".to_string()),
+                },
+            }
+        }
+        if let Some(v) = obj.get("organise_by_category") {
+            match v.as_bool() {
+                Some(b) => s.organise_by_category = b,
+                None => return Err("organise_by_category must be true or false".to_string()),
+            }
+        }
+        if let Some(v) = obj.get("proxy_url") {
+            match v {
+                serde_json::Value::Null => s.proxy_url = None,
+                _ => match v.as_str() {
+                    Some(p) if p.trim().is_empty() => s.proxy_url = None,
+                    Some(p) => match validate_proxy_url(p) {
+                        Ok(clean) => s.proxy_url = Some(clean),
+                        Err(_) => return Err(
+                            "proxy_url must be an http://, https:// or socks5:// URL with a host"
+                                .to_string(),
+                        ),
+                    },
+                    None => return Err("proxy_url must be a string or null".to_string()),
+                },
+            }
+        }
+        if let Some(v) = obj.get("shutdown_when_finished") {
+            match v.as_bool() {
+                Some(b) => s.shutdown_when_finished = b,
+                None => return Err("shutdown_when_finished must be true or false".to_string()),
+            }
+        }
+        if let Some(v) = obj.get("notifications_enabled") {
+            match v.as_bool() {
+                Some(b) => s.notifications_enabled = b,
+                None => return Err("notifications_enabled must be true or false".to_string()),
+            }
+        }
+        save_settings(&self.data_dir, &s)?;
+        Ok(s)
     }
 
     /// Record a pairing (round 10, item 15): dedupe by instance id
@@ -465,7 +639,12 @@ impl App {
         audio_url: Option<String>,
         manifest_text: Option<String>,
         audio_only: bool,
+        audio_lang: Option<String>,
+        subtitle_langs: Vec<String>,
+        audio_format: Option<String>,
+        playlist: Option<(String, u32)>,
     ) -> Result<DownloadRecord, String> {
+        let settings = self.current_settings();
         let clean_url = fetchforge_engine::validate_url(url)?;
         // HLS (.m3u8) / DASH (.mpd) manifests go straight to the
         // media path (manifest parsing + segment assembly in
@@ -480,6 +659,10 @@ impl App {
                 audio_url,
                 manifest_text,
                 audio_only,
+                audio_lang,
+                subtitle_langs,
+                audio_format,
+                playlist,
             );
         }
         // glTF models (.gltf) carry dependencies (buffers, textures)
@@ -499,6 +682,7 @@ impl App {
         let probe_opts = DownloadOptions {
             url: clean_url.clone(),
             referer: referer.clone(),
+            proxy_url: settings.proxy_url.clone(),
             ..Default::default()
         };
         let probe_result = probe(&probe_opts);
@@ -508,13 +692,11 @@ impl App {
         // through media extraction instead, and the user picks a quality
         // (or the extension path takes the recorded default). Direct file
         // links behave exactly as before.
-        let is_page = probe_result
-            .as_ref()
-            .is_ok_and(|p| {
-                p.content_type
-                    .as_deref()
-                    .is_some_and(|ct| ct.starts_with("text/html"))
-            });
+        let is_page = probe_result.as_ref().is_ok_and(|p| {
+            p.content_type
+                .as_deref()
+                .is_some_and(|ct| ct.starts_with("text/html"))
+        });
         if is_page {
             return self.add_media_download(
                 &clean_url,
@@ -524,6 +706,10 @@ impl App {
                 audio_url,
                 manifest_text,
                 audio_only,
+                audio_lang,
+                subtitle_langs,
+                audio_format,
+                playlist,
             );
         }
         match probe_result {
@@ -542,6 +728,10 @@ impl App {
                         audio_url,
                         manifest_text,
                         audio_only,
+                        audio_lang,
+                        subtitle_langs,
+                        audio_format,
+                        playlist,
                     );
                 }
                 // Round 10, item 4: some playlist endpoints serve a
@@ -551,7 +741,9 @@ impl App {
                 // playlist text re-routes to the media path instead
                 // of being saved as a junk file. A failed sniff
                 // fails open (the normal path below).
-                if fetchforge_engine::sniff_stream_kind(&clean_url, &referer).is_some() {
+                if sniff_stream_kind_with_proxy(&clean_url, &referer, settings.proxy_url.as_deref())
+                    .is_some()
+                {
                     return self.add_media_download(
                         &clean_url,
                         filename,
@@ -560,6 +752,10 @@ impl App {
                         audio_url,
                         manifest_text,
                         audio_only,
+                        audio_lang,
+                        subtitle_langs,
+                        audio_format,
+                        playlist,
                     );
                 }
                 let (mut filename, total, resumable) = (
@@ -577,13 +773,18 @@ impl App {
                 // an image instead of landing in "Other" with no
                 // extension. A name that already has an extension is
                 // never rewritten.
-                if p.content_type
-                    .as_deref()
-                    .is_some_and(is_image_content_type)
-                {
+                if p.content_type.as_deref().is_some_and(is_image_content_type) {
                     filename = ensure_image_extension(&filename, p.content_type.as_deref());
                 }
-                self.add_direct_record(&clean_url, filename, total, resumable, referer, audio_only)
+                self.add_direct_record(
+                    &clean_url,
+                    filename,
+                    total,
+                    resumable,
+                    referer,
+                    audio_only,
+                    audio_format,
+                )
             }
             Err(mut e) => {
                 // Probe failed. Some video pages refuse HEAD/GET probes
@@ -608,6 +809,10 @@ impl App {
                         audio_url.clone(),
                         manifest_text,
                         audio_only,
+                        audio_lang.clone(),
+                        subtitle_langs.clone(),
+                        audio_format.clone(),
+                        playlist.clone(),
                     ) {
                         Ok(rec) => return Ok(rec),
                         Err(extract_err) => e = extract_err,
@@ -615,11 +820,15 @@ impl App {
                 }
                 // Still record the failure so the user sees it, with the reason.
                 let id = generate_download_id();
+                let (playlist_title, playlist_index) = match playlist {
+                    Some((title, index)) => (Some(title), Some(index)),
+                    None => (None, None),
+                };
                 let rec = DownloadRecord {
                     id: id.clone(),
                     url: clean_url.clone(),
                     filename: filename.unwrap_or_else(|| "download".to_string()),
-                    destination: self.settings.download_dir.clone(),
+                    destination: settings.download_dir.clone(),
                     category: "Other".to_string(),
                     status: Status::Failed,
                     total_bytes: None,
@@ -646,6 +855,14 @@ impl App {
                     quality_note: None,
                     speed_bps: None,
                     size_kind: None,
+                    audio_lang,
+                    subtitle_langs,
+                    audio_format,
+                    format_kind: None,
+                    playlist: playlist_title,
+                    playlist_index,
+                    downgraded_from: None,
+                    downgrade_attempted: false,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -669,7 +886,12 @@ impl App {
         audio_url: Option<String>,
         manifest_text: Option<String>,
         audio_only: bool,
+        audio_lang: Option<String>,
+        subtitle_langs: Vec<String>,
+        audio_format: Option<String>,
+        playlist: Option<(String, u32)>,
     ) -> Result<DownloadRecord, String> {
+        let settings = self.current_settings();
         match self.try_media_download(
             clean_url,
             filename.clone(),
@@ -678,6 +900,10 @@ impl App {
             audio_url,
             manifest_text,
             audio_only,
+            audio_lang.clone(),
+            subtitle_langs.clone(),
+            audio_format.clone(),
+            playlist.clone(),
         ) {
             Ok(rec) => Ok(rec),
             Err(e) => {
@@ -687,11 +913,15 @@ impl App {
                 // lives in the worker's planning step
                 // (plan_media_download_or_drive_fallback).
                 let id = generate_download_id();
+                let (playlist_title, playlist_index) = match playlist {
+                    Some((title, index)) => (Some(title), Some(index)),
+                    None => (None, None),
+                };
                 let rec = DownloadRecord {
                     id: id.clone(),
                     url: clean_url.to_string(),
                     filename: filename.unwrap_or_else(|| "download".to_string()),
-                    destination: self.settings.download_dir.clone(),
+                    destination: settings.download_dir.clone(),
                     category: "Other".to_string(),
                     status: Status::Failed,
                     total_bytes: None,
@@ -718,6 +948,14 @@ impl App {
                     quality_note: None,
                     speed_bps: None,
                     size_kind: None,
+                    audio_lang,
+                    subtitle_langs,
+                    audio_format,
+                    format_kind: None,
+                    playlist: playlist_title,
+                    playlist_index,
+                    downgraded_from: None,
+                    downgrade_attempted: false,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -737,7 +975,8 @@ impl App {
         clean_url: &str,
         filename: Option<String>,
     ) -> Result<DownloadRecord, String> {
-        match fetch_gltf_plan(clean_url) {
+        let settings = self.current_settings();
+        match fetch_gltf_plan_with_proxy(clean_url, settings.proxy_url.as_deref()) {
             Ok(plan) => {
                 let record_filename = filename
                     .as_deref()
@@ -756,7 +995,7 @@ impl App {
                     if let Some(mut existing) = store.find_duplicate(
                         clean_url,
                         &record_filename,
-                        &self.settings.download_dir,
+                        &settings.download_dir,
                         false,
                     ) {
                         // The caller must know nothing new was
@@ -772,7 +1011,7 @@ impl App {
                         id: id.clone(),
                         url: clean_url.to_string(),
                         filename: record_filename,
-                        destination: self.settings.download_dir.clone(),
+                        destination: settings.download_dir.clone(),
                         category: "3D".to_string(),
                         status: Status::Queued,
                         total_bytes: plan.total_bytes,
@@ -802,6 +1041,14 @@ impl App {
                         quality_note: None,
                         speed_bps: None,
                         size_kind: None,
+                        audio_lang: None,
+                        subtitle_langs: Vec::new(),
+                        audio_format: None,
+                        format_kind: None,
+                        playlist: None,
+                        playlist_index: None,
+                        downgraded_from: None,
+                        downgrade_attempted: false,
                     };
                     store.upsert(rec.clone());
                     let _ = store.save();
@@ -816,7 +1063,7 @@ impl App {
                     id: id.clone(),
                     url: clean_url.to_string(),
                     filename: filename.unwrap_or_else(|| "download".to_string()),
-                    destination: self.settings.download_dir.clone(),
+                    destination: settings.download_dir.clone(),
                     category: "Other".to_string(),
                     status: Status::Failed,
                     total_bytes: None,
@@ -843,6 +1090,14 @@ impl App {
                     quality_note: None,
                     speed_bps: None,
                     size_kind: None,
+                    audio_lang: None,
+                    subtitle_langs: Vec::new(),
+                    audio_format: None,
+                    format_kind: None,
+                    playlist: None,
+                    playlist_index: None,
+                    downgraded_from: None,
+                    downgrade_attempted: false,
                 };
                 self.store.lock().unwrap().upsert(rec.clone());
                 let _ = self.store.lock().unwrap().save();
@@ -875,7 +1130,12 @@ impl App {
         audio_url: Option<String>,
         manifest_text: Option<String>,
         audio_only: bool,
+        audio_lang: Option<String>,
+        subtitle_langs: Vec<String>,
+        audio_format: Option<String>,
+        playlist: Option<(String, u32)>,
     ) -> Result<DownloadRecord, String> {
+        let settings = self.current_settings();
         let provisional = filename
             .as_deref()
             .map(sanitize_filename)
@@ -888,8 +1148,9 @@ impl App {
         // checked twice: once under the video filename (a queued
         // audio request still carries it) and once under the audio
         // filename (a completed audio download's record was renamed
-        // to .m4a by the post-step) — a completed VIDEO never
-        // matches either, because the flag differs.
+        // to the chosen audio format by the post-step) — a
+        // completed VIDEO never matches either, because the flag
+        // differs.
         {
             let mut store = self.store.lock().unwrap();
             // Fresh disk state before the duplicate check (see
@@ -901,18 +1162,14 @@ impl App {
                     .rsplit_once('.')
                     .map(|(s, _)| s)
                     .unwrap_or(&provisional);
-                format!("{stem}.m4a")
+                let ext = audio_format.as_deref().unwrap_or("m4a");
+                format!("{stem}.{ext}")
             });
             let existing = store
-                .find_duplicate(
-                    clean_url,
-                    &provisional,
-                    &self.settings.download_dir,
-                    audio_only,
-                )
+                .find_duplicate(clean_url, &provisional, &settings.download_dir, audio_only)
                 .or_else(|| {
                     audio_filename.as_ref().and_then(|f| {
-                        store.find_duplicate(clean_url, f, &self.settings.download_dir, audio_only)
+                        store.find_duplicate(clean_url, f, &settings.download_dir, audio_only)
                     })
                 });
             if let Some(mut existing) = existing {
@@ -925,11 +1182,15 @@ impl App {
                 return Ok(existing);
             }
             let id = generate_download_id();
+            let (playlist_title, playlist_index) = match playlist {
+                Some((title, index)) => (Some(title), Some(index)),
+                None => (None, None),
+            };
             let rec = DownloadRecord {
                 id: id.clone(),
                 url: clean_url.to_string(),
                 filename: provisional,
-                destination: self.settings.download_dir.clone(),
+                destination: settings.download_dir.clone(),
                 category: "Other".to_string(),
                 status: Status::Queued,
                 total_bytes: None,
@@ -958,6 +1219,14 @@ impl App {
                 quality_note: None,
                 speed_bps: None,
                 size_kind: None,
+                audio_lang,
+                subtitle_langs,
+                audio_format,
+                format_kind: None,
+                playlist: playlist_title,
+                playlist_index,
+                downgraded_from: None,
+                downgrade_attempted: false,
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -991,6 +1260,7 @@ impl App {
         rec: &DownloadRecord,
         job: &Job,
     ) -> Result<Option<DownloadRecord>, String> {
+        let settings = self.current_settings();
         let id = rec.id.clone();
         // The provisional filename ("download") means no name was
         // requested: let the plan derive it from the title. Any
@@ -1006,13 +1276,15 @@ impl App {
         // the capture — a single-use signed link consumed here
         // would fail again at run time.
         let captured = read_manifest_sidecar(&self.data_dir, &id, &rec.url);
-        let outcome = plan_media_download_or_drive_fallback(
+        let outcome = plan_media_download_or_drive_fallback_with_options(
             &self.data_dir,
             &rec.url,
             rec.format_id.as_deref(),
             filename_arg,
             &rec.referer,
             captured.as_ref(),
+            rec.audio_lang.as_deref(),
+            settings.proxy_url.as_deref(),
         );
         if job.cancelled.load(Ordering::Relaxed) {
             self.set_status(&id, Status::Cancelled, None);
@@ -1040,6 +1312,23 @@ impl App {
                 } else {
                     None
                 };
+                // Subtitles on a muxed HLS variant (round 11
+                // extension, feature 2): the variant downloads as
+                // one .ts file, so the subtitle track can only
+                // join it through an ffmpeg merge — mark the plan
+                // for a merge so the worker resolves ffmpeg
+                // upfront. The engine re-containerises to .mp4 at
+                // merge time and the completion step reconciles
+                // the record's filename; the plan keeps the .ts
+                // name until then, because the subtitle may not
+                // exist in the master at all (in which case the
+                // download is a plain .ts, exactly as before).
+                if !rec.subtitle_langs.is_empty()
+                    && plan.stream_kind == Some(fetchforge_engine::StreamKind::Hls)
+                    && !plan.needs_merge
+                {
+                    plan.needs_merge = true;
+                }
                 // The HTML fallback may have resolved the page to
                 // an embedded stream/file URL: the record and the
                 // worker both use the resolved URL, not the page
@@ -1062,7 +1351,7 @@ impl App {
                     .find_duplicate_except(
                         &record_url,
                         &plan.filename,
-                        &self.settings.download_dir,
+                        &settings.download_dir,
                         &id,
                         rec.audio_only,
                     )
@@ -1092,6 +1381,11 @@ impl App {
                 updated.needs_merge = plan.needs_merge;
                 updated.format_selector = Some(plan.selector);
                 updated.stream_kind = plan.stream_kind.map(|k| k.as_str().to_string());
+                // Round 11 extension, feature 13: what kind of
+                // format was planned — the worker passes
+                // --extract-audio --audio-format to yt-dlp only
+                // when the chosen format is audio-only.
+                updated.format_kind = plan.format_kind;
                 // Round 10, item 8: the picked quality as the site
                 // declared it — the completion probe compares the
                 // delivered file against these.
@@ -1154,7 +1448,9 @@ impl App {
         resumable: bool,
         referer: Option<String>,
         audio_only: bool,
+        audio_format: Option<String>,
     ) -> Result<DownloadRecord, String> {
+        let settings = self.current_settings();
         // Idempotent add (safe to run twice): if the same URL +
         // filename is already Queued, Downloading, or Completed,
         // return that record instead of starting a second download
@@ -1180,18 +1476,14 @@ impl App {
                     .rsplit_once('.')
                     .map(|(s, _)| s)
                     .unwrap_or(&filename);
-                format!("{stem}.m4a")
+                let ext = audio_format.as_deref().unwrap_or("m4a");
+                format!("{stem}.{ext}")
             });
             let existing = store
-                .find_duplicate(
-                    clean_url,
-                    &filename,
-                    &self.settings.download_dir,
-                    audio_only,
-                )
+                .find_duplicate(clean_url, &filename, &settings.download_dir, audio_only)
                 .or_else(|| {
                     audio_filename.as_ref().and_then(|f| {
-                        store.find_duplicate(clean_url, f, &self.settings.download_dir, audio_only)
+                        store.find_duplicate(clean_url, f, &settings.download_dir, audio_only)
                     })
                 });
             if let Some(mut existing) = existing {
@@ -1208,7 +1500,7 @@ impl App {
                 id: id.clone(),
                 url: clean_url.to_string(),
                 filename: filename.clone(),
-                destination: self.settings.download_dir.clone(),
+                destination: settings.download_dir.clone(),
                 category: category_for_filename(&filename).to_string(),
                 status: Status::Queued,
                 total_bytes: total,
@@ -1237,6 +1529,14 @@ impl App {
                 // Round 11, item 10: a probed Content-Length is
                 // the exact total.
                 size_kind: total.map(|_| SizeKind::Exact),
+                audio_lang: None,
+                subtitle_langs: Vec::new(),
+                audio_format,
+                format_kind: None,
+                playlist: None,
+                playlist_index: None,
+                downgraded_from: None,
+                downgrade_attempted: false,
             };
             store.upsert(rec.clone());
             let _ = store.save();
@@ -1244,6 +1544,52 @@ impl App {
             self.spawn_worker(id);
             Ok(rec)
         }
+    }
+
+    /// Playlist download (round 11 extension, feature 11): list
+    /// a playlist with yt-dlp and queue every entry as its own
+    /// record, tagged with the playlist title + its index, so
+    /// the list shows where each item came from. Entries that
+    /// fail to queue (a dead entry URL) are reported, never
+    /// fatal to the rest. Returns (playlist title, queued
+    /// records, per-entry errors, truncated?). The language,
+    /// subtitle and audio-format choices apply to every entry;
+    /// each entry plans at its own default quality (a yt-dlp
+    /// format id belongs to one video, so no single format can
+    /// be forced across a playlist).
+    fn add_playlist(
+        self: &Arc<Self>,
+        url: &str,
+        audio_lang: Option<String>,
+        subtitle_langs: Vec<String>,
+        audio_format: Option<String>,
+    ) -> Result<(String, Vec<DownloadRecord>, Vec<String>, bool), String> {
+        let settings = self.current_settings();
+        let info = list_playlist_with_proxy(&self.data_dir, url, settings.proxy_url.as_deref())?;
+        let title = info.title.clone();
+        let total = info.entries.len();
+        let truncated = total > MAX_PLAYLIST_ENTRIES;
+        let mut added = Vec::new();
+        let mut errors = Vec::new();
+        for entry in info.entries.into_iter().take(MAX_PLAYLIST_ENTRIES) {
+            match self.add_download(
+                &entry.url,
+                Some(entry.title.clone()),
+                None,
+                None,
+                None,
+                None,
+                false,
+                audio_lang.clone(),
+                subtitle_langs.clone(),
+                audio_format.clone(),
+                Some((title.clone(), entry.index)),
+            ) {
+                Ok(rec) => added.push(rec),
+                Err(e) => errors.push(format!("{}: {e}", entry.title)),
+            }
+        }
+        Ok((title, added, errors, truncated))
     }
 
     /// Remove a job from the map when its worker ends — but only
@@ -1271,7 +1617,7 @@ impl App {
             {
                 let mut active = app.active.lock().unwrap();
                 // Simple queue gate: if at capacity, wait (poll) until a slot frees.
-                while *active >= app.settings.max_simultaneous.max(1) {
+                while *active >= app.current_settings().max_simultaneous.max(1) {
                     drop(active);
                     std::thread::sleep(std::time::Duration::from_millis(250));
                     if job.cancelled.load(Ordering::Relaxed) {
@@ -1298,8 +1644,204 @@ impl App {
             // stale entry must not keep the record "protected"
             // from disk forever.
             app.remove_job_if_current(&id, &job);
+            // Round 11 extension, feature 7: shutdown when
+            // finished — only ever after a COMPLETED download
+            // (the helper checks the record's status), and only
+            // when nothing else remains.
+            if result.is_ok() {
+                app.maybe_shutdown_after_completion(&id);
+            }
             let _ = result;
         });
+    }
+
+    /// Auto-start queued downloads (round 11 extension, feature
+    /// 1): spawn a worker for every Queued record, oldest first.
+    /// Called once, by the process that becomes the server, right
+    /// after `recover_interrupted` — so downloads queued before
+    /// a restart start on their own instead of sitting until the
+    /// user resumes each by hand. Paused records stay paused
+    /// (the user paused them on purpose). The queue gate in
+    /// `spawn_worker` caps the running workers at
+    /// max_simultaneous; the rest wait for a slot. Mid-run
+    /// auto-start already works through that same gate: a worker
+    /// that ends frees a slot for the next waiting worker.
+    /// NOTE: only the bridge auto-starts. The desktop app must
+    /// NOT duplicate this — two workers on one record would
+    /// derive the same .part path and corrupt each other.
+    fn auto_start_queued(self: &Arc<Self>) {
+        let mut queued: Vec<DownloadRecord> = {
+            let store = self.store.lock().unwrap();
+            store
+                .all()
+                .into_iter()
+                .filter(|r| r.status == Status::Queued)
+                .cloned()
+                .collect()
+        };
+        queued.sort_by_key(|r| r.created_unix);
+        for rec in queued {
+            self.spawn_worker(rec.id);
+        }
+    }
+
+    /// Retry at the next lower quality after a failure (round 11
+    /// extension, feature 9). Returns true when a downgrade was
+    /// queued: the record is reset to "pending" with the lower
+    /// format id and a fresh worker is spawned to re-plan and
+    /// download it. Returns false when no downgrade is possible
+    /// — the caller then fails the record normally with the
+    /// original error.
+    ///
+    /// Rules: one downgrade only (`downgrade_attempted`); only
+    /// for a download that had a picked quality (no ladder to
+    /// step down otherwise); never for direct or gltf downloads
+    /// (no quality ladder); never on pause/cancel (the caller
+    /// checks `stop_reason` first); never on a planning failure
+    /// (the plan step does not call this). For yt-dlp downloads
+    /// the old .part files are deleted first, or yt-dlp would
+    /// resume the HIGHER quality's fragments under the same
+    /// filename. A failed re-listing (e.g. a signed manifest
+    /// link that only worked once) means no downgrade.
+    fn try_downgrade(self: &Arc<Self>, rec: &DownloadRecord) -> bool {
+        let Some(current) = self.store.lock().unwrap().get(&rec.id).cloned() else {
+            return false;
+        };
+        if current.downgrade_attempted || current.format_id.is_none() {
+            return false;
+        }
+        let Some(height) = current.picked_height else {
+            return false;
+        };
+        // gltf bundles have no quality ladder.
+        if current.stream_kind.as_deref() == Some("gltf") {
+            return false;
+        }
+        let settings = self.current_settings();
+        // Re-list the formats fresh: the ladder may have changed
+        // since the plan (a live manifest rotates variants). The
+        // one listing call covers all three paths — manifest
+        // URLs are listed through the stream path and converted
+        // to MediaFormat entries (variant URL / rep id as the
+        // format id), page URLs through yt-dlp.
+        let info = match list_formats_with_referer_and_proxy(
+            &self.data_dir,
+            &current.url,
+            current.referer.clone(),
+            settings.proxy_url.as_deref(),
+        ) {
+            Ok(i) => i,
+            Err(_) => return false,
+        };
+        let Some(lower) = next_lower_format(&info.formats, height) else {
+            return false;
+        };
+        // yt-dlp path only (no stream kind): delete the old
+        // quality's .part files, or the retry resumes them.
+        // Stream downloads write their segments under a sidecar
+        // keyed by the variant URL, so a new variant starts
+        // fresh on its own.
+        if current.stream_kind.is_none() {
+            let mut dir = PathBuf::from(&settings.download_dir);
+            if settings.organise_by_category {
+                dir = dir.join(category_for_filename(&current.filename));
+            }
+            let (stem, ext) = match current.filename.rsplit_once('.') {
+                Some((s, e)) => (s, e),
+                None => (current.filename.as_str(), ""),
+            };
+            remove_partial_files(&dir, stem, ext);
+        }
+        let old_label = format!("{height}p");
+        let new_format_id = lower.format_id.clone();
+        let new_label = lower.label.clone();
+        {
+            let mut store = self.store.lock().unwrap();
+            if let Some(mut r) = store.get(&current.id).cloned() {
+                r.reset_for_downgrade(new_format_id, old_label);
+                store.upsert(r);
+                let _ = store.save();
+            } else {
+                return false;
+            }
+        }
+        eprintln!(
+            "FetchForge: download {} failed at {height}p; retrying at lower quality ({new_label})",
+            current.id
+        );
+        self.spawn_worker(current.id.clone());
+        true
+    }
+
+    /// Shut the computer down when all downloads are finished
+    /// (round 11 extension, feature 7). Called after a worker
+    /// ends. Fires ONLY when ALL of these hold: the setting is
+    /// on; the just-ended download COMPLETED (a pause or cancel
+    /// never triggers it); no Queued, Downloading or Paused
+    /// record remains (fresh disk state — the desktop app may
+    /// have queued work this process has not seen); no other
+    /// worker is running in this process; and the shutdown has
+    /// not already fired in this process. Windows runs
+    /// `shutdown /s /t 60` (a 60-second abort window — the user
+    /// can run `shutdown /a` to stop it); anywhere else logs a
+    /// warning, since the deployment is Windows-only.
+    fn maybe_shutdown_after_completion(&self, id: &str) {
+        if self.shutdown_triggered.load(Ordering::Relaxed) {
+            return;
+        }
+        if !self.current_settings().shutdown_when_finished {
+            return;
+        }
+        // The just-ended download must have COMPLETED: a worker
+        // also returns Ok(()) for a pause or a cancel, and
+        // neither may shut the machine down.
+        let completed = {
+            let store = self.store.lock().unwrap();
+            store.get(id).is_some_and(|r| r.status == Status::Completed)
+        };
+        if !completed {
+            return;
+        }
+        // Fresh disk state: the other process may have queued
+        // work since this process last loaded.
+        let remaining = {
+            let mut store = self.store.lock().unwrap();
+            store.reload_from_disk(&self.active_job_ids());
+            store.all().iter().any(|r| {
+                matches!(
+                    r.status,
+                    Status::Queued | Status::Downloading | Status::Paused
+                )
+            })
+        };
+        if remaining {
+            return;
+        }
+        if *self.active.lock().unwrap() > 0 {
+            return;
+        }
+        // Claim the one-shot guard BEFORE running the command, so
+        // two workers finishing together cannot both fire it.
+        if self
+            .shutdown_triggered
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            eprintln!(
+                "FetchForge: all downloads finished; shutting down in 60 seconds (shutdown /s /t 60)."
+            );
+            let _ = std::process::Command::new("shutdown")
+                .args(["/s", "/t", "60"])
+                .spawn();
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("FetchForge WARNING: shutdown_when_finished is on and all downloads finished, but shutdown is only implemented on Windows; not shutting down.");
+        }
     }
 
     /// Best-effort delivered-quality probe (round 10, item 8):
@@ -1323,36 +1865,37 @@ impl App {
     }
 
     /// "Audio only" post-step (extension popup, round 8): turn a
-    /// downloaded video file into its audio track. Returns the path
-    /// the record should point at. A file that is already audio-only
-    /// (a DASH audio representation, an HLS audio playlist the
-    /// engine named `.m4a`) passes through unchanged — no ffmpeg
-    /// needed. Otherwise ffmpeg extracts the track (stream copy;
-    /// AAC re-encode only when the copy is impossible — see
-    /// [`extract_audio`]) to `<stem>.m4a` next to the video, and the
-    /// video file is deleted. On extraction failure the video file
-    /// is KEPT and the error is returned, so the caller can mark
-    /// the record Failed with a clear reason instead of completing
-    /// a download whose audio file does not exist. `ffmpeg` is the
-    /// worker's already-resolved binary when one exists; otherwise
-    /// it is resolved here (which may download ffmpeg on first use
-    /// — the workers resolve it upfront for audio-only downloads
-    /// so a missing ffmpeg fails fast instead of after a full
-    /// download).
+    /// downloaded video file into its audio track, in the format
+    /// the user chose (round 11 extension, feature 13: "mp3",
+    /// "opus" or "m4a"). Returns the path the record should point
+    /// at. A file that is already audio in the CHOSEN format (a
+    /// DASH audio representation the engine named `.m4a`, when
+    /// m4a was chosen) passes through unchanged — no ffmpeg
+    /// needed. A file in a DIFFERENT audio format is converted
+    /// (stream copy when the container allows it, re-encode
+    /// otherwise — see [`extract_audio_as`]). A video file is
+    /// extracted to `<stem>.<format>` next to the video, and the
+    /// video file is deleted. On extraction failure the video
+    /// file is KEPT and the error is returned, so the caller can
+    /// mark the record Failed with a clear reason instead of
+    /// completing a download whose audio file does not exist.
+    /// `ffmpeg` is the worker's already-resolved binary when one
+    /// exists; otherwise it is resolved here (which may download
+    /// ffmpeg on first use — the workers resolve it upfront for
+    /// audio-only downloads so a missing ffmpeg fails fast
+    /// instead of after a full download).
     fn audio_only_post_step(
         &self,
         video_path: &Path,
         ffmpeg: Option<&Path>,
+        format: &str,
     ) -> Result<PathBuf, String> {
         let ext = video_path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        if matches!(
-            ext.as_str(),
-            "m4a" | "mp3" | "ogg" | "opus" | "wav" | "flac" | "aac"
-        ) {
+        if ext == format {
             return Ok(video_path.to_path_buf());
         }
         let ffmpeg_path;
@@ -1368,14 +1911,15 @@ impl App {
             .and_then(|s| s.to_str())
             .unwrap_or("audio");
         let dir = video_path.parent().unwrap_or(Path::new("."));
-        let audio_path = unique_path(dir, &format!("{stem}.m4a"));
-        extract_audio(ffmpeg, video_path, &audio_path)?;
+        let audio_path = unique_path(dir, &format!("{stem}.{format}"));
+        extract_audio_as(ffmpeg, video_path, &audio_path, format)?;
         // Extraction succeeded: the video file is no longer needed.
         let _ = std::fs::remove_file(video_path);
         Ok(audio_path)
     }
 
-    fn run_one(&self, id: &str, job: &Job) -> Result<(), String> {
+    fn run_one(self: &Arc<Self>, id: &str, job: &Job) -> Result<(), String> {
+        let settings = self.current_settings();
         let mut rec = match self.store.lock().unwrap().get(id) {
             Some(r) => r.clone(),
             None => return Err("unknown download".to_string()),
@@ -1443,12 +1987,13 @@ impl App {
             url: rec.url.clone(),
             destination_dir: PathBuf::from(&rec.destination),
             filename: Some(rec.filename.clone()),
-            max_segments: self.settings.max_segments,
-            max_retries: self.settings.max_retries,
-            bandwidth_kbps: self.settings.bandwidth_kbps,
+            max_segments: settings.max_segments,
+            max_retries: settings.max_retries,
+            bandwidth_kbps: settings.bandwidth_kbps,
             referer: rec.referer.clone(),
+            proxy_url: settings.proxy_url.clone(),
             user_agent: None,
-            organise_by_category: self.settings.organise_by_category,
+            organise_by_category: settings.organise_by_category,
         };
         let app_id = id.to_string();
         let store_clone = &self.store;
@@ -1470,7 +2015,11 @@ impl App {
                 // the audio file. A failed extraction keeps the
                 // video file and fails the record with the reason.
                 let final_path = if rec.audio_only {
-                    match self.audio_only_post_step(&final_path, ffmpeg.as_deref()) {
+                    match self.audio_only_post_step(
+                        &final_path,
+                        ffmpeg.as_deref(),
+                        rec.audio_extension(),
+                    ) {
                         Ok(p) => p,
                         Err(e) => {
                             self.set_status(id, Status::Failed, Some(e));
@@ -1514,9 +2063,29 @@ impl App {
     /// and picks up its own .part files. On success the record's
     /// filename is corrected to the real file name: a merge may pick a
     /// different container than the planned extension.
-    fn run_media(&self, rec: &DownloadRecord, job: &Job) -> Result<(), String> {
+    fn run_media(self: &Arc<Self>, rec: &DownloadRecord, job: &Job) -> Result<(), String> {
+        let settings = self.current_settings();
         let id = rec.id.clone();
         self.set_status(&id, Status::Downloading, None);
+        // "Audio only" with a VIDEO format (round 11 extension,
+        // feature 13): yt-dlp downloads the video and the
+        // post-step extracts the audio — resolve ffmpeg UPFRONT
+        // so a missing ffmpeg fails fast instead of after a full
+        // video download (same fail-fast pattern as the HLS merge
+        // path). An audio FORMAT needs no post-step: yt-dlp
+        // extracts to the chosen format itself (--extract-audio).
+        let needs_audio_post_step = rec.audio_only && rec.format_kind.as_deref() != Some("audio");
+        let ffmpeg = if needs_audio_post_step {
+            match ensure_ffmpeg(&self.data_dir) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    self.set_status(&id, Status::Failed, Some(e));
+                    return Err("download failed".to_string());
+                }
+            }
+        } else {
+            None
+        };
         let stem = std::path::Path::new(&rec.filename)
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -1540,12 +2109,24 @@ impl App {
             url: rec.url.clone(),
             selector,
             needs_merge: rec.needs_merge,
-            destination_dir: PathBuf::from(&self.settings.download_dir),
+            destination_dir: PathBuf::from(&settings.download_dir),
             filename_stem: stem,
             expected_ext: ext,
             expected_total: rec.total_bytes,
-            organise_by_category: self.settings.organise_by_category,
+            organise_by_category: settings.organise_by_category,
             referer: rec.referer.clone(),
+            subtitle_langs: rec.subtitle_langs.clone(),
+            audio_format: if rec.format_kind.as_deref() == Some("audio") {
+                Some(
+                    rec.audio_format
+                        .clone()
+                        .unwrap_or_else(|| "m4a".to_string()),
+                )
+            } else {
+                None
+            },
+            proxy_url: settings.proxy_url.clone(),
+            bandwidth_kbps: settings.bandwidth_kbps,
         };
         let app_id = id.clone();
         let store_clone = &self.store;
@@ -1568,6 +2149,26 @@ impl App {
             &job.cancelled,
         ) {
             Ok(final_path) => {
+                // "Audio only" with a video format: extract the
+                // audio track BEFORE the record is marked
+                // Completed, so the list points at the audio file
+                // (see run_one). A failed extraction keeps the
+                // video file and fails the record with the reason.
+                let final_path = if needs_audio_post_step {
+                    match self.audio_only_post_step(
+                        &final_path,
+                        ffmpeg.as_deref(),
+                        rec.audio_extension(),
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            self.set_status(&id, Status::Failed, Some(e));
+                            return Err("download failed".to_string());
+                        }
+                    }
+                } else {
+                    final_path
+                };
                 let mut store = self.store.lock().unwrap();
                 if let Some(mut r) = store.get(&id).cloned() {
                     // Reconcile against the real file (round 10,
@@ -1590,6 +2191,12 @@ impl App {
                         }
                     }
                     Ok(())
+                } else if self.try_downgrade(rec) {
+                    // A lower quality was queued: the record is
+                    // back in the queue with a fresh worker, so
+                    // this worker ends cleanly instead of failing
+                    // the record.
+                    Ok(())
                 } else {
                     self.set_status(&id, Status::Failed, Some(e));
                     Err("download failed".to_string())
@@ -1605,11 +2212,12 @@ impl App {
     /// user picked "Audio only" (the audio track is extracted after
     /// the download); a resume re-runs the same variant and picks
     /// up the segment sidecar left by the paused run.
-    fn run_stream_hls(&self, rec: &DownloadRecord, job: &Job) -> Result<(), String> {
+    fn run_stream_hls(self: &Arc<Self>, rec: &DownloadRecord, job: &Job) -> Result<(), String> {
+        let settings = self.current_settings();
         let id = rec.id.clone();
         self.set_status(&id, Status::Downloading, None);
-        let mut dir = PathBuf::from(&self.settings.download_dir);
-        if self.settings.organise_by_category {
+        let mut dir = PathBuf::from(&settings.download_dir);
+        if settings.organise_by_category {
             dir = dir.join(category_for_filename(&rec.filename));
         }
         let variant_uri = rec.format_id.clone().unwrap_or_else(|| rec.url.clone());
@@ -1650,10 +2258,32 @@ impl App {
         // audio sibling downloads alone, and a master variant
         // resolves its audio group (or falls back to the muxed
         // variant, whose audio the post-step extracts).
+        //
+        // Round 11 extension, features 2/3/4/10/12: the popup's
+        // language and subtitle choices, the global speed limit,
+        // the proxy, and the title metadata all travel in one
+        // options struct. Subtitles are skipped for audio-only
+        // downloads (an audio file carries no subtitle track).
+        let stream_opts = StreamDownloadOptions {
+            audio_language: rec.audio_lang.clone(),
+            subtitle_language: if rec.audio_only {
+                None
+            } else {
+                rec.subtitle_langs.first().cloned()
+            },
+            proxy_url: settings.proxy_url.clone(),
+            bandwidth_kbps: settings.bandwidth_kbps,
+            title: Some(
+                std::path::Path::new(&rec.filename)
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().to_string())
+                    .unwrap_or_else(|| rec.filename.clone()),
+            ),
+        };
         let captured = read_manifest_sidecar(&self.data_dir, &id, &rec.url);
         let result = if rec.audio_only {
             match &rec.audio_url {
-                Some(audio_uri) => download_hls_variant(
+                Some(audio_uri) => download_hls_variant_opts(
                     audio_uri,
                     audio_uri,
                     &dir,
@@ -1664,8 +2294,9 @@ impl App {
                     &job.paused,
                     &job.cancelled,
                     None,
+                    &stream_opts,
                 ),
-                None => download_hls_audio_only(
+                None => download_hls_audio_only_opts(
                     &rec.url,
                     &variant_uri,
                     &dir,
@@ -1675,7 +2306,8 @@ impl App {
                     &job.paused,
                     &job.cancelled,
                     captured.as_ref(),
-                )
+                    &stream_opts,
+                ),
             }
         } else {
             match &rec.audio_url {
@@ -1691,7 +2323,7 @@ impl App {
                             return Err("download failed".to_string());
                         }
                     };
-                    download_hls_pair(
+                    download_hls_pair_opts(
                         &variant_uri,
                         audio_uri,
                         &dir,
@@ -1702,9 +2334,10 @@ impl App {
                         &job.paused,
                         &job.cancelled,
                         captured.as_ref(),
+                        &stream_opts,
                     )
                 }
-                None => download_hls_variant(
+                None => download_hls_variant_opts(
                     &rec.url,
                     &variant_uri,
                     &dir,
@@ -1715,6 +2348,7 @@ impl App {
                     &job.paused,
                     &job.cancelled,
                     captured.as_ref(),
+                    &stream_opts,
                 ),
             }
         };
@@ -1723,7 +2357,11 @@ impl App {
                 // "Audio only": extract the audio track BEFORE the
                 // record is marked Completed (see run_one).
                 let final_path = if rec.audio_only {
-                    match self.audio_only_post_step(&final_path, ffmpeg.as_deref()) {
+                    match self.audio_only_post_step(
+                        &final_path,
+                        ffmpeg.as_deref(),
+                        rec.audio_extension(),
+                    ) {
                         Ok(p) => p,
                         Err(e) => {
                             self.set_status(&id, Status::Failed, Some(e));
@@ -1755,6 +2393,12 @@ impl App {
                         }
                     }
                     Ok(())
+                } else if self.try_downgrade(rec) {
+                    // A lower quality was queued (round 11
+                    // extension, feature 9): the record is back
+                    // in the queue with a fresh worker, so this
+                    // worker ends cleanly instead of failing it.
+                    Ok(())
                 } else {
                     self.set_status(&id, Status::Failed, Some(e));
                     Err("download failed".to_string())
@@ -1769,11 +2413,12 @@ impl App {
     /// separate from the chosen video representation — except for
     /// "Audio only" downloads, where the worker resolves it upfront
     /// (fail fast) for the post-step extraction.
-    fn run_stream_dash(&self, rec: &DownloadRecord, job: &Job) -> Result<(), String> {
+    fn run_stream_dash(self: &Arc<Self>, rec: &DownloadRecord, job: &Job) -> Result<(), String> {
+        let settings = self.current_settings();
         let id = rec.id.clone();
         self.set_status(&id, Status::Downloading, None);
-        let mut dir = PathBuf::from(&self.settings.download_dir);
-        if self.settings.organise_by_category {
+        let mut dir = PathBuf::from(&settings.download_dir);
+        if settings.organise_by_category {
             dir = dir.join(category_for_filename(&rec.filename));
         }
         // "Audio only": resolve ffmpeg UPFRONT, so a missing ffmpeg
@@ -1796,6 +2441,16 @@ impl App {
             destination_dir: dir,
             filename: rec.filename.clone(),
             referer: rec.referer.clone(),
+            audio_language: rec.audio_lang.clone(),
+            subtitle_language: rec.subtitle_langs.first().cloned(),
+            proxy_url: settings.proxy_url.clone(),
+            bandwidth_kbps: settings.bandwidth_kbps,
+            title: Some(
+                std::path::Path::new(&rec.filename)
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().to_string())
+                    .unwrap_or_else(|| rec.filename.clone()),
+            ),
         };
         let app_id = id.clone();
         let store_clone = &self.store;
@@ -1824,7 +2479,11 @@ impl App {
                 // audio representation already lands as .m4a and
                 // passes the post-step unchanged.
                 let final_path = if rec.audio_only {
-                    match self.audio_only_post_step(&final_path, ffmpeg.as_deref()) {
+                    match self.audio_only_post_step(
+                        &final_path,
+                        ffmpeg.as_deref(),
+                        rec.audio_extension(),
+                    ) {
                         Ok(p) => p,
                         Err(e) => {
                             self.set_status(&id, Status::Failed, Some(e));
@@ -1856,6 +2515,12 @@ impl App {
                         }
                     }
                     Ok(())
+                } else if self.try_downgrade(rec) {
+                    // A lower quality was queued (round 11
+                    // extension, feature 9): the record is back
+                    // in the queue with a fresh worker, so this
+                    // worker ends cleanly instead of failing it.
+                    Ok(())
                 } else {
                     self.set_status(&id, Status::Failed, Some(e));
                     Err("download failed".to_string())
@@ -1868,10 +2533,11 @@ impl App {
     /// from the URL at run time, so a resume always works from the
     /// current file, and files already complete at their target are
     /// skipped by the bundle downloader.
-    fn run_gltf(&self, rec: &DownloadRecord, job: &Job) -> Result<(), String> {
+    fn run_gltf(self: &Arc<Self>, rec: &DownloadRecord, job: &Job) -> Result<(), String> {
+        let settings = self.current_settings();
         let id = rec.id.clone();
         self.set_status(&id, Status::Downloading, None);
-        let plan = match fetch_gltf_plan(&rec.url) {
+        let plan = match fetch_gltf_plan_with_proxy(&rec.url, settings.proxy_url.as_deref()) {
             Ok(p) => p,
             Err(e) => {
                 self.set_status(&id, Status::Failed, Some(e));
@@ -1879,10 +2545,11 @@ impl App {
             }
         };
         let opts = GltfDownloadOptions {
-            destination_dir: PathBuf::from(&self.settings.download_dir),
-            max_segments: self.settings.max_segments,
-            max_retries: self.settings.max_retries,
-            bandwidth_kbps: self.settings.bandwidth_kbps,
+            destination_dir: PathBuf::from(&settings.download_dir),
+            max_segments: settings.max_segments,
+            max_retries: settings.max_retries,
+            bandwidth_kbps: settings.bandwidth_kbps,
+            proxy_url: settings.proxy_url.clone(),
         };
         let app_id = id.clone();
         let store_clone = &self.store;
@@ -1976,6 +2643,7 @@ impl App {
     /// worst case is an orphaned .part the next Clear cache
     /// removes.
     fn delete_download(&self, id: &str, delete_files: bool) -> Result<usize, String> {
+        let settings = self.current_settings();
         if let Some(job) = self.jobs.lock().unwrap().get(id).cloned() {
             job.cancelled.store(true, Ordering::Relaxed);
             for _ in 0..50 {
@@ -2009,7 +2677,7 @@ impl App {
         }
         Ok(fetchforge_engine::delete_download_files(
             &record,
-            std::path::Path::new(&self.settings.download_dir),
+            std::path::Path::new(&settings.download_dir),
             &self.data_dir,
         ))
     }
@@ -2036,6 +2704,7 @@ impl App {
     /// data dir. NEVER deletes downloaded files, the download list,
     /// or history. Returns (files removed, bytes freed).
     fn clear_cache(&self) -> (usize, u64) {
+        let settings = self.current_settings();
         let mut removed_files = 0usize;
         let mut freed_bytes = 0u64;
         // (a) Detector store: count the file itself as one removed
@@ -2071,8 +2740,8 @@ impl App {
         // (b) Segment temp dirs + legacy sidecars in the download
         // tree (top level and one level of category subdirs — the
         // only depths the worker writes to).
-        let mut dirs_to_scan = vec![PathBuf::from(&self.settings.download_dir)];
-        if let Ok(entries) = std::fs::read_dir(&self.settings.download_dir) {
+        let mut dirs_to_scan = vec![PathBuf::from(&settings.download_dir)];
+        if let Ok(entries) = std::fs::read_dir(&settings.download_dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_dir() {
@@ -2203,6 +2872,48 @@ struct AddRequest {
     /// format choice already governs.
     #[serde(default)]
     audio_only: bool,
+    /// Audio language the user picked (round 11 extension,
+    /// feature 4): a language tag ("en", "hi", "es") matched
+    /// against the manifest's audio renditions or the yt-dlp
+    /// format's language tag. Absent means the default track.
+    #[serde(default)]
+    audio_lang: Option<String>,
+    /// Subtitle languages to embed (round 11 extension, feature
+    /// 2): yt-dlp embeds all of them; HLS/DASH embed the first
+    /// one that the manifest carries. Empty means none.
+    #[serde(default)]
+    subtitle_langs: Vec<String>,
+    /// Audio format for audio-only downloads (round 11 extension,
+    /// feature 13): "mp3", "opus" or "m4a". Absent means "m4a".
+    /// Ignored for video downloads.
+    #[serde(default)]
+    audio_format: Option<String>,
+}
+
+/// Batch add (round 11 extension, feature 5): several items
+/// queued from one action (a series page, the detector's
+/// multi-select). Each item is a full AddRequest; the endpoint
+/// answers per item, so one bad URL never blocks the rest.
+#[derive(Deserialize)]
+struct BatchRequest {
+    items: Vec<AddRequest>,
+}
+
+/// Playlist add (round 11 extension, feature 11): the URL of a
+/// playlist page (yt-dlp lists its entries); each entry becomes
+/// its own record. Language/subtitle/audio-format choices apply
+/// to every entry. There is deliberately no `format_id`: a
+/// yt-dlp format id belongs to ONE video, so each entry plans
+/// at its own default quality.
+#[derive(Deserialize)]
+struct PlaylistAddRequest {
+    url: String,
+    #[serde(default)]
+    audio_lang: Option<String>,
+    #[serde(default)]
+    subtitle_langs: Vec<String>,
+    #[serde(default)]
+    audio_format: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2215,6 +2926,13 @@ struct FormatsRequest {
     /// extension versions and the desktop's own listing calls.
     #[serde(default)]
     referer: Option<String>,
+}
+
+/// Playlist listing request (round 11 extension, feature 11):
+/// just the playlist page URL.
+#[derive(Deserialize)]
+struct PlaylistListRequest {
+    url: String,
 }
 
 /// One media item the extension detected on a page (Phase 4/8).
@@ -2271,6 +2989,18 @@ struct DetectedRequest {
 /// are dropped first. The list is a recent-detections cache, not an
 /// archive — 200 is far more than a panel ever shows at once.
 const MAX_DETECTED_ITEMS: usize = 200;
+
+/// Maximum items in one batch add (round 11 extension, feature
+/// 5): a series page rarely tops 50 episodes, and a runaway
+/// selection must not bury the list in one click.
+const MAX_BATCH_ITEMS: usize = 50;
+
+/// Maximum entries queued from one playlist add (round 11
+/// extension, feature 11): a 1,000-video playlist queued by one
+/// click would bury the list. Past the cap the endpoint reports
+/// `truncated: true` with the total, so the user knows entries
+/// were left out.
+const MAX_PLAYLIST_ENTRIES: usize = 200;
 
 fn generate_token() -> String {
     // F04: OS CSPRNG only, on every platform. No time/pid fallback.
@@ -2651,8 +3381,34 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
         return;
     }
     if method == "GET" && path == "/settings" {
-        let body = serde_json::to_string(&app.settings).unwrap_or_else(|_| "{}".to_string());
+        let body =
+            serde_json::to_string(&app.current_settings()).unwrap_or_else(|_| "{}".to_string());
         let _ = stream.write_all(http_response(200, &body).as_bytes());
+        return;
+    }
+    // Update settings (round 11 extension, features 3/7/10):
+    // merges the fields the body carries into the current
+    // settings, validates (an invalid proxy fails the save with
+    // the field name only — the value is never echoed), and
+    // persists. Takes effect on the next download; a running
+    // download keeps the settings it started with.
+    if method == "POST" && path == "/settings" {
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(v) => match app.update_settings(&v) {
+                Ok(saved) => {
+                    let b = serde_json::to_string(&saved).unwrap_or_else(|_| "{}".to_string());
+                    let _ = stream.write_all(http_response(200, &b).as_bytes());
+                }
+                Err(e) => {
+                    let b = serde_json::json!({"error": e}).to_string();
+                    let _ = stream.write_all(http_response(400, &b).as_bytes());
+                }
+            },
+            Err(_) => {
+                let _ = stream
+                    .write_all(http_response(400, r#"{"error":"Invalid JSON body"}"#).as_bytes());
+            }
+        }
         return;
     }
     if method == "POST" && path == "/downloads" {
@@ -2666,6 +3422,10 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
                 r.audio_url,
                 r.manifest_text,
                 r.audio_only,
+                r.audio_lang,
+                r.subtitle_langs,
+                r.audio_format,
+                None,
             ) {
                 Ok(rec) => {
                     // 202: the download is queued; extraction and
@@ -2692,7 +3452,41 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
     if method == "POST" && path == "/media/formats" {
         let req: Result<FormatsRequest, _> = serde_json::from_str(&body);
         match req {
-            Ok(r) => match list_formats_with_referer(&app.data_dir, &r.url, r.referer) {
+            Ok(r) => match list_formats_with_referer_and_proxy(
+                &app.data_dir,
+                &r.url,
+                r.referer,
+                app.current_settings().proxy_url.as_deref(),
+            ) {
+                Ok(info) => {
+                    let b = serde_json::to_string(&info).unwrap();
+                    let _ = stream.write_all(http_response(200, &b).as_bytes());
+                }
+                Err(e) => {
+                    let b = serde_json::json!({"error": e}).to_string();
+                    let _ = stream.write_all(http_response(400, &b).as_bytes());
+                }
+            },
+            Err(_) => {
+                let _ = stream
+                    .write_all(http_response(400, r#"{"error":"Invalid JSON body"}"#).as_bytes());
+            }
+        }
+        return;
+    }
+    // Playlist listing (round 11 extension, feature 11; token
+    // required): list a playlist's entries (titles + URLs, flat
+    // — no per-video extraction) so the UI can show "Download
+    // all N videos". Errors plainly when the URL is not a
+    // playlist.
+    if method == "POST" && path == "/media/playlist" {
+        let req: Result<PlaylistListRequest, _> = serde_json::from_str(&body);
+        match req {
+            Ok(r) => match list_playlist_with_proxy(
+                &app.data_dir,
+                &r.url,
+                app.current_settings().proxy_url.as_deref(),
+            ) {
                 Ok(info) => {
                     let b = serde_json::to_string(&info).unwrap();
                     let _ = stream.write_all(http_response(200, &b).as_bytes());
@@ -2773,6 +3567,79 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
         let _ = stream.write_all(http_response(200, &b).as_bytes());
         return;
     }
+    // Batch add (round 11 extension, feature 5; token
+    // required): queue several items from one action (a series
+    // page, the detector's multi-select). Each item is answered
+    // individually, so one bad URL never blocks the rest.
+    // Must sit before the /downloads/<id>/... catch-all below.
+    if method == "POST" && path == "/downloads/batch" {
+        let req: Result<BatchRequest, _> = serde_json::from_str(&body);
+        match req {
+            Ok(r) => {
+                let mut added = Vec::new();
+                let mut errors = Vec::new();
+                for item in r.items.into_iter().take(MAX_BATCH_ITEMS) {
+                    match app.add_download(
+                        &item.url,
+                        item.filename,
+                        item.format_id,
+                        item.referer,
+                        item.audio_url,
+                        item.manifest_text,
+                        item.audio_only,
+                        item.audio_lang,
+                        item.subtitle_langs,
+                        item.audio_format,
+                        None,
+                    ) {
+                        Ok(rec) => added.push(rec),
+                        Err(e) => errors.push(serde_json::json!({
+                            "url": item.url,
+                            "error": e,
+                        })),
+                    }
+                }
+                let b = serde_json::json!({"added": added, "errors": errors}).to_string();
+                let _ = stream.write_all(http_response(202, &b).as_bytes());
+            }
+            Err(_) => {
+                let _ = stream
+                    .write_all(http_response(400, r#"{"error":"Invalid JSON body"}"#).as_bytes());
+            }
+        }
+        return;
+    }
+    // Playlist add (round 11 extension, feature 11; token
+    // required): queue every entry of a playlist as its own
+    // record. Must sit before the /downloads/<id>/... catch-all
+    // below.
+    if method == "POST" && path == "/downloads/playlist" {
+        let req: Result<PlaylistAddRequest, _> = serde_json::from_str(&body);
+        match req {
+            Ok(r) => match app.add_playlist(&r.url, r.audio_lang, r.subtitle_langs, r.audio_format)
+            {
+                Ok((title, added, errors, truncated)) => {
+                    let b = serde_json::json!({
+                        "playlist": title,
+                        "added": added,
+                        "errors": errors,
+                        "truncated": truncated,
+                    })
+                    .to_string();
+                    let _ = stream.write_all(http_response(202, &b).as_bytes());
+                }
+                Err(e) => {
+                    let b = serde_json::json!({"error": e}).to_string();
+                    let _ = stream.write_all(http_response(400, &b).as_bytes());
+                }
+            },
+            Err(_) => {
+                let _ = stream
+                    .write_all(http_response(400, r#"{"error":"Invalid JSON body"}"#).as_bytes());
+            }
+        }
+        return;
+    }
     // /downloads/<id>/pause | resume | cancel
     if method == "POST" && path.starts_with("/downloads/") {
         let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
@@ -2812,9 +3679,7 @@ fn handle_connection(app: &Arc<App>, mut stream: std::net::TcpStream) {
                 "delete" => {
                     let delete_files = serde_json::from_str::<serde_json::Value>(&body)
                         .ok()
-                        .and_then(|v| {
-                            v.get("delete_files").and_then(|b| b.as_bool())
-                        })
+                        .and_then(|v| v.get("delete_files").and_then(|b| b.as_bool()))
                         .unwrap_or(false);
                     match app.delete_download(id, delete_files) {
                         Ok(files) => {
@@ -2917,6 +3782,9 @@ fn forward_add_to_bridge(
     format_id: Option<&str>,
     manifest_text: Option<&str>,
     audio_only: bool,
+    audio_lang: Option<&str>,
+    subtitle_langs: &[String],
+    audio_format: Option<&str>,
 ) -> Result<DownloadRecord, String> {
     let token = std::fs::read_to_string(data_dir.join("bridge-token.txt"))
         .map_err(|_| "Bridge token file not found.".to_string())?;
@@ -2924,7 +3792,7 @@ fn forward_add_to_bridge(
     if token.is_empty() {
         return Err("Bridge token file is empty.".to_string());
     }
-    let body = serde_json::json!({"url": url, "filename": filename, "referer": referer, "audio_url": audio_url, "format_id": format_id, "manifest_text": manifest_text, "audio_only": audio_only}).to_string();
+    let body = serde_json::json!({"url": url, "filename": filename, "referer": referer, "audio_url": audio_url, "format_id": format_id, "manifest_text": manifest_text, "audio_only": audio_only, "audio_lang": audio_lang, "subtitle_langs": subtitle_langs, "audio_format": audio_format}).to_string();
     let (status, resp) = loopback_http(port, "POST", "/downloads", Some(token), Some(&body))?;
     // POST /downloads answers 202 (queued; extraction runs in the
     // worker). 201 is still accepted so a newer CLI keeps working
@@ -3038,6 +3906,27 @@ fn native_host(app: &Arc<App>) {
                     .get("audio_only")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // The popup's option choices (round 11 extension,
+                // features 2/4/13): audio language, subtitle
+                // languages, and the audio format for audio-only
+                // downloads. Absent for old extension versions.
+                let audio_lang = value
+                    .get("audio_lang")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let subtitle_langs: Vec<String> = value
+                    .get("subtitle_langs")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let audio_format = value
+                    .get("audio_format")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 // A download started from the extension must survive
                 // this host process exiting: Chrome/Firefox terminate
                 // the native host after its sendNativeMessage reply,
@@ -3075,6 +3964,9 @@ fn native_host(app: &Arc<App>) {
                     format_id.as_deref(),
                     manifest_text.as_deref(),
                     audio_only,
+                    audio_lang.as_deref(),
+                    &subtitle_langs,
+                    audio_format.as_deref(),
                 ) {
                     Ok(rec) => {
                         serde_json::json!({"type": "added", "download": rec, "via": "bridge"})
@@ -3091,6 +3983,9 @@ fn native_host(app: &Arc<App>) {
                                 format_id.as_deref(),
                                 manifest_text.as_deref(),
                                 audio_only,
+                                audio_lang.as_deref(),
+                                &subtitle_langs,
+                                audio_format.as_deref(),
                             )
                         }) {
                             Ok(rec) => {
@@ -3104,6 +3999,10 @@ fn native_host(app: &Arc<App>) {
                                 audio_url,
                                 manifest_text,
                                 audio_only,
+                                audio_lang,
+                                subtitle_langs,
+                                audio_format,
+                                None,
                             ) {
                                 Ok(rec) => {
                                     serde_json::json!({"type": "added", "download": rec, "via": "in-process", "warning": "The FetchForge bridge is not running, so this download started inside the browser connection and may stop if the browser closes it. Open the FetchForge app to keep downloads running."})
@@ -3189,6 +4088,10 @@ fn main() {
     // interrupted downloads — after the bind succeeds, so a second
     // process that fails to bind never touches downloads.json.
     app.recover_interrupted();
+    // Round 11 extension, feature 1: auto-start whatever was
+    // Queued when the bridge last stopped (oldest first). Paused
+    // records stay paused.
+    app.auto_start_queued();
     eprintln!("FetchForge bridge listening on 127.0.0.1:{port} (loopback only)");
     eprintln!("Data dir: {}", data_dir.display());
     eprintln!(
@@ -3287,11 +4190,17 @@ mod tests {
             None,
             None,
             false,
+            None,
+            &[],
+            None,
         )
         .unwrap();
         assert_eq!(rec.id, "dl-1");
         assert_eq!(rec.filename, "x.zip");
-        assert_eq!(rec.format_id, None, "old record JSON must load with defaults");
+        assert_eq!(
+            rec.format_id, None,
+            "old record JSON must load with defaults"
+        );
         let request = handle.join().unwrap();
         assert!(
             request.contains("POST /downloads HTTP/1.1"),
@@ -3327,6 +4236,9 @@ mod tests {
             None,
             None,
             false,
+            None,
+            &[],
+            None,
         )
         .unwrap_err();
         assert!(err.contains("not reachable"), "error: {err}");
@@ -3353,6 +4265,9 @@ mod tests {
             None,
             None,
             false,
+            None,
+            &[],
+            None,
         )
         .unwrap_err();
         assert!(err.contains("401"), "error: {err}");
@@ -3381,8 +4296,7 @@ mod tests {
 
     #[test]
     fn add_request_accepts_optional_format_id() {
-        let r: AddRequest =
-            serde_json::from_str(r#"{"url":"https://example.com/x.zip"}"#).unwrap();
+        let r: AddRequest = serde_json::from_str(r#"{"url":"https://example.com/x.zip"}"#).unwrap();
         assert_eq!(r.format_id, None);
         let r: AddRequest = serde_json::from_str(
             r#"{"url":"https://www.youtube.com/watch?v=x","filename":"v.mp4","format_id":"22"}"#,
@@ -3476,7 +4390,8 @@ mod tests {
         let stop2 = stop.clone();
         let server = std::thread::spawn(move || {
             listener.set_nonblocking(true).unwrap();
-            let playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\nseg0.ts\n#EXT-X-ENDLIST\n";
+            let playlist =
+                "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\nseg0.ts\n#EXT-X-ENDLIST\n";
             loop {
                 if stop2.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
@@ -3513,6 +4428,10 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                Vec::new(),
+                None,
+                None,
             )
             .unwrap();
         assert!(!first.duplicate, "first add queues a new download");
@@ -3525,6 +4444,10 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                Vec::new(),
+                None,
+                None,
             )
             .unwrap();
         assert!(second.duplicate, "second add must be flagged duplicate");
@@ -3556,12 +4479,12 @@ mod tests {
             Ok(p) => p,
             Err(_) => return,
         };
-        // Case 1: an already-audio file passes through unchanged —
-        // no ffmpeg call at all (even garbage bytes pass, since the
-        // extension decides, not a probe).
+        // Case 1: an already-audio file in the CHOSEN format passes
+        // through unchanged — no ffmpeg call at all (even garbage
+        // bytes pass, since the extension decides, not a probe).
         let audio = dir.join("song.m4a");
         std::fs::write(&audio, b"fake audio bytes").unwrap();
-        let out = app.audio_only_post_step(&audio, None).unwrap();
+        let out = app.audio_only_post_step(&audio, None, "m4a").unwrap();
         assert_eq!(out, audio);
         assert!(audio.is_file());
         // Case 2: a real muxed mp4 extracts to .m4a and the video
@@ -3593,7 +4516,9 @@ mod tests {
             .unwrap()
             .success();
         assert!(mk, "fixture build failed");
-        let out = app.audio_only_post_step(&video, Some(&ffmpeg)).unwrap();
+        let out = app
+            .audio_only_post_step(&video, Some(&ffmpeg), "m4a")
+            .unwrap();
         assert_eq!(out.file_name().unwrap(), "clip.m4a");
         assert!(out.is_file());
         assert!(
@@ -3605,10 +4530,43 @@ mod tests {
         // the download).
         let bad = dir.join("bad.mp4");
         std::fs::write(&bad, b"not a video").unwrap();
-        assert!(app.audio_only_post_step(&bad, Some(&ffmpeg)).is_err());
+        assert!(app
+            .audio_only_post_step(&bad, Some(&ffmpeg), "m4a")
+            .is_err());
         assert!(
             bad.is_file(),
             "a failed extraction must keep the video file"
+        );
+        // Case 4 (round 11 extension, feature 13): an audio file
+        // in the WRONG format is converted, not passed through —
+        // the user asked for mp3, so an .m4a must become one.
+        let m4a = dir.join("track.m4a");
+        let mk = std::process::Command::new(&ffmpeg)
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:d=1",
+                "-c:a",
+                "aac",
+                m4a.to_str().unwrap(),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(mk, "m4a fixture build failed");
+        let out = app
+            .audio_only_post_step(&m4a, Some(&ffmpeg), "mp3")
+            .unwrap();
+        assert_eq!(out.file_name().unwrap(), "track.mp3");
+        assert!(out.is_file());
+        assert!(
+            !m4a.exists(),
+            "the source file must be deleted after conversion"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3623,7 +4581,7 @@ mod tests {
         // are on the returned records.)
         let dir = test_data_dir("fetchforge-test-audio-dedupe");
         let app = App::new(dir.clone());
-        let download_dir = app.settings.download_dir.clone();
+        let download_dir = app.current_settings().download_dir.clone();
         let mut video = test_record("video-1", "clip.mp4", Status::Completed);
         video.url = "https://example.com/clip.mp4".to_string();
         video.destination = download_dir.clone();
@@ -3641,6 +4599,10 @@ mod tests {
                 None,
                 None,
                 true,
+                None,
+                Vec::new(),
+                None,
+                None,
             )
             .unwrap();
         assert!(!audio.duplicate, "audio must not match the completed video");
@@ -3655,6 +4617,10 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                Vec::new(),
+                None,
+                None,
             )
             .unwrap();
         assert!(
@@ -3676,7 +4642,7 @@ mod tests {
         // a re-add in the same process.
         let dir = test_data_dir("fetchforge-test-cleared-readd");
         let app = App::new(dir.clone());
-        let download_dir = app.settings.download_dir.clone();
+        let download_dir = app.current_settings().download_dir.clone();
         let mut old = test_record("clip-old", "clip.mp4", Status::Completed);
         old.url = "https://example.com/clip.mp4".to_string();
         old.destination = download_dir.clone();
@@ -3712,6 +4678,10 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                Vec::new(),
+                None,
+                None,
             )
             .unwrap();
         assert!(
@@ -3772,12 +4742,19 @@ mod tests {
         });
         let dir = test_data_dir("fetchforge-test-plan-duplicate-fresh");
         let app = App::new(dir.clone());
-        let download_dir = app.settings.download_dir.clone();
+        let download_dir = app.current_settings().download_dir.clone();
         let url = format!("http://127.0.0.1:{port}/v.m3u8");
         // Learn the planned filename first: the cleared record must
         // match it exactly, or the test would pass trivially.
-        let planned_filename = match plan_media_download_or_drive_fallback(
-            &dir, &url, None, Some("clip"), &None, None,
+        let planned_filename = match plan_media_download_or_drive_fallback_with_options(
+            &dir,
+            &url,
+            None,
+            Some("clip"),
+            &None,
+            None,
+            None,
+            None,
         )
         .unwrap()
         {
@@ -3932,6 +4909,14 @@ mod tests {
             quality_note: None,
             speed_bps: None,
             size_kind: None,
+            audio_lang: None,
+            subtitle_langs: Vec::new(),
+            audio_format: None,
+            format_kind: None,
+            playlist: None,
+            playlist_index: None,
+            downgraded_from: None,
+            downgrade_attempted: false,
         }
     }
 
@@ -4032,5 +5017,165 @@ mod tests {
         assert!(!filename_matches_unique("movie (1).mkv", "movie.mp4"));
         assert!(!filename_matches_unique("other.mp4", "movie.mp4"));
         assert!(!filename_matches_unique("movie.mp4", "movie (1).mp4"));
+    }
+
+    #[test]
+    fn update_settings_merges_validates_and_persists() {
+        // Round 11 extension, features 3/7/10: a partial body
+        // merges into the current settings and persists to disk;
+        // an invalid proxy fails the whole save and the error
+        // never contains the proxy value (it may hold
+        // credentials); numerics clamp instead of failing.
+        let dir = test_data_dir("fetchforge-test-update-settings");
+        let app = App::new(dir.clone());
+        let saved = app
+            .update_settings(&serde_json::json!({
+                "bandwidth_kbps": 500,
+                "proxy_url": "http://user:secret@proxy.example.com:8080",
+                "shutdown_when_finished": true,
+                "notifications_enabled": false,
+                "max_simultaneous": 0,
+            }))
+            .unwrap();
+        assert_eq!(saved.bandwidth_kbps, Some(500));
+        // validate_proxy_url normalises the URL (the url crate
+        // adds the empty path "/"); the stored form is the
+        // normalised one.
+        assert_eq!(
+            saved.proxy_url.as_deref(),
+            Some("http://user:secret@proxy.example.com:8080/")
+        );
+        assert!(saved.shutdown_when_finished);
+        assert!(!saved.notifications_enabled);
+        assert_eq!(saved.max_simultaneous, 1, "0 clamps to 1");
+        // Persisted: a fresh load reads the same values.
+        let reloaded = app.current_settings();
+        assert_eq!(reloaded.bandwidth_kbps, Some(500));
+        assert!(reloaded.shutdown_when_finished);
+        // An invalid proxy fails, names only the field, and
+        // leaves the saved settings untouched.
+        let err = app
+            .update_settings(&serde_json::json!({"proxy_url": "ftp://bad.example.com"}))
+            .unwrap_err();
+        assert!(err.contains("proxy_url"), "error: {err}");
+        assert!(
+            !err.contains("ftp://"),
+            "error must not echo the value: {err}"
+        );
+        assert_eq!(
+            app.current_settings().proxy_url.as_deref(),
+            Some("http://user:secret@proxy.example.com:8080/")
+        );
+        // bandwidth 0 means unlimited.
+        let saved = app
+            .update_settings(&serde_json::json!({"bandwidth_kbps": 0}))
+            .unwrap();
+        assert_eq!(saved.bandwidth_kbps, None);
+    }
+
+    #[test]
+    fn try_downgrade_refuses_without_a_ladder() {
+        // Round 11 extension, feature 9: no picked height, no
+        // format id, or an already-attempted downgrade means no
+        // retry — without ever touching the network.
+        let dir = test_data_dir("fetchforge-test-downgrade-guard");
+        let app = App::new(dir);
+        let mut rec = test_record("no-height", "clip.mp4", Status::Failed);
+        rec.format_id = Some("1080".to_string());
+        rec.picked_height = None;
+        {
+            let mut store = app.store.lock().unwrap();
+            store.upsert(rec.clone());
+        }
+        assert!(!app.try_downgrade(&rec));
+        let mut rec2 = test_record("already-tried", "clip.mp4", Status::Failed);
+        rec2.format_id = Some("1080".to_string());
+        rec2.picked_height = Some(1080);
+        rec2.downgrade_attempted = true;
+        {
+            let mut store = app.store.lock().unwrap();
+            store.upsert(rec2.clone());
+        }
+        assert!(!app.try_downgrade(&rec2));
+        let mut rec3 = test_record("gltf", "model.gltf", Status::Failed);
+        rec3.format_id = Some("x".to_string());
+        rec3.picked_height = Some(1080);
+        rec3.stream_kind = Some("gltf".to_string());
+        {
+            let mut store = app.store.lock().unwrap();
+            store.upsert(rec3.clone());
+        }
+        assert!(!app.try_downgrade(&rec3));
+    }
+
+    #[test]
+    fn auto_start_queued_spawns_queued_only() {
+        // Round 11 extension, feature 1: Queued records get a
+        // worker (visible in the job map immediately — the
+        // worker thread itself fails fast on the fake URL, which
+        // is harmless here); Paused records are left alone.
+        let dir = test_data_dir("fetchforge-test-auto-start");
+        let app = App::new(dir);
+        let queued = test_record("q-1", "a.zip", Status::Queued);
+        let paused = test_record("p-1", "b.zip", Status::Paused);
+        {
+            let mut store = app.store.lock().unwrap();
+            store.upsert(queued);
+            store.upsert(paused);
+            let _ = store.save();
+        }
+        app.auto_start_queued();
+        assert!(
+            app.jobs.lock().unwrap().contains_key("q-1"),
+            "queued record must get a worker"
+        );
+        assert!(
+            !app.jobs.lock().unwrap().contains_key("p-1"),
+            "paused record must not get a worker"
+        );
+        // Tidy: cancel the spawned worker so it stops promptly.
+        let job = app.jobs.lock().unwrap().get("q-1").cloned();
+        if let Some(job) = job {
+            job.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn shutdown_guard_fires_once_and_only_when_idle() {
+        // Round 11 extension, feature 7: with the setting on and
+        // nothing remaining, the guard fires (on non-Windows the
+        // shutdown itself is only a logged warning, so the test
+        // asserts the one-shot guard instead of a real shutdown).
+        // A remaining Queued record blocks it.
+        let dir = test_data_dir("fetchforge-test-shutdown-guard");
+        let app = App::new(dir);
+        app.update_settings(&serde_json::json!({"shutdown_when_finished": true}))
+            .unwrap();
+        let done = test_record("done-1", "a.zip", Status::Completed);
+        let waiting = test_record("wait-1", "b.zip", Status::Queued);
+        {
+            let mut store = app.store.lock().unwrap();
+            store.upsert(done);
+            store.upsert(waiting);
+            let _ = store.save();
+        }
+        app.maybe_shutdown_after_completion("done-1");
+        assert!(
+            !app.shutdown_triggered.load(Ordering::Relaxed),
+            "a queued record must block the shutdown"
+        );
+        {
+            let mut store = app.store.lock().unwrap();
+            store.remove("wait-1");
+            let _ = store.save();
+        }
+        app.maybe_shutdown_after_completion("done-1");
+        assert!(
+            app.shutdown_triggered.load(Ordering::Relaxed),
+            "with nothing remaining, the guard must fire"
+        );
+        // A second call is a no-op (the guard is already set).
+        app.maybe_shutdown_after_completion("done-1");
+        assert!(app.shutdown_triggered.load(Ordering::Relaxed));
     }
 }

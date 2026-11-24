@@ -107,6 +107,14 @@ pub struct DownloadOptions {
     /// Kilobits per second, None = unlimited. Enforced per download.
     pub bandwidth_kbps: Option<u64>,
     pub referer: Option<String>,
+    /// Proxy for this download (round 11 extension, feature 10):
+    /// `http://`, `https://` or `socks5://` with an optional
+    /// `user:pass@` — validated by
+    /// [`crate::validate::validate_proxy_url`] before it reaches
+    /// here. None means no explicit proxy (the OS proxy, if any,
+    /// still applies through reqwest's system-proxy feature).
+    /// NEVER logged: the URL may contain a password.
+    pub proxy_url: Option<String>,
     pub user_agent: Option<String>,
     /// If true, place the file in `<dir>/<Category>/` (see category.rs).
     pub organise_by_category: bool,
@@ -122,6 +130,7 @@ impl Default for DownloadOptions {
             max_retries: 3,
             bandwidth_kbps: None,
             referer: None,
+            proxy_url: None,
             user_agent: None,
             organise_by_category: true,
         }
@@ -154,7 +163,7 @@ pub enum StopReason {
 }
 
 fn client(opts: &DownloadOptions) -> Result<Client, String> {
-    Client::builder()
+    let mut builder = Client::builder()
         .user_agent(
             opts.user_agent
                 .clone()
@@ -162,9 +171,83 @@ fn client(opts: &DownloadOptions) -> Result<Client, String> {
         )
         .timeout(Duration::from_secs(120))
         .connect_timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::limited(10));
+    if let Some(proxy) = &opts.proxy_url {
+        // The proxy URL was validated at settings-save time
+        // (validate_proxy_url); a failure here is a reqwest-level
+        // rejection (e.g. an unsupported scheme), reported
+        // WITHOUT the URL — it may contain credentials.
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy)
+                .map_err(|_| "The configured proxy could not be used.".to_string())?,
+        );
+    }
+    builder
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+/// A bandwidth limiter shared across threads (round 11 extension,
+/// feature 3): the HLS/DASH segment engine downloads up to 4
+/// segments in parallel, so a per-thread limiter would let the
+/// aggregate run 4x over the cap. One `SharedLimiter` per download
+/// phase accounts every completed segment's bytes; the sleep is
+/// computed under the lock and taken AFTER releasing it, so one
+/// worker's pause never blocks the others' accounting. The window
+/// logic mirrors the single-threaded [`Limiter`]: a 1-second
+/// window, sleeping at most 1 s per call so a pause/cancel check
+/// is never far away.
+pub struct SharedLimiter {
+    kbps: Option<u64>,
+    state: std::sync::Mutex<SharedLimiterState>,
+}
+
+struct SharedLimiterState {
+    window_start: Instant,
+    window_bytes: u64,
+}
+
+impl SharedLimiter {
+    pub fn new(kbps: Option<u64>) -> Self {
+        Self {
+            kbps,
+            state: std::sync::Mutex::new(SharedLimiterState {
+                window_start: Instant::now(),
+                window_bytes: 0,
+            }),
+        }
+    }
+
+    /// Account `n` downloaded bytes, sleeping when the window is
+    /// over budget. A None or 0 limit is a no-op.
+    pub fn account(&self, n: usize) {
+        let Some(kbps) = self.kbps else { return };
+        if kbps == 0 {
+            return;
+        }
+        let sleep = {
+            let mut st = self.state.lock().unwrap();
+            st.window_bytes += n as u64;
+            let budget = kbps * 1024 / 8; // bytes per second
+            let elapsed = st.window_start.elapsed().as_secs_f64();
+            let expected = budget as f64 * elapsed;
+            let mut sleep = Duration::ZERO;
+            if st.window_bytes as f64 > expected {
+                let over = (st.window_bytes as f64 - expected) / budget as f64;
+                if over > 0.0 {
+                    sleep = Duration::from_secs_f64(over.min(1.0));
+                }
+            }
+            if elapsed >= 1.0 {
+                st.window_start = Instant::now();
+                st.window_bytes = 0;
+            }
+            sleep
+        };
+        if !sleep.is_zero() {
+            std::thread::sleep(sleep);
+        }
+    }
 }
 
 /// HEAD probe (falls back to a ranged GET when HEAD is refused).
@@ -868,5 +951,61 @@ pub fn stop_reason(err: &str) -> Option<StopReason> {
         "__PAUSED__" => Some(StopReason::Paused),
         "__CANCELLED__" => Some(StopReason::Cancelled),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn shared_limiter_noop_without_limit_and_throttles_with_one() {
+        // No limit (None or 0): account returns at once.
+        let free = SharedLimiter::new(None);
+        let start = Instant::now();
+        free.account(100 * 1024 * 1024);
+        assert!(start.elapsed() < Duration::from_millis(50));
+        let zero = SharedLimiter::new(Some(0));
+        zero.account(100 * 1024 * 1024);
+        // A 100 KB/s limit: accounting 200 KB in one window must
+        // sleep roughly a second (capped at 1 s per call).
+        let limited = SharedLimiter::new(Some(100));
+        let start = Instant::now();
+        limited.account(200 * 1024);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_millis(1500),
+            "elapsed: {elapsed:?}"
+        );
+        // The same limiter shared across threads enforces the
+        // limit GLOBALLY: two threads accounting 60 KB each at
+        // 100 KB/s must together sleep (120 KB > 100 KB window).
+        let shared = std::sync::Arc::new(SharedLimiter::new(Some(100)));
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let limiter = std::sync::Arc::clone(&shared);
+                scope.spawn(move || limiter.account(60 * 1024));
+            }
+        });
+        assert!(
+            start.elapsed() >= Duration::from_millis(150),
+            "shared accounting must throttle: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn client_with_bad_proxy_errors_without_the_url() {
+        // A malformed proxy URL fails client construction — and
+        // the error never contains the proxy value (credentials).
+        let opts = DownloadOptions {
+            proxy_url: Some("http://user:secret@proxy.example.com:99999".to_string()),
+            ..Default::default()
+        };
+        let err = client(&opts).unwrap_err();
+        assert!(!err.contains("secret"), "error: {err}");
+        assert!(!err.contains("proxy.example.com"), "error: {err}");
     }
 }

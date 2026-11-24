@@ -40,6 +40,7 @@ fn opts(url: &str, dir: &std::path::Path) -> DownloadOptions {
         max_retries: 0,
         bandwidth_kbps: None,
         referer: None,
+        proxy_url: None,
         user_agent: None,
         organise_by_category: false,
     }

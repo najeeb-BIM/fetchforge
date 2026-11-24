@@ -142,9 +142,8 @@ fn wait_health(port: u16) {
     loop {
         if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
             let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-            let _ = s.write_all(
-                b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-            );
+            let _ = s
+                .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
             let mut buf = String::new();
             if s.read_to_string(&mut buf).is_ok() && buf.contains("200") {
                 return;

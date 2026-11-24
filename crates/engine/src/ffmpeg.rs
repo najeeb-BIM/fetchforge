@@ -274,41 +274,8 @@ fn no_console_window(cmd: &mut Command) {
 /// partial output and returns ffmpeg's error tail. Runs on the
 /// caller's worker thread; pause/cancel are checked by the caller
 /// before and after (a stream copy is seconds, not minutes).
-pub fn merge_av(
-    ffmpeg: &Path,
-    video: &Path,
-    audio: &Path,
-    output: &Path,
-) -> Result<(), String> {
-    let mut cmd = Command::new(ffmpeg);
-    cmd.args(["-y", "-i"])
-        .arg(video)
-        .arg("-i")
-        .arg(audio)
-        .args(["-map", "0:v:0", "-map", "1:a:0", "-c", "copy"])
-        .arg(output)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    no_console_window(&mut cmd);
-    let out = cmd
-        .output()
-        .map_err(|e| format!("Could not run ffmpeg to merge the video and audio tracks ({e})."))?;
-    if out.status.success() && output.is_file() {
-        return Ok(());
-    }
-    let _ = std::fs::remove_file(output);
-    let tail: String = String::from_utf8_lossy(&out.stderr)
-        .chars()
-        .rev()
-        .take(300)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    Err(format!(
-        "ffmpeg could not merge the video and audio tracks. {tail}"
-    ))
+pub fn merge_av(ffmpeg: &Path, video: &Path, audio: &Path, output: &Path) -> Result<(), String> {
+    merge_tracks(ffmpeg, video, Some(audio), None, None, output)
 }
 
 /// Extract the audio track of a downloaded video into a standalone
@@ -322,6 +289,23 @@ pub fn merge_av(
 /// sources); a failed extraction removes any partial output and
 /// returns ffmpeg's error tail, exactly like [`merge_av`].
 pub fn extract_audio(ffmpeg: &Path, input: &Path, output: &Path) -> Result<(), String> {
+    extract_audio_as(ffmpeg, input, output, "m4a")
+}
+
+/// [`extract_audio`] with the target format chosen (round 11
+/// extension, feature 13): "mp3", "opus" or "m4a". Stream copy
+/// first (lossless when the source codec already fits the target
+/// container); the re-encode fallback uses the format's encoder
+/// (libmp3lame for mp3, libopus for opus, aac for m4a) instead of
+/// always AAC — an mp3 target re-encoded as AAC would be an mp3
+/// file holding AAC audio. Any other format string falls back to
+/// the m4a behaviour.
+pub fn extract_audio_as(
+    ffmpeg: &Path,
+    input: &Path,
+    output: &Path,
+    format: &str,
+) -> Result<(), String> {
     let run = |args: &[&str]| -> Result<(), String> {
         let mut cmd = Command::new(ffmpeg);
         cmd.args(["-y", "-i"])
@@ -351,13 +335,112 @@ pub fn extract_audio(ffmpeg: &Path, input: &Path, output: &Path) -> Result<(), S
     };
     // Stream copy first: the common case (AAC in MP4) is lossless
     // and near-instant. Re-encode only when the copy is impossible.
+    let encoder = match format {
+        "mp3" => "libmp3lame",
+        "opus" => "libopus",
+        _ => "aac",
+    };
     match run(&["-vn", "-c:a", "copy"]) {
         Ok(()) => Ok(()),
-        Err(copy_err) => match run(&["-vn", "-c:a", "aac"]) {
+        Err(copy_err) => match run(&["-vn", "-c:a", encoder]) {
             Ok(()) => Ok(()),
             Err(_) => Err(copy_err),
         },
     }
+}
+
+/// Merge video + audio (+ optionally subtitles) with ffmpeg,
+/// stream-copied (`-c copy`: no re-encode, no quality loss).
+/// `audio` is None for a muxed variant (the video already has
+/// sound); `subtitle` is Some((vtt_file, language)) when a
+/// subtitle track was downloaded (round 11 extension, feature 2)
+/// — it is muxed as mov_text with its language tag, which needs
+/// an MP4 output (the caller guarantees that: subtitle downloads
+/// re-containerise a muxed .ts variant to .mp4 at plan time).
+/// `title` is the metadata title (round 11 extension, feature
+/// 12), written when present. A failed merge removes any partial
+/// output and returns ffmpeg's error tail, exactly like
+/// [`merge_av`].
+#[allow(clippy::too_many_arguments)]
+pub fn merge_tracks(
+    ffmpeg: &Path,
+    video: &Path,
+    audio: Option<&Path>,
+    subtitle: Option<(&Path, &str)>,
+    title: Option<&str>,
+    output: &Path,
+) -> Result<(), String> {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-y", "-i"]).arg(video);
+    let mut next_input = 1;
+    let audio_input = if let Some(a) = audio {
+        cmd.arg("-i").arg(a);
+        let idx = next_input;
+        next_input += 1;
+        Some(idx)
+    } else {
+        None
+    };
+    let subtitle_input = if let Some((s, _)) = subtitle {
+        cmd.arg("-i").arg(s);
+        let idx = next_input;
+        next_input += 1;
+        Some(idx)
+    } else {
+        None
+    };
+    let _ = next_input;
+    cmd.args(["-map", "0:v:0"]);
+    if let Some(idx) = audio_input {
+        cmd.args(["-map", &format!("{idx}:a:0")]);
+    } else {
+        // Muxed video: keep its own audio track too (a subtitle
+        // merge must not strip the sound).
+        cmd.args(["-map", "0:a?"]);
+    }
+    if let Some(idx) = subtitle_input {
+        cmd.args(["-map", &format!("{idx}:s:0")]);
+    }
+    cmd.args(["-c", "copy"]);
+    if subtitle_input.is_some() {
+        // WebVTT must be converted to the MP4 subtitle codec;
+        // -c copy would fail (mov_text is the only subtitle codec
+        // MP4 accepts for text).
+        cmd.args(["-c:s", "mov_text"]);
+        if let Some((_, lang)) = subtitle {
+            if !lang.is_empty() {
+                cmd.args(["-metadata:s:s:0", &format!("language={lang}")]);
+            }
+        }
+    }
+    if let Some(t) = title {
+        if !t.is_empty() {
+            cmd.args(["-metadata", &format!("title={t}")]);
+        }
+    }
+    cmd.arg(output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    no_console_window(&mut cmd);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("Could not run ffmpeg to merge the tracks ({e})."))?;
+    if out.status.success() && output.is_file() {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(output);
+    let tail: String = String::from_utf8_lossy(&out.stderr)
+        .chars()
+        .rev()
+        .take(300)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    Err(format!(
+        "ffmpeg could not merge the video and audio tracks. {tail}"
+    ))
 }
 
 /// What a delivered file actually is (round 10, item 8): its video
@@ -587,10 +670,7 @@ mod tests {
     fn ffmpeg_resolution_env_override_and_tools_folder() {
         let dir = unique_temp_dir("ff-resolve");
         std::fs::create_dir_all(dir.join("tools").join("ffmpeg")).unwrap();
-        let tools_ff = dir
-            .join("tools")
-            .join("ffmpeg")
-            .join(ffmpeg_exe_name());
+        let tools_ff = dir.join("tools").join("ffmpeg").join(ffmpeg_exe_name());
         std::fs::write(&tools_ff, b"fake").unwrap();
         // Env override wins (PATH may contain a real ffmpeg on this
         // machine; the override test is order-independent either way).
@@ -629,13 +709,26 @@ mod tests {
                 .success()
         };
         assert!(mk(&[
-            "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
             video.to_str().unwrap()
         ]));
         assert!(mk(&[
-            "-y", "-f", "lavfi", "-i", "sine=frequency=440:d=1",
-            "-c:a", "aac", audio.to_str().unwrap()
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:d=1",
+            "-c:a",
+            "aac",
+            audio.to_str().unwrap()
         ]));
         let out = dir.join("merged.mp4");
         merge_av(&ffmpeg, &video, &audio, &out).unwrap();
@@ -741,6 +834,148 @@ mod tests {
         let out3 = dir.join("audio3.m4a");
         assert!(extract_audio(&ffmpeg, &bad, &out3).is_err());
         assert!(!out3.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_audio_as_reencodes_to_mp3_and_opus() {
+        // Round 11 extension, feature 13: an mp3 target gets a
+        // real mp3 file (libmp3lame re-encode when the AAC source
+        // cannot be copied into mp3), an opus target a real opus
+        // file. Needs a real ffmpeg; skipped otherwise.
+        let ffmpeg = match find_on_path(ffmpeg_exe_name()) {
+            Some(p) => p,
+            None => return,
+        };
+        let dir = unique_temp_dir("extract-as");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |args: &[&str]| {
+            Command::new(&ffmpeg)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let muxed = dir.join("muxed.mp4");
+        assert!(mk(&[
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:d=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            muxed.to_str().unwrap()
+        ]));
+        let probe = |path: &Path| {
+            let out = Command::new(&ffmpeg)
+                .arg("-i")
+                .arg(path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stderr).to_string()
+        };
+        let mp3 = dir.join("audio.mp3");
+        extract_audio_as(&ffmpeg, &muxed, &mp3, "mp3").unwrap();
+        assert!(mp3.is_file());
+        let info = probe(&mp3);
+        assert!(info.contains("Audio: mp3"), "mp3 probe: {info}");
+        assert!(!info.contains("Video:"), "mp3 must be audio-only: {info}");
+        let opus = dir.join("audio.opus");
+        extract_audio_as(&ffmpeg, &muxed, &opus, "opus").unwrap();
+        assert!(opus.is_file());
+        let info = probe(&opus);
+        assert!(info.contains("Audio: opus"), "opus probe: {info}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_tracks_muxes_subtitles_and_title_metadata() {
+        // Round 11 extension, features 2 + 12: a muxed video +
+        // a WebVTT file merge into an mp4 carrying a mov_text
+        // subtitle stream tagged with its language, plus the
+        // title metadata. Needs a real ffmpeg; skipped otherwise.
+        let ffmpeg = match find_on_path(ffmpeg_exe_name()) {
+            Some(p) => p,
+            None => return,
+        };
+        let dir = unique_temp_dir("merge-subs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |args: &[&str]| {
+            Command::new(&ffmpeg)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let muxed = dir.join("muxed.mp4");
+        assert!(mk(&[
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:d=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            muxed.to_str().unwrap()
+        ]));
+        let vtt = dir.join("subs.vtt");
+        std::fs::write(&vtt, "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n").unwrap();
+        let out = dir.join("merged.mp4");
+        merge_tracks(
+            &ffmpeg,
+            &muxed,
+            None,
+            Some((&vtt, "en")),
+            Some("Test Title"),
+            &out,
+        )
+        .unwrap();
+        assert!(out.is_file());
+        let probe = Command::new(&ffmpeg)
+            .arg("-i")
+            .arg(&out)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        let info = String::from_utf8_lossy(&probe.stderr);
+        assert!(info.contains("Video:"), "video kept: {info}");
+        assert!(info.contains("Audio:"), "muxed audio kept: {info}");
+        assert!(
+            info.contains("Subtitle: mov_text"),
+            "subtitle muxed as mov_text: {info}"
+        );
+        assert!(
+            info.contains("title") && info.contains("Test Title"),
+            "title metadata written: {info}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

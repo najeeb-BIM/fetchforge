@@ -1,13 +1,17 @@
 <!doctype html><html><head><meta charset="utf-8"><style>body{font-family:system-ui;width:320px;padding:12px}input,button{width:100%;margin:4px 0;padding:8px;box-sizing:border-box}button{background:#22c55e;border:0;border-radius:6px;font-weight:600;cursor:pointer}.media-row{display:flex;gap:8px;align-items:center;margin:6px 0}.media-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}.media-btn{width:auto;flex:none;margin:0;padding:6px 10px;font-size:13px}</style></head>
 <body><h3>FetchForge</h3><p id="status">Checking…</p>
 <label style="font-size:13px"><input type="checkbox" id="adBlock" style="width:auto" checked> Block ads &amp; popups on streaming sites</label>
+<label style="font-size:13px"><input type="checkbox" id="clipboardWatch" style="width:auto"> Watch clipboard for media links (offers them, never downloads)</label>
+<p id="clipboardStatus" style="font-size:13px;margin:6px 0 0"></p>
+<label style="font-size:13px"><input type="checkbox" id="interceptDownloads" style="width:auto"> Take over browser downloads of video/audio files</label>
 <p id="streamDetectStatus" style="font-size:13px;margin:6px 0 0">Full stream detection: checking…</p>
 <button id="streamDetectEnable" style="display:none">Enable full stream detection</button>
 <hr><h4>Media on this page</h4>
 <p id="mediaStatus">Looking for media…</p>
 <div id="mediaList"></div>
 <div id="mediaBatch" style="display:none"><label style="font-size:13px"><input type="checkbox" id="mediaSelectAll" style="width:auto"> Select all</label>
-<button id="mediaDownloadSelected">Download selected</button></div>
+<button id="mediaDownloadSelected">Download selected</button>
+<button id="mediaDownloadAll">Download all</button></div>
 <hr><input id="url" placeholder="Paste a download link">
 <input id="filename" placeholder="Filename (optional)">
 <button id="send">Send to FetchForge</button>

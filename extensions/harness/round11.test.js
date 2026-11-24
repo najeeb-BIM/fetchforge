@@ -112,13 +112,21 @@ function makeFloatOverlayC() {
     popupSubtitle: { textContent: "", style: { display: "none" } },
     popupBody: { textContent: "", children: [], appendChild(c) { this.children.push(c); } },
     filenameInput: { value: "" },
+    // Round 11 extension, features 2/4/13: the popup-chrome
+    // option selects (mirrors createFloatingButton's return).
+    langRow: { style: { display: "none" } },
+    langSelect: { value: "", textContent: "", appendChild() {} },
+    subRow: { style: { display: "none" } },
+    subList: { textContent: "", appendChild() {}, querySelectorAll() { return []; } },
+    fmtRow: { style: { display: "none" } },
+    fmtSelect: { value: "m4a" },
   };
 }
 const ctxC = makeContext(
   {
     document: {
       title: "The Odyssey · NOVA",
-      createElement: () => ({ dataset: {}, style: {}, textContent: "", title: "", addEventListener: () => {} }),
+      createElement: () => ({ dataset: {}, style: {}, textContent: "", title: "", appendChild: () => {}, addEventListener: () => {} }),
     },
     window: {
       setTimeout: (fn) => { pendingTimersC.push({ fn: fn }); return pendingTimersC.length; },
@@ -135,7 +143,7 @@ const ctxC = makeContext(
     + "globalThis.__popupRows = function () { return popupRows; };\n"
     + "globalThis.__popupOpen = function () { return popupOpen; };\n"
     + "function pickAndSend(btn, dl, opts) { opts = opts || {}; if (!opts.filename) opts.filename = currentPopupFilename(); globalThis.__sendCalls.push({ btn: btn, dl: dl, opts: opts }); return Promise.resolve({ ok: true }); }\n",
-    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename", "sortFormatsForPopup", "isDashUrl"], 2),
+    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "configurePopupOptions", "currentPopupOptions", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename", "sortFormatsForPopup", "isDashUrl"], 2),
   ]
 );
 ctxC.__sendCalls = sendCallsC;

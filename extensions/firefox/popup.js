@@ -105,6 +105,13 @@ document.getElementById("mediaDownloadSelected").onclick = async () => {
     ? "Sent " + sent + " item" + (sent === 1 ? "" : "s") + "."
     : "Sent " + sent + " of " + boxes.length + " selected.";
 };
+// Round 11 extension, feature 5: batch download — check every
+// item on the page and send them all through the same selected
+// path (one sendUrl per item; the app queues each).
+document.getElementById("mediaDownloadAll").onclick = () => {
+  document.querySelectorAll(".media-check").forEach((b) => { b.checked = true; });
+  document.getElementById("mediaDownloadSelected").click();
+};
 async function refresh() {
   const s = await getStorage("token");
   const token = s.token;
@@ -214,7 +221,63 @@ document.getElementById("streamDetectEnable").onclick = async () => {
   status.textContent = granted ? "Full stream detection enabled." : "Full stream detection stayed off — detection still works, but some hidden streams may be missed.";
   refreshStreamDetect();
 };
+// Clipboard monitoring (round 11 extension, feature 6): opt-in,
+// default OFF. Enabling requests the optional clipboardRead
+// permission (a user gesture is required, so the popup is the
+// only place it can happen); declining leaves the toggle off.
+// The background polls the clipboard once a minute and offers
+// any media URL in the app's Media Detector panel — it never
+// starts a download on its own.
+async function refreshClipboardWatch() {
+  const box = document.getElementById("clipboardWatch");
+  const statusEl = document.getElementById("clipboardStatus");
+  if (!box) return;
+  let enabled = false;
+  try {
+    const s = await getStorage("clipboardWatch");
+    if (typeof s.clipboardWatch === "boolean") enabled = s.clipboardWatch;
+  } catch (_) {}
+  box.checked = enabled;
+  if (statusEl) statusEl.textContent = enabled
+    ? "Clipboard monitoring: on. Copied media links appear in the app's Media Detector — nothing downloads on its own."
+    : "";
+}
+document.getElementById("clipboardWatch").onchange = async (e) => {
+  const enabled = e.target.checked;
+  if (enabled) {
+    let granted = false;
+    try { granted = await permissionsRequest({ permissions: ["clipboardRead"] }); } catch (_) { granted = false; }
+    if (!granted) {
+      e.target.checked = false;
+      status.textContent = "Clipboard monitoring stayed off — the clipboard permission was not granted.";
+      return;
+    }
+  }
+  await setStorage({ clipboardWatch: enabled });
+  refreshClipboardWatch();
+};
+// Browser download interception (round 11 extension, feature
+// 14): opt-in, default OFF. When on, the background pauses a
+// browser-initiated download of a video/audio file, sends it to
+// FetchForge, and cancels the browser copy once the app takes
+// it; any failure resumes the browser download. No extra
+// permission is needed: `downloads` is already granted.
+async function refreshInterceptDownloads() {
+  const box = document.getElementById("interceptDownloads");
+  if (!box) return;
+  let enabled = false;
+  try {
+    const s = await getStorage("interceptDownloads");
+    if (typeof s.interceptDownloads === "boolean") enabled = s.interceptDownloads;
+  } catch (_) {}
+  box.checked = enabled;
+}
+document.getElementById("interceptDownloads").onchange = async (e) => {
+  await setStorage({ interceptDownloads: e.target.checked });
+};
 refresh();
 refreshMedia();
 refreshAdBlock();
 refreshStreamDetect();
+refreshClipboardWatch();
+refreshInterceptDownloads();

@@ -338,13 +338,21 @@ function makeFloatOverlay() {
     popupSubtitle: { textContent: "", style: { display: "none" } },
     popupBody: body,
     filenameInput: { value: "" },
+    // Round 11 extension, features 2/4/13: the popup-chrome
+    // option selects (mirrors createFloatingButton's return).
+    langRow: { style: { display: "none" } },
+    langSelect: { value: "", textContent: "", appendChild() {} },
+    subRow: { style: { display: "none" } },
+    subList: { textContent: "", appendChild() {}, querySelectorAll() { return []; } },
+    fmtRow: { style: { display: "none" } },
+    fmtSelect: { value: "m4a" },
   };
 }
 const ctx4 = makeContext(
   {
     document: {
       title: "The Odyssey | NovaHD",
-      createElement: () => ({ dataset: {}, style: {}, textContent: "", title: "", addEventListener: () => {} }),
+      createElement: () => ({ dataset: {}, style: {}, textContent: "", title: "", appendChild: () => {}, addEventListener: () => {} }),
     },
     window: {
       setTimeout: (fn) => { pendingTimers.push({ fn: fn }); return pendingTimers.length; },
@@ -361,7 +369,7 @@ const ctx4 = makeContext(
     + "globalThis.__popupRows = function () { return popupRows; };\n"
     + "globalThis.__popupOpen = function () { return popupOpen; };\n"
     + "function pickAndSend(btn, dl, opts) { opts = opts || {}; if (!opts.filename) opts.filename = currentPopupFilename(); globalThis.__sendCalls.push({ btn: btn, dl: dl, opts: opts }); return Promise.resolve({ ok: true }); }\n",
-    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename", "sortFormatsForPopup", "isDashUrl"], 2),
+    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "configurePopupOptions", "currentPopupOptions", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename", "sortFormatsForPopup", "isDashUrl"], 2),
   ]
 );
 ctx4.__sendCalls = sendCalls4;
@@ -563,7 +571,7 @@ const ctx6 = makeContext(
   {
     document: {
       title: "The Odyssey | NovaHD",
-      createElement: () => ({ dataset: {}, style: {}, textContent: "", title: "", addEventListener: () => {} }),
+      createElement: () => ({ dataset: {}, style: {}, textContent: "", title: "", appendChild: () => {}, addEventListener: () => {} }),
     },
     window: { setTimeout: () => 1, clearTimeout: () => {} },
   },
@@ -572,7 +580,7 @@ const ctx6 = makeContext(
     + "globalThis.__popupRows = function () { return popupRows; };\n"
     + "function capturedTextFor(url) { return undefined; }\n"
     + "function pickAndSend(btn, dl, opts) { opts = opts || {}; if (!opts.filename) opts.filename = currentPopupFilename(); globalThis.__sendCalls.push({ btn: btn, dl: dl, opts: opts }); return Promise.resolve({ ok: true }); }\n",
-    extractMany(contentSrc, ["openHlsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename"], 2),
+    extractMany(contentSrc, ["openHlsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "configurePopupOptions", "currentPopupOptions", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename"], 2),
   ]
 );
 ctx6.__sendCalls = sendCalls6;

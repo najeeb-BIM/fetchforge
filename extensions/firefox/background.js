@@ -92,14 +92,14 @@ async function verifyServer(token) {
   for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ j.hmac.charCodeAt(i);
   return diff === 0;
 }
-async function sendViaBridge(url, filename, referer, audioUrl, formatId, manifestText, audioOnly) {
+async function sendViaBridge(url, filename, referer, audioUrl, formatId, manifestText, audioOnly, audioLang, subtitleLangs, audioFormat) {
   const token = await getToken();
   if (!token) throw new Error("no-token");
   if (!(await verifyServer(token))) throw new Error("challenge-failed");
   const r = await fetch(BRIDGE + "/downloads", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-FetchForge-Token": token },
-    body: JSON.stringify({ url, filename, referer, audio_url: audioUrl, format_id: formatId, manifest_text: manifestText, audio_only: audioOnly }),
+    body: JSON.stringify({ url, filename, referer, audio_url: audioUrl, format_id: formatId, manifest_text: manifestText, audio_only: audioOnly, audio_lang: audioLang, subtitle_langs: subtitleLangs, audio_format: audioFormat }),
   });
   if (!r.ok) throw new Error("bridge-" + r.status);
   // The bridge answers 202 once the download is queued;
@@ -116,11 +116,11 @@ async function sendViaBridge(url, filename, referer, audioUrl, formatId, manifes
   if (rec && rec.duplicate) return { ok: true, duplicate: true };
   return { ok: true };
 }
-async function sendViaNative(url, filename, referer, audioUrl, formatId, manifestText, audioOnly) {
+async function sendViaNative(url, filename, referer, audioUrl, formatId, manifestText, audioOnly, audioLang, subtitleLangs, audioFormat) {
   const resp = await callApi(
     (...a) => api.runtime.sendNativeMessage(...a),
     HOST,
-    { type: "addDownload", url, filename, referer, audio_url: audioUrl, format_id: formatId, manifest_text: manifestText, audio_only: audioOnly }
+    { type: "addDownload", url, filename, referer, audio_url: audioUrl, format_id: formatId, manifest_text: manifestText, audio_only: audioOnly, audio_lang: audioLang, subtitle_langs: subtitleLangs, audio_format: audioFormat }
   );
   if (resp && resp.type === "error") throw new Error(resp.error);
   // Same as the bridge path: the native host forwards the bridge's
@@ -150,12 +150,18 @@ async function sendViaNative(url, filename, referer, audioUrl, formatId, manifes
 // it is dropped here (defence in depth — the content script
 // already caps at capture) and the engine fetches normally.
 // audioOnly is the popup's "Audio only" choice (round 8): the app
-// delivers an audio file instead of the video.
-async function sendDownload(url, filename, referer, audioUrl, formatId, manifestText, audioOnly) {
+// delivers an audio file instead of the video. audioLang /
+// subtitleLangs / audioFormat are the quality popup's option
+// selects (round 11 extension, features 2/4/13): the chosen
+// audio language, the subtitle languages to mux in, and the
+// audio container for an audio-only send. Undefined values are
+// dropped by JSON.stringify, so a plain send carries none of
+// them.
+async function sendDownload(url, filename, referer, audioUrl, formatId, manifestText, audioOnly, audioLang, subtitleLangs, audioFormat) {
   if (!/^https?:\/\//i.test(url)) return { ok: false, error: "Not a web link" };
   if (typeof manifestText === "string" && manifestText.length > 262144) manifestText = undefined;
   try {
-    const r = await sendViaNative(url, filename, referer, audioUrl, formatId, manifestText, audioOnly);
+    const r = await sendViaNative(url, filename, referer, audioUrl, formatId, manifestText, audioOnly, audioLang, subtitleLangs, audioFormat);
     // A real failure reason from the app (not a transport miss):
     // the native host already asked the bridge, so retrying the
     // bridge directly would only fail the same way again.
@@ -165,10 +171,19 @@ async function sendDownload(url, filename, referer, audioUrl, formatId, manifest
     if (r && r.ok === false) return r;
     return r;
   } catch (_) { /* host not installed */ }
-  try { return await sendViaBridge(url, filename, referer, audioUrl, formatId, manifestText, audioOnly); } catch (_) { /* bridge not running / no token */ }
+  try { return await sendViaBridge(url, filename, referer, audioUrl, formatId, manifestText, audioOnly, audioLang, subtitleLangs, audioFormat); } catch (_) { /* bridge not running / no token */ }
   // Documented fallback: let the browser handle it normally, and
   // record it so the popup can say so (not a silent fallback).
-  try { await callApi((...a) => api.downloads.download(...a), { url, saveAs: false }); try { await callApi((...a) => api.storage.local.set(...a), { lastFallback: Date.now() }); } catch (_) {} return { ok: true, viaBrowser: true }; }
+  // Round 11 extension, feature 14: register the URL first, so
+  // download interception does not re-grab a file the extension
+  // itself just handed to the browser (an infinite
+  // pause/cancel loop). The set is capped: a stale entry (the
+  // download never started) only ever lets one later download
+  // of the same URL slip through un-intercepted — fail-open.
+  try {
+    browserFallbackUrls.add(url);
+    if (browserFallbackUrls.size > 100) browserFallbackUrls.delete(browserFallbackUrls.values().next().value);
+    await callApi((...a) => api.downloads.download(...a), { url, saveAs: false }); try { await callApi((...a) => api.storage.local.set(...a), { lastFallback: Date.now() }); } catch (_) {} return { ok: true, viaBrowser: true }; }
   catch (_) { return { ok: false, error: "Could not reach the FetchForge app" }; }
 }
 // Format list for the IDM-style quality popup (round 6, study C1):
@@ -222,6 +237,72 @@ async function getFormats(url, referer) {
     throw e;
   }
   return await r.json();
+}
+// ---- Browser download interception (round 11 extension, feature 14) ----
+// Opt-in, default OFF (the popup's toggle persists
+// `interceptDownloads` in storage.local): when enabled, a
+// browser-initiated download of a media file — video/audio by
+// extension or MIME type — is paused, sent to FetchForge, and
+// cancelled in the browser once the app takes it (IDM/XDM-style).
+// Any failure resumes the browser download (fail-open): the user
+// never loses a download because the app was unreachable.
+// Non-media downloads are never touched. browserFallbackUrls
+// holds URLs the sendDownload fallback handed to the browser, so
+// interception does not re-grab them (an infinite pause/cancel
+// loop); each entry is consumed by the next onCreated for it.
+const browserFallbackUrls = new Set();
+const INTERCEPT_EXTENSIONS = ["mp4", "mkv", "webm", "mov", "avi", "m4v", "3gp", "wmv", "flv", "ts", "m3u8", "mpd", "mp3", "m4a", "opus", "ogg", "flac", "wav", "aac"];
+// Pure: is this download item a media file worth intercepting?
+// MIME type first (a download's extension can lie), then the URL
+// path's extension. Unit-tested by the harness.
+function isInterceptableDownload(item) {
+  if (!item || !item.url || !/^https?:\/\//i.test(item.url)) return false;
+  const mime = String(item.mime || "").toLowerCase();
+  if (mime.indexOf("video/") === 0 || mime.indexOf("audio/") === 0) return true;
+  let path = "";
+  try { path = new URL(item.url).pathname.toLowerCase(); } catch (_) { return false; }
+  const ext = path.split(".").pop();
+  return INTERCEPT_EXTENSIONS.indexOf(ext) !== -1;
+}
+// The download item's own filename (a full path on disk) reduced
+// to its basename — the name the app saves the file under.
+function downloadItemBasename(item) {
+  const raw = String((item && item.filename) || (item && item.url) || "").replace(/\\/g, "/");
+  const base = raw.split("/").pop() || "download";
+  try { return decodeURIComponent(base); } catch (_) { return base; }
+}
+if (api.downloads && api.downloads.onCreated) {
+  api.downloads.onCreated.addListener((item) => {
+    if (!item || !item.url) return;
+    if (browserFallbackUrls.has(item.url)) { browserFallbackUrls.delete(item.url); return; }
+    if (!isInterceptableDownload(item)) return;
+    (async () => {
+      let enabled = false;
+      try {
+        const s = await callApi((...a) => api.storage.local.get(...a), "interceptDownloads");
+        enabled = !!(s && s.interceptDownloads);
+      } catch (_) { enabled = false; }
+      if (!enabled) return;
+      // Pause first: a small file could finish before the app
+      // answers. A pause that fails (already finished) means
+      // there is nothing left to intercept — fail open.
+      try { await callApi((...a) => api.downloads.pause(...a), item.id); } catch (_) { return; }
+      const r = await sendDownload(item.url, downloadItemBasename(item)).catch(() => ({ ok: false }));
+      try {
+        if (r && r.ok) {
+          // The app took it — or the send fell back to the
+          // browser's own downloader, which is already
+          // downloading it: either way the paused original is
+          // cancelled, never resumed (resuming would download
+          // the file twice).
+          await callApi((...a) => api.downloads.cancel(...a), item.id);
+        } else {
+          // Nothing took it: let the browser finish the download.
+          await callApi((...a) => api.downloads.resume(...a), item.id);
+        }
+      } catch (_) { /* the download finished or vanished meanwhile */ }
+    })();
+  });
 }
 api.runtime.onInstalled.addListener(() => {
   try {
@@ -306,6 +387,150 @@ function handleReport(tabId, frameId, items, pageUrl) {
     postDetected(tabId, pageUrl);
   }, 1000));
 }
+// ---- Clipboard monitoring (round 11 extension, feature 6) ----
+// Opt-in, default OFF (the popup's toggle persists
+// `clipboardWatch` in storage.local): when enabled, a 1-minute
+// alarm reads the clipboard and OFFERS any media URL it finds —
+// it never starts a download. The offer lands in the app's Media
+// Detector panel (POST /media/detected) like any detected item,
+// and the user downloads it from there. Dedupe: the
+// last-offered URL is kept in storage.local, so the same
+// clipboard text is offered once, not once a minute.
+// Chromium MV3: a service worker has no document focus, so
+// navigator.clipboard.readText() fails there — the read goes
+// through a short-lived offscreen document (offscreen.html,
+// chromium-only) that reads the clipboard on load and replies.
+// Firefox's background page is a real document and reads
+// directly. The clipboardRead permission is OPTIONAL (manifest
+// optional_permissions); the popup requests it when the user
+// enables the toggle, and the check below verifies it is still
+// granted before every read.
+const CLIPBOARD_ALARM = "fetchforge-clipboard";
+const CLIPBOARD_MEDIA_HOSTS = ["youtube.com", "youtu.be", "vimeo.com", "dailymotion.com", "twitch.tv", "tiktok.com", "instagram.com", "facebook.com", "fb.watch", "x.com", "twitter.com", "soundcloud.com", "reddit.com", "drive.google.com"];
+const CLIPBOARD_MEDIA_EXTENSIONS = ["mp4", "mkv", "webm", "mov", "avi", "m4v", "3gp", "wmv", "flv", "ts", "m3u8", "mpd", "mp3", "m4a", "opus", "ogg", "flac", "wav", "aac"];
+// Finds the first media URL in pasted text: the first http(s)
+// URL whose host is a known media page or whose path names a
+// media file or manifest. Trailing sentence punctuation is
+// stripped (a period after a pasted link is not part of the
+// URL). Returns null when the text carries no media URL.
+// Pure — unit-tested by the harness.
+function extractMediaUrlFromText(text) {
+  const matches = String(text || "").match(/https?:\/\/[^\s"'<>]+/gi) || [];
+  for (const raw of matches) {
+    const url = raw.replace(/[.,;:!?)]+$/, "");
+    let host = "", path = "";
+    try { const u = new URL(url); host = u.hostname.toLowerCase(); path = u.pathname.toLowerCase(); } catch (_) { continue; }
+    if (CLIPBOARD_MEDIA_HOSTS.some((h) => host === h || host.endsWith("." + h))) return url;
+    const ext = path.split(".").pop();
+    if (CLIPBOARD_MEDIA_EXTENSIONS.indexOf(ext) !== -1) return url;
+  }
+  return null;
+}
+async function clipboardPermissionGranted() {
+  try {
+    if (!api.permissions || !api.permissions.contains) return false;
+    if (isFirefox) return await api.permissions.contains({ permissions: ["clipboardRead"] });
+    return await new Promise((resolve) => api.permissions.contains({ permissions: ["clipboardRead"] }, resolve));
+  } catch (_) { return false; }
+}
+// Chromium only: the offscreen document reads the clipboard on
+// load and replies with { type: "clipboardText", text }. The
+// listener is registered BEFORE the document is created, so a
+// fast reply is never missed; the document is closed after the
+// reply (or after 5 s with no reply).
+async function readClipboardTextViaOffscreen() {
+  if (!api.offscreen || !api.offscreen.createDocument) return null;
+  let onMsg = null;
+  try {
+    const text = await new Promise((resolve) => {
+      const timer = setTimeout(() => { cleanup(); resolve(null); }, 5000);
+      function cleanup() {
+        clearTimeout(timer);
+        if (onMsg) { try { api.runtime.onMessage.removeListener(onMsg); } catch (_) {} onMsg = null; }
+      }
+      onMsg = function (msg) {
+        if (msg && msg.type === "clipboardText") { cleanup(); resolve(typeof msg.text === "string" ? msg.text : null); }
+      };
+      api.runtime.onMessage.addListener(onMsg);
+      // Close a stale document from a previous poll first (its
+      // one read already went to that poll's listener), then
+      // create a fresh one — it reads on load and replies here.
+      (async () => {
+        try { await api.offscreen.closeDocument(); } catch (_) {}
+        try {
+          await api.offscreen.createDocument({
+            url: "offscreen.html",
+            reasons: ["CLIPBOARD"],
+            justification: "Read the clipboard for media URLs when clipboard monitoring is enabled.",
+          });
+        } catch (_) { cleanup(); resolve(null); }
+      })();
+    });
+    return text;
+  } catch (_) { return null; }
+  finally {
+    try { await api.offscreen.closeDocument(); } catch (_) {}
+  }
+}
+async function readClipboardText() {
+  // Firefox background page: a real document, so the Clipboard
+  // API works directly. (In a Chromium service worker
+  // navigator.clipboard is undefined and this falls through.)
+  if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.readText) {
+    try { return await navigator.clipboard.readText(); } catch (_) { return null; }
+  }
+  return readClipboardTextViaOffscreen();
+}
+async function offerClipboardUrl(url) {
+  let token = "";
+  try { token = await getToken(); } catch (_) { return; }
+  if (!token) return;
+  try {
+    if (!(await verifyServer(token))) return;
+    await fetch(BRIDGE + "/media/detected", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-FetchForge-Token": token },
+      body: JSON.stringify({ items: [{ kind: "video", url: url, title: "From clipboard", pageUrl: "Clipboard" }] }),
+    });
+  } catch (_) { /* bridge unreachable; the offer is best-effort */ }
+}
+async function checkClipboard() {
+  try {
+    const s = await callApi((...a) => api.storage.local.get(...a), ["clipboardWatch", "lastClipboardOffer"]);
+    if (!s || !s.clipboardWatch) return;
+    if (!(await clipboardPermissionGranted())) return;
+    const text = await readClipboardText();
+    if (!text) return;
+    const url = extractMediaUrlFromText(text);
+    if (!url) return;
+    if (s.lastClipboardOffer === url) return; // already offered
+    await offerClipboardUrl(url);
+    await callApi((...a) => api.storage.local.set(...a), { lastClipboardOffer: url });
+  } catch (_) { /* clipboard reads are best-effort; never break the background */ }
+}
+async function applyClipboardWatchPref() {
+  try {
+    const s = await callApi((...a) => api.storage.local.get(...a), "clipboardWatch");
+    const enabled = !!(s && s.clipboardWatch);
+    if (!api.alarms) return;
+    if (enabled) {
+      await api.alarms.create(CLIPBOARD_ALARM, { periodInMinutes: 1 });
+    } else {
+      await api.alarms.clear(CLIPBOARD_ALARM);
+    }
+  } catch (_) { /* alarms unavailable */ }
+}
+if (api.alarms && api.alarms.onAlarm) {
+  api.alarms.onAlarm.addListener((alarm) => {
+    if (alarm && alarm.name === CLIPBOARD_ALARM) checkClipboard();
+  });
+}
+if (api.storage && api.storage.onChanged) {
+  api.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.clipboardWatch) applyClipboardWatchPref();
+  });
+}
+applyClipboardWatchPref();
 // Ad blocker: apply the stored on/off pref at startup (the ruleset
 // is enabled by default in the manifest; the popup toggle persists
 // the choice in storage.local). Chrome also persists the enabled
@@ -712,7 +937,7 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // the content script captured from the player (round 6).
     if (!_sender || !_sender.tab) { sendResponse({ ok: false, error: "No tab" }); return false; }
     const referer = msg.referer || (_sender && _sender.url) || (_sender.tab && _sender.tab.url) || undefined;
-    sendDownload(msg.url, msg.filename, referer, msg.audioUrl, msg.formatId, msg.manifestText, msg.audioOnly).then((r) => sendResponse({ ok: r.ok, error: r.error, duplicate: r.duplicate, viaBrowser: r.viaBrowser }));
+    sendDownload(msg.url, msg.filename, referer, msg.audioUrl, msg.formatId, msg.manifestText, msg.audioOnly, msg.audioLang, msg.subtitleLangs, msg.audioFormat).then((r) => sendResponse({ ok: r.ok, error: r.error, duplicate: r.duplicate, viaBrowser: r.viaBrowser }));
     return true;
   }
   if (msg && msg.type === "getFormats") {

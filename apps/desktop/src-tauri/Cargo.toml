@@ -14,5 +14,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [profile.release]
-lto = true
-codegen-units = 1
+# Thin LTO + 16 codegen units. Fat LTO with a single codegen unit was the
+# previous setting; it exhausts the 7 GB GitHub-hosted runner during the
+# final link of the desktop app (three round-11 runs died identically ~45
+# min into the build step, runner unresponsive, no logs). Thin LTO keeps
+# cross-crate inlining with a fraction of the link-time memory. Do not
+# restore fat LTO + codegen-units = 1 without a larger runner.
+lto = "thin"
+codegen-units = 16

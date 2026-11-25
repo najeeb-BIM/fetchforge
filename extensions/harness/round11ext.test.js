@@ -20,7 +20,7 @@ const bgSrc = readSource("extensions/chromium/background.js");
 // ---------- Context A: HLS master parsing + format ladder ----------
 const ctxA = makeContext(
   {},
-  [extractMany(contentSrc, ["parseHlsMaster", "parseHlsAttrs", "resolveAgainst", "friendlyCodec", "formatBandwidth", "hlsVariantHeight", "sortFormatsForPopup"], 2)]
+  [extractMany(contentSrc, ["parseHlsMaster", "parseHlsAttrs", "resolveAgainst", "friendlyCodec", "formatBandwidth", "hlsVariantHeight", "sortFormatsForPopup", "visibleFormatLabel", "effectiveFormatHeight"], 2)]
 );
 
 // novahd-style master: 7 audio renditions in ONE group, 2

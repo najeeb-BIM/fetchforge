@@ -3,7 +3,7 @@
 // ranking (item 8), formats dedupe (item 10), junk-title
 // auto-fill (item 11), formats-failure reasons (item 12),
 // browser identity for the paired count (item 15), and the
-// 0.2.11 manifest + chromium/firefox byte-identity checks.
+// 0.2.12 manifest + chromium/firefox byte-identity checks.
 // Every function under test is the exact source extracted from
 // extensions/chromium/content.js / background.js — see extract.js.
 "use strict";
@@ -30,7 +30,9 @@ const ctxA = makeContext(
     + "function findPlaylistFromResources() { return null; }\n"
     + "function findStreamUrlFromResources() { return null; }\n",
     extractConst(contentSrc, "STREAM_EXT_RE", 2) + "\n",
-    extractMany(contentSrc, ["qualityHintScore", "mediaSource", "sameDirectoryEncodes", "resolveUrl", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "isStreamLikeName", "sanitizeFilenameStem", "popupDefaultName", "stemOfFilename", "sortFormatsForPopup"], 2),
+    extractConst(contentSrc, "PLAYER_FAILURE_RE", 2) + "\n",
+    extractConst(contentSrc, "PLAYER_FAILURE_TEXT_MAX", 2) + "\n",
+    extractMany(contentSrc, ["qualityHintScore", "mediaSource", "findPlayerFailure", "sameDirectoryEncodes", "resolveUrl", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "isStreamLikeName", "sanitizeFilenameStem", "popupDefaultName", "stemOfFilename", "sortFormatsForPopup", "visibleFormatLabel", "effectiveFormatHeight"], 2),
   ]
 );
 function setDocA(title, qs) {
@@ -202,7 +204,7 @@ const ctxB = makeContext(
   [
     "let popupOpen = false;\nlet popupRows = [];\nlet popupRequestId = 0;\nlet floatOverlay = null;\nlet currentDownload = null;\n"
     + "globalThis.__popupOpen = function () { return popupOpen; };\n",
-    extractMany(contentSrc, ["sendCurrentDownload", "pickAndSend", "showPopupSendError", "closeQualityPopup", "currentPopupOptions", "currentPopupFilename", "defaultFilenameFor", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "isStreamLikeName", "stemOfFilename", "sanitizeFilenameStem", "isManifestUrl", "shortFailureReason", "setPopupNote", "legalAlternativeNote", "isAccessRestrictedReason"], 2),
+    extractMany(contentSrc, ["sendCurrentDownload", "pickAndSend", "verdictMatchesPage", "showPopupSendError", "closeQualityPopup", "currentPopupOptions", "currentPopupFilename", "defaultFilenameFor", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "isStreamLikeName", "stemOfFilename", "sanitizeFilenameStem", "isManifestUrl", "shortFailureReason", "setPopupNote", "legalAlternativeNote", "isAccessRestrictedReason"], 2),
   ]
 );
 function makeOverlayB(filename) {
@@ -316,7 +318,7 @@ const ctxC = makeContext(
     + "function openFormatsPopup(btn, dl) { __calls.formats.push({ btn: btn, dl: dl }); popupOpen = true; }\n"
     + "function openSimplePopup(btn, dl) { __calls.simple.push({ btn: btn, dl: dl }); popupOpen = true; }\n"
     + "function sendCurrentDownload(btn, dl, opts) { __calls.send.push({ btn: btn, dl: dl, opts: opts }); }\n",
-    extractMany(contentSrc, ["onOverlayClick", "parseHlsMaster", "parseHlsAttrs", "resolveAgainst", "friendlyCodec", "formatBandwidth", "hlsVariantHeight", "probeDirectFileDuration", "parseMp4Duration", "isManifestUrl", "isDashUrl", "isMp4FamilyUrl", "isVideoFileUrl", "isOneClickFileUrl"], 2),
+    extractMany(contentSrc, ["onOverlayClick", "verdictMatchesPage", "parseHlsMaster", "parseHlsAttrs", "resolveAgainst", "friendlyCodec", "formatBandwidth", "hlsVariantHeight", "probeDirectFileDuration", "parseMp4Duration", "isManifestUrl", "isDashUrl", "isMp4FamilyUrl", "isVideoFileUrl", "isOneClickFileUrl"], 2),
   ]
 );
 function clickC(dl) {
@@ -356,7 +358,7 @@ const ctxD = makeContext(
     + extractConst(bgSrc, "BG_MASTER_STEM_RE", 0) + "\n"
     + extractConst(bgSrc, "BG_AUDIO_STEM_RE", 0) + "\n"
     + extractConst(bgSrc, "OBSERVED_TTL_MS", 0) + "\n",
-    extractMany(bgSrc, ["bgManifestKind", "bestDownloadSource"], 0),
+    extractMany(bgSrc, ["bgManifestKind", "bestDownloadSource", "samePage"], 0),
   ]
 );
 function verdictD(frames, observed) {
@@ -514,10 +516,10 @@ test("Item 15: getBrowserId is stable across calls and stored once", async () =>
 });
 
 // ---------- Manifests + byte identity ----------
-test("Manifests are at 0.2.11 in both browsers", () => {
+test("Manifests are at 0.2.12 in both browsers", () => {
   for (const name of ["chromium", "firefox"]) {
     const m = JSON.parse(readSource("extensions/" + name + "/manifest.json"));
-    assertEq(m.version, "0.2.11", name + " version");
+    assertEq(m.version, "0.2.12", name + " version");
   }
 });
 

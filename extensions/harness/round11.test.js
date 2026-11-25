@@ -29,7 +29,7 @@ const ctxA = makeContext(
     + "function openFormatsPopup(btn, dl) { __calls.formats.push({ btn: btn, dl: dl }); popupOpen = true; }\n"
     + "function openSimplePopup(btn, dl) { __calls.simple.push({ btn: btn, dl: dl }); popupOpen = true; }\n"
     + "function sendCurrentDownload(btn, dl, opts) { __calls.send.push({ btn: btn, dl: dl, opts: opts }); }\n",
-    extractMany(contentSrc, ["onOverlayClick", "parseHlsMaster", "parseHlsAttrs", "resolveAgainst", "friendlyCodec", "formatBandwidth", "hlsVariantHeight", "probeDirectFileDuration", "parseMp4Duration", "isManifestUrl", "isDashUrl", "isMp4FamilyUrl", "isVideoFileUrl", "isOneClickFileUrl"], 2),
+    extractMany(contentSrc, ["onOverlayClick", "verdictMatchesPage", "parseHlsMaster", "parseHlsAttrs", "resolveAgainst", "friendlyCodec", "formatBandwidth", "hlsVariantHeight", "probeDirectFileDuration", "parseMp4Duration", "isManifestUrl", "isDashUrl", "isMp4FamilyUrl", "isVideoFileUrl", "isOneClickFileUrl"], 2),
   ]
 );
 function clickA(dl) {
@@ -143,7 +143,7 @@ const ctxC = makeContext(
     + "globalThis.__popupRows = function () { return popupRows; };\n"
     + "globalThis.__popupOpen = function () { return popupOpen; };\n"
     + "function pickAndSend(btn, dl, opts) { opts = opts || {}; if (!opts.filename) opts.filename = currentPopupFilename(); globalThis.__sendCalls.push({ btn: btn, dl: dl, opts: opts }); return Promise.resolve({ ok: true }); }\n",
-    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "configurePopupOptions", "currentPopupOptions", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "isStreamLikeName", "stemOfFilename", "sortFormatsForPopup", "isDashUrl", "resolutionFromFormat", "singleFormatRowLabel", "legalAlternativeNote", "isAccessRestrictedReason", "setPopupNote"], 2),
+    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "configurePopupOptions", "currentPopupOptions", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "isStreamLikeName", "stemOfFilename", "sortFormatsForPopup", "visibleFormatLabel", "effectiveFormatHeight", "isDashUrl", "resolutionFromFormat", "singleFormatRowLabel", "legalAlternativeNote", "isAccessRestrictedReason", "setPopupNote"], 2),
   ]
 );
 ctxC.__sendCalls = sendCallsC;
@@ -186,7 +186,7 @@ test("Item 2: a hash-like server title does not overwrite the filename pre-fill"
 // ---------- Context D: sortFormatsForPopup visible identity (item 3) ----------
 const ctxD = makeContext(
   {},
-  [extractMany(contentSrc, ["sortFormatsForPopup"], 2)]
+  [extractMany(contentSrc, ["sortFormatsForPopup", "visibleFormatLabel", "effectiveFormatHeight"], 2)]
 );
 
 test("Item 3: sortFormatsForPopup dedupes 140/140-drc, keeps 233/234", () => {
@@ -240,7 +240,9 @@ const ctxE = makeContext(
     + "function findPlaylistFromResources() { return null; }\n"
     + "function findStreamUrlFromResources() { return null; }\n",
     extractConst(contentSrc, "STREAM_EXT_RE", 2) + "\n",
-    extractMany(contentSrc, ["mediaSource", "sameDirectoryEncodes", "qualityHintScore", "resolveUrl"], 2),
+    extractConst(contentSrc, "PLAYER_FAILURE_RE", 2) + "\n",
+    extractConst(contentSrc, "PLAYER_FAILURE_TEXT_MAX", 2) + "\n",
+    extractMany(contentSrc, ["mediaSource", "findPlayerFailure", "sameDirectoryEncodes", "qualityHintScore", "resolveUrl"], 2),
   ]
 );
 

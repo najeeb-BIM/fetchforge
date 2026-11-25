@@ -296,6 +296,49 @@
     return out;
   }
 
+  // Round 13, item 4: does this video's player show a failure
+  // message? PrimeWire's player fails WITHOUT setting
+  // video.error (a custom/MSE player that fails at the fetch
+  // level and paints "Sorry, the video player failed to load.
+  // (Error Code: 101102)" in its own overlay), so the round-12
+  // el.error check never fired and the popup offered the bare
+  // page URL as a download. The failure text lives in the
+  // player's own overlay — a sibling of the <video> or a child
+  // of a nearby player container — so the search walks the
+  // video's ancestors (up to four levels) and their direct
+  // children, and stops at <body>: it NEVER reads page-wide
+  // text, so the same words in a comment, description, or title
+  // elsewhere on the page do not flag a healthy player. A
+  // container is only read when its text is short (an overlay
+  // is a sentence, not an article), which keeps a big wrapper
+  // from matching on unrelated words.
+  const PLAYER_FAILURE_RE = /unable to play|failed to load|error code|player (failed|error)|video (could not|failed to)|playback (failed|error)|something went wrong|this video (is unavailable|cannot be played)/i;
+  const PLAYER_FAILURE_TEXT_MAX = 600;
+  function findPlayerFailure(el) {
+    if (!el) return false;
+    if (PLAYER_FAILURE_RE.test(el.textContent || "")) return true;
+    let node = el.parentElement;
+    let depth = 0;
+    while (node && depth < 4) {
+      if (node === document.body || node === document.documentElement) break;
+      const text = node.textContent || "";
+      if (text && text.length <= PLAYER_FAILURE_TEXT_MAX && PLAYER_FAILURE_RE.test(text)) return true;
+      // The overlay is often a direct child of a container whose
+      // own text is long (player + sidebar + controls): check the
+      // children one by one instead of the whole container.
+      if (node.children) {
+        for (const child of node.children) {
+          if (child === el) continue;
+          const t = child.textContent || "";
+          if (t && t.length <= PLAYER_FAILURE_TEXT_MAX && PLAYER_FAILURE_RE.test(t)) return true;
+        }
+      }
+      node = node.parentElement;
+      depth++;
+    }
+    return false;
+  }
+
   function mediaSource(el) {
     const candidates = [];
     if (el.currentSrc) candidates.push(el.currentSrc);
@@ -388,7 +431,14 @@
       // sending the site's home address to the engine (which
       // refuses it). A healthy blob player (YouTube) has no error
       // and still returns the plain viaPage source below.
-      if (el.error) return { url: null, viaPage: true, noStream: true };
+      // Round 13, item 4: the same flag when the player PAINTS its
+      // failure instead of setting video.error — PrimeWire's
+      // custom player fails at the fetch level and shows the
+      // failure in its own overlay while el.error stays unset.
+      // findPlayerFailure reads only the player container, never
+      // the whole page, so matching words elsewhere do not flag
+      // a healthy player.
+      if (el.error || findPlayerFailure(el)) return { url: null, viaPage: true, noStream: true };
       return { url: null, viaPage: true };
     }
     return null;
@@ -1423,6 +1473,30 @@
   // closing silently (YesMovies). On success — or a duplicate /
   // viaBrowser outcome, which the button reports honestly — the
   // popup closes; on failure it stays open with the error.
+  // Round 13, item 3: does this verdict belong to the page the
+  // user is looking at RIGHT NOW? The background tags every
+  // verdict with the tab URL it was elected for (pageUrl). A
+  // verdict for another page is stale — the tab has navigated
+  // since the election, most often by a pushState/SPA navigation
+  // that fires no tab event for the background to clear on — and
+  // its URL must never be sent, however fresh currentDownload
+  // looks. The comparison is origin + path: query strings and
+  // hashes (tracking params, player state) do not make a page a
+  // different film. A verdict with no page tag (older background,
+  // or a verdict built before tagging) passes: the check only
+  // refuses what it can prove stale.
+  function verdictMatchesPage(dl) {
+    const pu = (dl && dl.pageUrl) || "";
+    if (!pu) return true;
+    try {
+      const a = new URL(pu);
+      const b = new URL(window.location.href);
+      return a.origin === b.origin && a.pathname === b.pathname;
+    } catch (_) {
+      return pu === window.location.href;
+    }
+  }
+
   function pickAndSend(btn, dl, opts) {
     opts = opts || {};
     // Round 12, item 9 (LookMovie wrong-film send): the popup's
@@ -1437,7 +1511,13 @@
     // re-validate at pick time: refuse, close the popup, and tell
     // the user to click again for the new stream. Nothing is
     // sent on this path.
-    if (popupOpen && dl && dl.url && (!currentDownload || !currentDownload.url || dl.url !== currentDownload.url)) {
+    // Round 13, item 3: the URL comparison alone is not enough —
+    // currentDownload itself can be the stale verdict (it still
+    // IS the MoviesJoy URL at pick time), so the pick must also
+    // prove the verdict belongs to THIS page. An SPA navigation
+    // changes location.href without any background event; the
+    // page tag is the only thing that catches it here.
+    if (popupOpen && dl && dl.url && (!verdictMatchesPage(dl) || !currentDownload || !currentDownload.url || dl.url !== currentDownload.url)) {
       closeQualityPopup();
       btn.textContent = "Stream changed — try again";
       btn.title = "The stream changed while the popup was open. Click the button again to pick from the new stream.";
@@ -1489,6 +1569,24 @@
     // closes it instead of sending.
     if (popupOpen) { closeQualityPopup(); return; }
     const dl = currentDownload;
+    // Round 13, item 3: the verdict may belong to a page the tab
+    // has since left (SPA navigation — no background event, so
+    // the verdict was never cleared). Opening a popup for it
+    // would offer the previous film's qualities and send its
+    // URL on pick. Refuse on the button instead, like the
+    // noStream refusal below, and drop the stale verdict so the
+    // next click re-reads the election for this page.
+    if (!verdictMatchesPage(dl)) {
+      currentDownload = null;
+      btn.textContent = "Stream changed — try again";
+      btn.title = "The stream changed while the popup was open. Click the button again to pick from the new stream.";
+      window.setTimeout(function () {
+        btn.disabled = false;
+        btn.textContent = "↓ FetchForge";
+        btn.title = "";
+      }, 5000);
+      return;
+    }
     // Round 12, item 10: the elected verdict is a FAILED player
     // (PrimeWire: "Unable to play media", no stream ever loaded).
     // Its URL is the bare page address — sending it would queue
@@ -2043,22 +2141,51 @@
   // highest-first (height, then bitrate), audio-only rows last.
   // The server already sorts best-first; this is defence in depth
   // (and the unit under test for the ladder order).
+  //
+  // Round 13, item 5: the dedupe key is the VISIBLE identity
+  // only — what the user sees in the row. The round-12 key still
+  // carried invisible measurements (bitrate, size), so YouTube
+  // codec twins at one height survived as identical rows: Big
+  // Buck Bunny 4K 60fps showed the same size-less "1080p 60fps ·
+  // mp4 · video only (merged with best audio)" row twice (formats
+  // 299 avc and 390 av01, different vbr) and the 144p row three
+  // times, at every height from 240p to 1080p. The rows show no
+  // bitrate, so two rows with the same visible label at the same
+  // height are the same choice to the user, whatever their vbr.
+  // The key is therefore the normalised visible label (trailing
+  // size segment stripped, so a sized twin collapses with its
+  // size-less twin) + kind + effective height, where the height
+  // comes from the entry or, failing that, from the label itself
+  // ("720p · …" with no height field). Different heights stay
+  // distinct; the 233/234 audio exemption is untouched (audio
+  // keeps the measured key, and unmeasured audio still skips the
+  // visible dedupe entirely).
+  function visibleFormatLabel(f) {
+    let label = ((f && f.label) || "").trim().replace(/\s+/g, " ");
+    // A trailing size (" · 12 MB", " · ≈1.2 GB", " · ~800 KB") is
+    // part of the label the engine built, not part of the
+    // quality the row offers: strip it so a sized twin and an
+    // unsized twin key the same.
+    label = label.replace(/\s*·\s*[≈~]?\d+(?:\.\d+)?\s*(?:B|KB|MB|GB|TB)$/i, "");
+    return label;
+  }
+  function effectiveFormatHeight(f) {
+    if (f && f.height != null) return f.height;
+    const m = /(\d{3,4})p\b/.exec(visibleFormatLabel(f));
+    return m ? Number(m[1]) : "";
+  }
   function sortFormatsForPopup(formats) {
     // Round 11, item 3: dedupe on visible identity — the same
     // stream can arrive under several format ids (YouTube lists
     // the same m4a audio as both 140 and 140-drc, identical
-    // label/bitrate/size), so id-only dedupe showed it twice
-    // (and merged video rows twice, 144p three times). Keyed on
-    // label + kind + bitrate + size; the first occurrence wins.
+    // label/bitrate/size), so id-only dedupe showed it twice.
     // A format with NO measurement at all (no bitrate, no size)
     // skips the visible dedupe ONLY when it is audio-only: its
     // identity is too thin to prove two entries are the same
     // stream — YouTube's HLS audio entries 233/234 are both
     // "Audio only · mp4" with no bitrate or size yet different
-    // qualities, and must both survive. Round 12, item 3: a
-    // VIDEO entry without measurements dedupes on label + kind +
-    // height instead (see the loop below). The id dedupe stays
-    // as a first pass for every format: the same id is the same
+    // qualities, and must both survive. The id dedupe stays as
+    // a first pass for every format: the same id is the same
     // stream by definition.
     const seen = {};
     const list = [];
@@ -2066,25 +2193,25 @@
       const idKey = (f && f.format_id) ? ("id:" + f.format_id) : "";
       if (idKey && seen[idKey]) continue;
       if (idKey) seen[idKey] = true;
-      // Round 12, item 3: the visible-identity dedupe now applies
-      // to VIDEO entries even without measurements — a merged
-      // video row listed twice with no bitrate/size is still the
-      // same stream when label + kind + height agree, and the
-      // 144p-triple case proved the listing duplicates them.
-      // The exemption stays for AUDIO only: YouTube's HLS audio
-      // entries 233/234 are both "Audio only · mp4" with no
-      // bitrate or size yet different qualities, and must both
-      // survive. A measured format (any kind) keeps the full
-      // label + kind + bitrate + size key.
-      const hasMeasure = f && (f.abr != null || f.vbr != null || f.filesize != null);
       const isAudio = f && f.kind === "audio_only";
-      if (hasMeasure || !isAudio) {
-        const visKey = hasMeasure
-          ? "vis:" + ((f && f.label) || "") + "|" + ((f && f.kind) || "")
+      const hasMeasure = f && (f.abr != null || f.vbr != null || f.filesize != null);
+      if (isAudio) {
+        // Audio keeps the round-11 rule: a measured audio entry
+        // dedupes on label + kind + bitrate + size; an
+        // unmeasured one is exempt (233/234).
+        if (hasMeasure) {
+          const visKey = "vis:" + visibleFormatLabel(f) + "|" + ((f && f.kind) || "")
             + "|" + ((f && f.abr != null) ? f.abr : "") + "|" + ((f && f.vbr != null) ? f.vbr : "")
-            + "|" + ((f && f.filesize != null) ? f.filesize : "")
-          : "vis-nm:" + ((f && f.label) || "") + "|" + ((f && f.kind) || "")
-            + "|" + ((f && f.height != null) ? f.height : "");
+            + "|" + ((f && f.filesize != null) ? f.filesize : "");
+          if (seen[visKey]) continue;
+          seen[visKey] = true;
+        }
+      } else {
+        // Video (any kind that is not audio-only): the visible
+        // identity only — label + kind + effective height. No
+        // bitrate, no size: neither is shown in the row.
+        const visKey = "vis:" + visibleFormatLabel(f) + "|" + ((f && f.kind) || "")
+          + "|" + effectiveFormatHeight(f);
         if (seen[visKey]) continue;
         seen[visKey] = true;
       }
@@ -2763,6 +2890,35 @@
   // above); no scroll/resize tracking is needed, because the
   // button is viewport-anchored, not video-anchored.
 
+  // The overlay-election verdict for this tab (which stream the
+  // top frame's button downloads, or null when no frame has one).
+  // Named (not inline in the listener) so the harness can drive
+  // it directly.
+  function handleOverlayVerdict(msg) {
+    const newDownload = (msg.download && msg.download.url) ? msg.download : null;
+    // Round 13, item 3: a verdict tagged for another page is
+    // stale — the tab navigated (often by pushState, which fires
+    // no tab event) after the election. Drop it instead of
+    // adopting it: adopting it would show the button for the
+    // previous film and let a click send its URL. Only the top
+    // frame checks: a subframe's own location is the iframe URL,
+    // never the tab URL, so the check would false-fire there —
+    // and subframes never show the button or open popups.
+    if (isTopFrame && newDownload && !verdictMatchesPage(newDownload)) {
+      if (popupOpen) closeQualityPopup();
+      currentDownload = null;
+      refreshFloatingButton();
+      return;
+    }
+    // A changed download invalidates any open quality popup:
+    // its rows described the previous stream.
+    if (popupOpen && (!newDownload || !currentDownload || newDownload.url !== currentDownload.url)) {
+      closeQualityPopup();
+    }
+    currentDownload = newDownload;
+    refreshFloatingButton();
+  }
+
   // Popup asks for the media on this tab; background sends the
   // overlay-election verdict for this tab (which stream the top
   // frame's button downloads, or null when no frame has one).
@@ -2770,14 +2926,7 @@
     if (msg && msg.type === "getMedia") {
       sendResponse({ items: collectMedia() });
     } else if (msg && msg.type === "overlayVerdict") {
-      const newDownload = (msg.download && msg.download.url) ? msg.download : null;
-      // A changed download invalidates any open quality popup:
-      // its rows described the previous stream.
-      if (popupOpen && (!newDownload || !currentDownload || newDownload.url !== currentDownload.url)) {
-        closeQualityPopup();
-      }
-      currentDownload = newDownload;
-      refreshFloatingButton();
+      handleOverlayVerdict(msg);
     }
   });
 

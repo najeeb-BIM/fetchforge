@@ -564,8 +564,30 @@ if (api.tabs && api.tabs.onActivated) {
 // rebuilds the state from the next report; frames that stopped
 // reporting are pruned after 12 s. Election state is in memory
 // only — losing it just means buttons show until the next verdict.
-const tabOverlayCandidates = new Map(); // tabId -> Map(frameId -> { candidates, frameUrl, at })
+const tabOverlayCandidates = new Map(); // tabId -> Map(frameId -> { candidates, frameUrl, pageUrl, at })
+// Round 13, item 3: the tab's current top-page URL, tracked so
+// the election can be scoped to the page the user is actually
+// on. Updated on every navigation (tabs.onUpdated) and on every
+// top-frame candidate report (sender URL — this also heals the
+// map after a pushState/SPA navigation, which fires no tab
+// event). The election drops anything tagged for another page;
+// the verdict carries this URL so the content script can refuse
+// a stale verdict at popup-open and pick time too.
+const tabUrlById = new Map(); // tabId -> top-page URL string
 const OVERLAY_CANDIDATE_TTL_MS = 12000;
+// Same page for election purposes: same origin + path. Query
+// strings and hashes (tracking params, player state) do not make
+// a page a different film. Unparseable URLs fail open (kept) —
+// the election must not drop a stream it cannot attribute.
+function samePage(a, b) {
+  try {
+    const ua = new URL(a || "");
+    const ub = new URL(b || "");
+    return ua.origin === ub.origin && ua.pathname === ub.pathname;
+  } catch (_) {
+    return (a || "") === (b || "");
+  }
+}
 function sendToFrame(tabId, frameId, msg) {
   try {
     const p = api.tabs.sendMessage(tabId, msg, { frameId: frameId });
@@ -621,11 +643,20 @@ function bgManifestKind(url) {
 // pageVideoDuration is the longest video duration seen in ANY
 // frame, playing or not, for the content script's clip guard) or
 // null when no frame has a source.
-function bestDownloadSource(tabId, winner) {
+function bestDownloadSource(tabId, winner, tabUrl) {
   const frames = tabOverlayCandidates.get(tabId);
   const all = [];
   if (frames) {
     for (const [fid, entry] of frames.entries()) {
+      // Round 13, item 3: a frame report tagged for another page
+      // is stale — its document navigated away (SPA navigation,
+      // or a report that arrived just before the navigation
+      // clear) and its stream must not win on the new page. An
+      // untagged entry (reported before tagging existed) is kept:
+      // only what can be proved stale is dropped. The tag is the
+      // TOP page URL, so a subframe player (VidFast iframe on
+      // another origin) is kept whenever its page is current.
+      if (tabUrl && entry.pageUrl && !samePage(entry.pageUrl, tabUrl)) continue;
       for (const c of entry.candidates) {
         if (!c.source || !c.source.url) continue;
         all.push({ frameId: fid, frameUrl: entry.frameUrl, cand: c });
@@ -655,6 +686,26 @@ function bestDownloadSource(tabId, winner) {
     }
     for (const rec of observed.values()) {
       if (now - rec.at > OBSERVED_TTL_MS) continue;
+      // Round 13, item 3: an observed finding is tagged with the
+      // page that fetched it (pageUrl, the initiator). When the
+      // tab's current page is known, a finding from another
+      // ORIGIN cannot belong to this page — drop it even before
+      // any frame has reported, which is the window the round-12
+      // origin filter could not cover (it only ran once frames
+      // existed). Origin-level, not page-level: a worker or
+      // service worker may fetch the stream, so its initiator is
+      // the worker URL, not the page URL. An untagged finding is
+      // still governed by the round-12 rules below.
+      if (tabUrl) {
+        const recPage = rec.pageUrl || rec.initiator || "";
+        if (recPage) {
+          let recOrigin = "";
+          let tabOrigin = "";
+          try { recOrigin = new URL(recPage).origin; } catch (_) { recOrigin = ""; }
+          try { tabOrigin = new URL(tabUrl).origin; } catch (_) { tabOrigin = ""; }
+          if (recOrigin && tabOrigin && recOrigin !== tabOrigin) continue;
+        }
+      }
       // Round 12, item 9: an observed finding with NO initiator
       // cannot be attributed to any page — it may be a stale
       // entry from a previous navigation (or a previous tab, on
@@ -738,7 +789,10 @@ function bestDownloadSource(tabId, winner) {
   // Round 12, item 10: carry noStream — a failed player the
   // content script flagged, so the button can say "No stream
   // found" instead of sending the page URL.
-  return { url: s.url, filename: s.filename, audioUrl: s.audioUrl, referer: best.frameUrl, viaPage: !!s.viaPage, manifestText: s.manifestText, masterText: s.masterText, pageVideoDuration: pageVideoDuration, kind: s.kind || (isPlaylist(best) ? "playlist" : "file"), noStream: !!s.noStream };
+  // Round 13, item 3: carry pageUrl — the tab URL this verdict
+  // was elected for, so the content script can refuse a verdict
+  // for a page the tab has since left (popup-open and pick time).
+  return { url: s.url, filename: s.filename, audioUrl: s.audioUrl, referer: best.frameUrl, pageUrl: tabUrl || best.frameUrl, viaPage: !!s.viaPage, manifestText: s.manifestText, masterText: s.masterText, pageVideoDuration: pageVideoDuration, kind: s.kind || (isPlaylist(best) ? "playlist" : "file"), noStream: !!s.noStream };
 }
 function electOverlay(tabId) {
   const frames = tabOverlayCandidates.get(tabId);
@@ -769,7 +823,11 @@ function electOverlay(tabId) {
   // bestDownloadSource): only the top frame shows the button, and
   // it downloads this stream. Every frame gets the verdict; only
   // the top frame acts on `download`.
-  const download = bestDownloadSource(tabId, winner);
+  // Round 13, item 3: the election is scoped to the tab's current
+  // page — stale reports and observations from the previous page
+  // are filtered inside bestDownloadSource, and the verdict is
+  // tagged with that page.
+  const download = bestDownloadSource(tabId, winner, tabUrlById.get(tabId) || undefined);
   // Every known frame gets the verdict; when no frame has
   // reported yet, frame 0 (the top frame) still gets it — it is
   // the one that shows the button, and its content script is
@@ -808,7 +866,7 @@ function electOverlay(tabId) {
 // Tier 0 layers cover the same streams in most cases. No
 // keep-alive hack: waking the worker on a timer drains battery
 // for an insurance layer.
-const tabObserved = new Map(); // tabId -> Map(url -> { url, kind, initiator, at })
+const tabObserved = new Map(); // tabId -> Map(url -> { url, kind, initiator, pageUrl, at })
 const OBSERVED_PER_TAB_MAX = 100;
 const OBSERVED_TTL_MS = 30 * 60 * 1000; // 30 min: a film's playlist stays valid for the watch session
 // Classify one observed response: { kind: "playlist"|"file", url }
@@ -846,7 +904,7 @@ function storeObserved(tabId, url, kind, initiator) {
     const oldest = perTab.keys().next().value;
     if (oldest !== undefined) perTab.delete(oldest);
   }
-  perTab.set(url, { url: url, kind: kind, initiator: initiator || "", at: now });
+  perTab.set(url, { url: url, kind: kind, initiator: initiator || "", pageUrl: initiator || "", at: now });
   // A new finding may change the election (a playlist observed
   // here beats any direct file): re-elect promptly so the
   // button appears without waiting for the next frame report.
@@ -922,6 +980,7 @@ if (api.tabs && api.tabs.onRemoved) {
     tabLastPosted.delete(tabId);
     tabOverlayCandidates.delete(tabId);
     tabObserved.delete(tabId);
+    tabUrlById.delete(tabId);
     if (tabPostTimers.has(tabId)) { clearTimeout(tabPostTimers.get(tabId)); tabPostTimers.delete(tabId); }
     delete mediaCounts[tabId];
     saveMediaCounts();
@@ -944,7 +1003,11 @@ function clearTabElectionState(tabId) {
   tabOverlayCandidates.delete(tabId);
 }
 if (api.tabs && api.tabs.onUpdated) {
-  api.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  api.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    // Round 13, item 3: track the tab's current page for the
+    // election scoping, from either the change or the tab object.
+    const u = (changeInfo && changeInfo.url) || (tab && tab.url);
+    if (typeof u === "string" && u) tabUrlById.set(tabId, u);
     if (changeInfo && typeof changeInfo.url === "string") clearTabElectionState(tabId);
   });
 }
@@ -1003,9 +1066,16 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         if (c.source && c.source.viaPage && !c.source.url) c.source.url = frameUrl;
       }
       if (!tabOverlayCandidates.has(tabId)) tabOverlayCandidates.set(tabId, new Map());
+      // Round 13, item 3: tag the report with the tab's current
+      // page. A top-frame report also (re)sets the tracked tab
+      // URL itself — a pushState/SPA navigation fires no tab
+      // event, but the new page's top frame reports its own URL
+      // here, which heals the tracking for the next election.
+      if (frameId === 0 && frameUrl) tabUrlById.set(tabId, frameUrl);
       tabOverlayCandidates.get(tabId).set(frameId, {
         candidates: candidates,
         frameUrl: frameUrl,
+        pageUrl: tabUrlById.get(tabId) || "",
         at: Date.now(),
       });
       electOverlay(tabId);

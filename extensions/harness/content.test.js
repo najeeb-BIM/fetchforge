@@ -194,7 +194,7 @@ const ctx3 = makeContext(
     + "function openFormatsPopup(btn, dl) { __calls.formats.push({ btn: btn, dl: dl }); popupOpen = true; }\n"
     + "function openSimplePopup(btn, dl) { __calls.simple.push({ btn: btn, dl: dl }); popupOpen = true; }\n"
     + "function sendCurrentDownload(btn, dl, opts) { __calls.send.push({ btn: btn, dl: dl, opts: opts }); }\n",
-    extractMany(contentSrc, ["onOverlayClick", "parseHlsMaster", "parseHlsAttrs", "resolveAgainst", "friendlyCodec", "formatBandwidth", "hlsVariantHeight", "probeDirectFileDuration", "parseMp4Duration", "isManifestUrl", "isDashUrl", "isMp4FamilyUrl", "isVideoFileUrl", "isOneClickFileUrl"], 2),
+    extractMany(contentSrc, ["onOverlayClick", "verdictMatchesPage", "parseHlsMaster", "parseHlsAttrs", "resolveAgainst", "friendlyCodec", "formatBandwidth", "hlsVariantHeight", "probeDirectFileDuration", "parseMp4Duration", "isManifestUrl", "isDashUrl", "isMp4FamilyUrl", "isVideoFileUrl", "isOneClickFileUrl"], 2),
   ]
 );
 function clickOverlay(dl, behaviour) {
@@ -369,7 +369,7 @@ const ctx4 = makeContext(
     + "globalThis.__popupRows = function () { return popupRows; };\n"
     + "globalThis.__popupOpen = function () { return popupOpen; };\n"
     + "function pickAndSend(btn, dl, opts) { opts = opts || {}; if (!opts.filename) opts.filename = currentPopupFilename(); globalThis.__sendCalls.push({ btn: btn, dl: dl, opts: opts }); return Promise.resolve({ ok: true }); }\n",
-    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "configurePopupOptions", "currentPopupOptions", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "isStreamLikeName", "stemOfFilename", "sortFormatsForPopup", "isDashUrl", "resolutionFromFormat", "singleFormatRowLabel", "legalAlternativeNote", "isAccessRestrictedReason", "setPopupNote"], 2),
+    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "configurePopupOptions", "currentPopupOptions", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "isStreamLikeName", "stemOfFilename", "sortFormatsForPopup", "visibleFormatLabel", "effectiveFormatHeight", "isDashUrl", "resolutionFromFormat", "singleFormatRowLabel", "legalAlternativeNote", "isAccessRestrictedReason", "setPopupNote"], 2),
   ]
 );
 ctx4.__sendCalls = sendCalls4;
@@ -509,7 +509,7 @@ test("Round 8: timeout shows the degraded popup and a late reply never overwrite
 // ---------- Context 5: quality ladder (Round 8, pure) ----------
 const ctx5 = makeContext(
   { document: { title: "" }, window: {} },
-  [extractMany(contentSrc, ["parseHlsMaster", "parseHlsAttrs", "resolveAgainst", "friendlyCodec", "formatBandwidth", "hlsVariantHeight", "sortFormatsForPopup"], 2)]
+  [extractMany(contentSrc, ["parseHlsMaster", "parseHlsAttrs", "resolveAgainst", "friendlyCodec", "formatBandwidth", "hlsVariantHeight", "sortFormatsForPopup", "visibleFormatLabel", "effectiveFormatHeight"], 2)]
 );
 
 test("Round 8: HLS ladder is height-first, not bandwidth-first", () => {

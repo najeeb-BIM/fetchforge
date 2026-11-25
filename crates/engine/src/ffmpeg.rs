@@ -120,7 +120,31 @@ pub fn find_ffmpeg(data_dir: &Path) -> Result<PathBuf, String> {
 /// Lookup, downloading the pinned ffmpeg build (Windows only) when
 /// no ffmpeg is available. On non-Windows there is no pinned binary,
 /// so the error tells the user how to install one.
+///
+/// Round 12, item 8: the whole lookup + download is serialised on
+/// a process-wide lock. Two jobs starting at once used to race the
+/// first-use fetch — both saw "no ffmpeg", both downloaded the zip
+/// to the same path, and a job that spawned ffmpeg mid-fetch could
+/// fail with "The system cannot find the file specified.
+/// (os error 2)" (Windows spawn error for a not-yet-present
+/// binary). The cause is timing-supported, not log-proven: no log
+/// ever captured the race in the act. With the lock, the second
+/// caller waits, then re-checks and finds the finished binary.
+/// The lock is held for the whole call (the download is minutes
+/// at worst on a slow link, but only the FIRST call in the
+/// process ever downloads; every later call finds ffmpeg at once
+/// and the lock is uncontended). A poisoned lock (a panicking
+/// holder) is treated as free rather than failing every later
+/// download.
 pub fn ensure_ffmpeg(data_dir: &Path) -> Result<PathBuf, String> {
+    static FFMPEG_FETCH_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    let lock = FFMPEG_FETCH_LOCK.get_or_init(|| std::sync::Mutex::new(()));
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    ensure_ffmpeg_locked(data_dir)
+}
+
+fn ensure_ffmpeg_locked(data_dir: &Path) -> Result<PathBuf, String> {
     match find_ffmpeg(data_dir) {
         Ok(p) => Ok(p),
         Err(_) => {
@@ -664,6 +688,36 @@ mod tests {
         zip.finish().unwrap();
         assert!(extract_ffmpeg_exe(&zip2, &dir.join("out.exe")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_ffmpeg_serializes_concurrent_first_use() {
+        // Round 12, item 8: eight threads calling ensure_ffmpeg
+        // at once must all return the same binary, never panic or
+        // deadlock on the fetch lock. This exercises the lock
+        // itself; the real first-use download race is
+        // Windows-only and cannot be exercised on this VM, so the
+        // download path is verified by inspection + the full
+        // suite, not by this test.
+        let dir = unique_temp_dir("ff-lock");
+        std::fs::create_dir_all(dir.join("tools").join("ffmpeg")).unwrap();
+        let tools_ff = dir.join("tools").join("ffmpeg").join(ffmpeg_exe_name());
+        std::fs::write(&tools_ff, b"fake").unwrap();
+        let dir = std::sync::Arc::new(dir);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let d = dir.clone();
+            handles.push(std::thread::spawn(move || ensure_ffmpeg(&d)));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.join().expect("ensure_ffmpeg thread panicked"));
+        }
+        let first = results[0].as_ref().unwrap();
+        for r in &results {
+            assert_eq!(r.as_ref().unwrap(), first, "concurrent calls disagreed");
+        }
+        let _ = std::fs::remove_dir_all(&*dir);
     }
 
     #[test]

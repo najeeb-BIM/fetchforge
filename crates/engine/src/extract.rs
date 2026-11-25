@@ -1113,6 +1113,15 @@ pub fn list_formats_with_referer_and_proxy(
     referer: Option<String>,
     proxy: Option<&str>,
 ) -> Result<MediaInfo, String> {
+    // Round 12, item 4: an archive.org download link names ONE
+    // encode (the popup offered only "Video · MP4" — the standard
+    // 597 MB mp4 — while the 1080p mkv sat in the same item). The
+    // metadata path returns the best encode instead; on any
+    // failure it yields None and the normal path below runs, so a
+    // metadata outage never breaks the old behaviour.
+    if let Some(info) = try_archive_best_encode(url) {
+        return Ok(info);
+    }
     if crate::media::is_manifest_url(url) {
         let info = crate::media::list_stream_formats_with_proxy(url, &referer, None, proxy)?;
         return Ok(stream_info_to_media_info(&info));
@@ -1134,6 +1143,248 @@ pub fn list_formats_with_referer_and_proxy(
 /// the URL was typed, not observed on a page).
 pub fn list_formats(data_dir: &Path, url: &str) -> Result<MediaInfo, String> {
     list_formats_with_referer(data_dir, url, None)
+}
+
+// ---------------------------------------------------------------------------
+// Internet Archive best encode (round 12, item 4)
+// ---------------------------------------------------------------------------
+
+/// Video extensions an Archive item's files may carry. The
+/// metadata `format` tags vary (`MPEG4`, `Matroska`, `h.264`,
+/// ...), so the filename extension is the filter — it is what the
+/// download URL needs anyway.
+const ARCHIVE_VIDEO_EXTS: [&str; 5] = ["mp4", "mkv", "webm", "mov", "ogv"];
+
+/// One video encode of an Archive item, as listed in its public
+/// metadata (`https://archive.org/metadata/<id>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveEncode {
+    name: String,
+    ext: String,
+    height: Option<u32>,
+    size: Option<u64>,
+    url: String,
+}
+
+/// Height hint from a FILENAME only (round 11, item 4's lesson:
+/// scoring the whole URL made every file in the Archive's
+/// `..._1080p` item directory look 1080p). A `1080p`/`720p` token
+/// in the name, or a bare `1080`/`720` token; None when the name
+/// carries no hint (the standard mp4 and the 512kb mp4 have
+/// none, so they rank below any hinted encode).
+fn archive_height_from_filename(name: &str) -> Option<u32> {
+    let mut best: Option<u32> = None;
+    for token in name.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if token.is_empty() {
+            continue;
+        }
+        let digits = token.strip_suffix(['p', 'P']).unwrap_or(token);
+        if let Ok(h) = digits.parse::<u32>() {
+            // A bare number counts only for real heights
+            // (240–4320, multiples of 120 — 240/360/480/720/1080/
+            // 1440/2160); a year (1968) or a bitrate (512) is not
+            // a height. A `…p` token counts for any height in
+            // range (e.g. 900p).
+            let is_height =
+                (240..=4320).contains(&h) && (token.ends_with(['p', 'P']) || h % 120 == 0);
+            if is_height {
+                best = Some(best.map_or(h, |b: u32| b.max(h)));
+            }
+        }
+    }
+    best
+}
+
+/// Rank Archive encodes best-first: height descending, then
+/// container — mkv first (the Archive's high-quality encode),
+/// then mp4, webm, mov, ogv — then size descending. A tie between
+/// two genuinely-1080p files keeps metadata order (either is a
+/// fine pick — the round-11 tie rule, kept).
+fn rank_archive_encodes(encodes: &mut Vec<ArchiveEncode>) {
+    let container_rank = |ext: &str| match ext {
+        "mkv" => 0,
+        "mp4" => 1,
+        "webm" => 2,
+        "mov" => 3,
+        _ => 4,
+    };
+    encodes.sort_by(|a, b| {
+        b.height
+            .unwrap_or(0)
+            .cmp(&a.height.unwrap_or(0))
+            .then(container_rank(&a.ext).cmp(&container_rank(&b.ext)))
+            .then(b.size.unwrap_or(0).cmp(&a.size.unwrap_or(0)))
+    });
+}
+
+/// Parse an archive.org metadata document into its video encodes:
+/// top-level files only (a `dir/file.mp4` belongs to a
+/// sub-directory, not this item's encodes) with a video
+/// extension. The download URL is built from the item id + file
+/// name (URL-encoded by the join, so spaces in Archive names
+/// survive). Files whose name cannot be joined are skipped, not
+/// failed — one odd name must not hide the other encodes.
+fn archive_encodes_from_metadata(value: &serde_json::Value, item_id: &str) -> Vec<ArchiveEncode> {
+    let Some(files) = value.get("files").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let Ok(base) = url::Url::parse(&format!("https://archive.org/download/{item_id}/")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for f in files {
+        let Some(name) = opt_str(f, "name") else {
+            continue;
+        };
+        if name.contains('/') {
+            continue;
+        }
+        let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        if !ARCHIVE_VIDEO_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        let Ok(download) = base.join(name) else {
+            continue;
+        };
+        let size = f.get("size").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        });
+        out.push(ArchiveEncode {
+            height: archive_height_from_filename(name),
+            name: name.to_string(),
+            ext,
+            size,
+            url: download.to_string(),
+        });
+    }
+    out
+}
+
+/// Split an `archive.org/download/<id>/<file>` URL into its item
+/// id and file name. Anything else (details pages, other hosts,
+/// a bare `/download/<id>` with no file) is None — those URLs
+/// keep the normal yt-dlp path.
+fn archive_download_parts(url: &str) -> Option<(String, String)> {
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.host_str() != Some("archive.org") {
+        return None;
+    }
+    let mut segments = parsed.path_segments()?;
+    if segments.next() != Some("download") {
+        return None;
+    }
+    let id = segments.next().unwrap_or("");
+    let file = segments.next().unwrap_or("");
+    if id.is_empty() || file.is_empty() {
+        return None;
+    }
+    Some((id.to_string(), file.to_string()))
+}
+
+/// Build the MediaInfo for an Archive best encode: one combined
+/// format (the best file — format id "0", the direct-file
+/// convention from [`parse_media_info`]'s single-file synthesis)
+/// with its exact metadata size, and `resolved_url` pointing at
+/// the best file so the worker downloads it, not the clicked one.
+fn archive_media_info(
+    item_id: &str,
+    title: &str,
+    best: &ArchiveEncode,
+    page_url: &str,
+) -> MediaInfo {
+    let size_kind = best.size.map(|_| crate::media::SizeKind::Exact);
+    let format = MediaFormat {
+        format_id: "0".to_string(),
+        label: format_label(
+            "0",
+            FormatKind::Combined,
+            &best.ext,
+            best.height,
+            None,
+            None,
+            None,
+            best.size,
+            size_kind,
+            false,
+        ),
+        ext: best.ext.clone(),
+        kind: FormatKind::Combined,
+        height: best.height,
+        width: None,
+        abr: None,
+        vbr: None,
+        fps: None,
+        language: None,
+        filesize: best.size,
+        filesize_approx: false,
+        size_kind,
+        needs_merge: false,
+    };
+    MediaInfo {
+        title: if title.trim().is_empty() {
+            item_id.to_string()
+        } else {
+            title.to_string()
+        },
+        extractor: "archive.org".to_string(),
+        duration_secs: None,
+        webpage_url: page_url.to_string(),
+        formats: vec![format],
+        default_format_id: Some("0".to_string()),
+        resolved_url: Some(best.url.clone()),
+        audio_languages: Vec::new(),
+        subtitle_langs: Vec::new(),
+        is_playlist: false,
+        playlist_title: None,
+        playlist_count: None,
+    }
+}
+
+/// Try the Archive best-encode path for one URL. Returns None
+/// when the URL is not an archive.org download link, when the
+/// metadata fetch fails, or when the item lists no video encode
+/// at all — in every None case the caller falls through to
+/// yt-dlp, so this path can only improve the listing, never
+/// break it. The metadata endpoint is public (no auth, no
+/// cookies): reading an item's public file list is not a bypass
+/// of anything.
+fn try_archive_best_encode(url: &str) -> Option<MediaInfo> {
+    let (item_id, _clicked) = archive_download_parts(url)?;
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("FetchForge/0.2")
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .ok()?;
+    // No `json` feature on this crate's reqwest: read text, parse.
+    let text = client
+        .get(format!("https://archive.org/metadata/{item_id}"))
+        .send()
+        .ok()?
+        .text()
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let title = value
+        .get("metadata")
+        .and_then(|m| m.get("title"))
+        .and_then(|t| {
+            t.as_str().map(|s| s.to_string()).or_else(|| {
+                t.as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+        })
+        .unwrap_or_else(|| item_id.clone());
+    let mut encodes = archive_encodes_from_metadata(&value, &item_id);
+    if encodes.is_empty() {
+        return None;
+    }
+    rank_archive_encodes(&mut encodes);
+    let best = encodes.into_iter().next()?;
+    Some(archive_media_info(&item_id, &title, &best, url))
 }
 
 // ---------------------------------------------------------------------------
@@ -3740,6 +3991,124 @@ mod tests {
     /// from an earlier test run.
     fn unique_temp_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("fetchforge-test-{}-{}", tag, std::process::id()))
+    }
+
+    #[test]
+    fn archive_best_encode_picks_1080p_mkv_from_metadata() {
+        // Round 12, item 4: canned metadata in the Night of the
+        // Living Dead shape — standard mp4 (597 MB-ish, no height
+        // hint), 512kb mp4, 720p mp4, 1080p mkv, plus a poster, a
+        // text file and a sub-directory mp4 that must all be
+        // ignored. The 1080p mkv wins; the standard mp4 loses even
+        // though it comes first in the list.
+        let value: serde_json::Value = serde_json::json!({
+            "metadata": {"title": "Night of the Living Dead"},
+            "files": [
+                {"name": "Night of the Living Dead.mp4", "size": "625000000"},
+                {"name": "Night of the Living Dead_512kb.mp4", "size": "300000000"},
+                {"name": "Night of the Living Dead_720p.mp4", "size": "1200000000"},
+                {"name": "Night of the Living Dead_1080p.mkv", "size": "2500000000"},
+                {"name": "poster.jpg", "size": "12345"},
+                {"name": "Night of the Living Dead_djvu.txt", "size": "999"},
+                {"name": "sub/Night of the Living Dead.mp4", "size": "625000000"}
+            ]
+        });
+        let mut encodes = archive_encodes_from_metadata(&value, "Night.Of.The.Living.Dead_1080p");
+        assert_eq!(encodes.len(), 4, "only top-level video files count");
+        rank_archive_encodes(&mut encodes);
+        let best = &encodes[0];
+        assert_eq!(best.name, "Night of the Living Dead_1080p.mkv");
+        assert_eq!(best.ext, "mkv");
+        assert_eq!(best.height, Some(1080));
+        assert_eq!(best.size, Some(2_500_000_000));
+        assert!(
+            best.url
+                .contains("Night%20of%20the%20Living%20Dead_1080p.mkv"),
+            "spaces are URL-encoded: {}",
+            best.url
+        );
+        let info = archive_media_info(
+            "Night.Of.The.Living.Dead_1080p",
+            "Night of the Living Dead",
+            best,
+            "https://archive.org/download/Night.Of.The.Living.Dead_1080p/Night%20of%20the%20Living%20Dead.mp4",
+        );
+        assert_eq!(info.title, "Night of the Living Dead");
+        assert_eq!(info.extractor, "archive.org");
+        assert_eq!(info.default_format_id.as_deref(), Some("0"));
+        assert_eq!(info.resolved_url.as_deref(), Some(best.url.as_str()));
+        let format = &info.formats[0];
+        assert_eq!(format.ext, "mkv");
+        assert_eq!(format.height, Some(1080));
+        assert_eq!(format.filesize, Some(2_500_000_000));
+        assert_eq!(format.size_kind, Some(crate::media::SizeKind::Exact));
+        assert!(format.label.starts_with("1080p"), "label: {}", format.label);
+        // Without any hinted encode, the biggest file wins (the
+        // standard mp4 over the 512kb mp4).
+        let plain: serde_json::Value = serde_json::json!({
+            "files": [
+                {"name": "Film_512kb.mp4", "size": 300000000},
+                {"name": "Film.mp4", "size": 625000000}
+            ]
+        });
+        let mut encodes = archive_encodes_from_metadata(&plain, "film");
+        rank_archive_encodes(&mut encodes);
+        assert_eq!(encodes[0].name, "Film.mp4");
+    }
+
+    #[test]
+    fn archive_height_hint_reads_filename_only() {
+        // Round 11, item 4's lesson, kept: the hint comes from
+        // the FILE name, never a directory — the caller only ever
+        // passes the file name, so a `..._1080p` directory cannot
+        // inflate a plain file.
+        assert_eq!(
+            archive_height_from_filename("Night of the Living Dead_1080p.mkv"),
+            Some(1080)
+        );
+        assert_eq!(archive_height_from_filename("Film_720p.mp4"), Some(720));
+        assert_eq!(archive_height_from_filename("Film.mp4"), None);
+        assert_eq!(
+            archive_height_from_filename("Film_512kb.mp4"),
+            None,
+            "512kb is a bitrate, not a height"
+        );
+        assert_eq!(
+            archive_height_from_filename("Film (1968).mp4"),
+            None,
+            "a year is not a height"
+        );
+    }
+
+    #[test]
+    fn archive_download_parts_only_matches_download_links() {
+        assert_eq!(
+            archive_download_parts(
+                "https://archive.org/download/Night.Of.The.Living.Dead_1080p/Night%20of%20the%20Living%20Dead.mp4"
+            ),
+            Some((
+                "Night.Of.The.Living.Dead_1080p".to_string(),
+                "Night%20of%20the%20Living%20Dead.mp4".to_string()
+            ))
+        );
+        assert_eq!(
+            archive_download_parts("https://archive.org/details/Night.Of.The.Living.Dead_1080p"),
+            None,
+            "a details page is not a download link"
+        );
+        assert_eq!(
+            archive_download_parts("https://archive.org/download/only-id"),
+            None,
+            "no file named"
+        );
+        assert_eq!(
+            archive_download_parts("https://example.com/download/x/f.mp4"),
+            None,
+            "another host is not Archive"
+        );
+        // A non-Archive URL never touches the network: the
+        // best-encode path yields None before any fetch.
+        assert!(try_archive_best_encode("https://example.com/download/x/f.mp4").is_none());
     }
 
     #[test]

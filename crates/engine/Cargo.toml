@@ -25,5 +25,13 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # tags and namespaces vary, so a real parser beats string scanning).
 # No default features: MPDs are UTF-8, encoding_rs is not needed.
 quick-xml = { version = "0.38", default-features = false }
+# AES-128 HLS decryption (round 12, item 5): standard HLS AES-128
+# (EXT-X-KEY METHOD=AES-128) is NOT DRM — the key is served openly
+# and ffmpeg handles it natively — so the native path decrypts
+# segments itself. `aes` does the block cipher; `cipher` supplies
+# the traits; CBC mode is implemented by hand (a dozen lines) so
+# no separate `cbc` crate is needed.
+aes = "0.8"
+cipher = "0.4"
 
 [dev-dependencies]

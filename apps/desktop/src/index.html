@@ -493,6 +493,11 @@ document.querySelectorAll("#tabs button").forEach((b) => { b.onclick = () => sho
 // checking — the list is a convenience, not a guarantee.
 const SITE_DIRECTORY = [
   ["novahd", "https://novahd.cc"],
+  // Round 13, item 7: the old NOXX domain is retired — the
+  // Sites link is the current noxx.gg domain. (No NOXX entry
+  // existed in this file at round 12; added here at the
+  // current domain.)
+  ["NOXX", "https://noxx.gg"],
   ["nime", "https://nime.pro"],
   ["atlantic", "https://atlantic.bz"],
   ["LookMovie", "https://lookmovie2.uk"],
@@ -844,13 +849,17 @@ async function refresh() {
       // textContent only: filenames and server error strings are untrusted
       // and must never be parsed as HTML (a file named <img src=x onerror=…>
       // used to be injected via innerHTML before this fix).
-      const tdName = document.createElement("td"); tdName.textContent = d.filename;
+      const tdName = document.createElement("td"); tdName.className = "file-cell"; tdName.textContent = d.filename;
       const tdCat = document.createElement("td"); tdCat.textContent = d.category;
       const tdStatus = document.createElement("td");
       tdStatus.textContent = d.status + (d.error ? " - " + d.error : "");
       // Round 10, item 8: when the site mislabelled the picked
       // stream, the record says what was actually delivered.
-      if (d.quality_note) {
+      // Round 13, item 10: a completed download shows no remarks
+      // line under it — all three notes below are skipped once
+      // the download is complete.
+      const showNotes = d.status !== "completed";
+      if (showNotes && d.quality_note) {
         const note = document.createElement("div");
         note.className = "quality-note";
         note.textContent = d.quality_note;
@@ -859,39 +868,46 @@ async function refresh() {
       // Round 11 extension, feature 9: a downgraded download
       // says what it was retried from. Feature 11: a playlist
       // item says which playlist it came from and its position.
-      if (d.downgraded_from) {
+      if (showNotes && d.downgraded_from) {
         const note = document.createElement("div");
         note.className = "quality-note";
         note.textContent = "Retried at a lower quality (was " + d.downgraded_from + ")";
         tdStatus.appendChild(note);
       }
-      if (d.playlist) {
+      if (showNotes && d.playlist) {
         const note = document.createElement("div");
         note.className = "quality-note";
         note.textContent = "Playlist: " + d.playlist + (d.playlist_index != null ? " · #" + d.playlist_index : "");
         tdStatus.appendChild(note);
       }
       const tdProg = document.createElement("td");
-      const prog = document.createElement("progress");
-      prog.value = d.downloaded_bytes; prog.max = pctDenom || 1;
-      tdProg.appendChild(prog);
-      // Round 11, item 11: downloaded/total plus the remaining
-      // amount — "87% (459 MB of 4.9 GB, 3.9 GB left)". No
-      // pieces/segments anywhere in the UI (they stay in the
-      // record/JSON for the engine); no ", ~X est." suffix — the
-      // total itself carries its ladder marker. When no total is
-      // known, only the downloaded amount shows.
-      const total = displayTotal(d);
-      let progText = ` ${pct}% (${fmtBytes(d.downloaded_bytes)}`;
-      if (total) {
-        progText += " of " + total.text;
-        const remaining = total.bytes - d.downloaded_bytes;
-        if (remaining > 0) progText += ", " + fmtBytes(remaining) + " left";
+      // Round 13, item 10: a completed download shows a dash in
+      // the Progress column — no bar, no percentage/bytes text —
+      // so it is immediately clear the download is complete.
+      if (d.status === "completed") {
+        tdProg.textContent = "—";
       } else {
-        progText += " downloaded";
+        const prog = document.createElement("progress");
+        prog.value = d.downloaded_bytes; prog.max = pctDenom || 1;
+        tdProg.appendChild(prog);
+        // Round 11, item 11: downloaded/total plus the remaining
+        // amount — "87% (459 MB of 4.9 GB, 3.9 GB left)". No
+        // pieces/segments anywhere in the UI (they stay in the
+        // record/JSON for the engine); no ", ~X est." suffix — the
+        // total itself carries its ladder marker. When no total is
+        // known, only the downloaded amount shows.
+        const total = displayTotal(d);
+        let progText = ` ${pct}% (${fmtBytes(d.downloaded_bytes)}`;
+        if (total) {
+          progText += " of " + total.text;
+          const remaining = total.bytes - d.downloaded_bytes;
+          if (remaining > 0) progText += ", " + fmtBytes(remaining) + " left";
+        } else {
+          progText += " downloaded";
+        }
+        progText += ")";
+        tdProg.appendChild(document.createTextNode(progText));
       }
-      progText += ")";
-      tdProg.appendChild(document.createTextNode(progText));
       // Round 11, item 8: real download speed — Downloading rows
       // only. A paused row keeps its last speed in the record,
       // but showing it would be a stale speed.

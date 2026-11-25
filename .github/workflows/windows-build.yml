@@ -84,13 +84,14 @@ jobs:
           path: |
             installer/FetchForge-Setup-0.2.0-x64.exe
             dist/FetchForge-portable-x64.zip
-  # TEMPORARY DIAGNOSTIC (2026-11-25): nine main-workflow runs died with
-  # the Engine step stuck and zero logs, but the isolated release build
-  # (run 45509381392) PASSED in under 6 min — so an earlier main-workflow
-  # step is the cause. This job bisects: it currently runs checkout +
-  # toolchain + cargo test + the release build (10-min timeout). If it
-  # fails, the tests step is implicated; if it passes, the next suspect
-  # is the tauri-cli install. Remove after the cause is found.
+  # TEMPORARY DIAGNOSTIC (2026-11-25): the isolated release build PASSED
+  # (run 45509381392) but diag+tests FAILED (run 45517628762, runner died
+  # in the release-build step AFTER the tests step succeeded) — so the
+  # tests step is implicated. This job now also deletes target/debug
+  # between tests and the build (same as the main workflow's free-disk
+  # step): if it passes, target/debug's disk usage is the killer; if it
+  # still fails, the tests step kills the runner some other way (not
+  # disk). Remove after the cause is found.
   diag:
     if: ${{ inputs.diagnostic_only }}
     runs-on: windows-2022
@@ -99,6 +100,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run tests (bisection)
         run: cargo test
+      - name: Free disk space (bisection, same as main workflow)
+        shell: pwsh
+        run: |
+          if (Test-Path target/debug) { Remove-Item -Recurse -Force target/debug }
+          "Free space on C: $([math]::Round((Get-PSDrive C).Free / 1GB, 2)) GB"
       - name: Release build with 10-minute timeout
         shell: pwsh
         run: |

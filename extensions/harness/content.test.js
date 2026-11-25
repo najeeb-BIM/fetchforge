@@ -136,7 +136,7 @@ const ctx2 = makeContext(
     // revert timer; the harness provides it as a context global.
     sendRevertTimer: null,
   },
-  [extractMany(contentSrc, ["sendCurrentDownload", "defaultFilenameFor", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename", "sanitizeFilenameStem", "isManifestUrl", "shortFailureReason"], 2)]
+  [extractMany(contentSrc, ["sendCurrentDownload", "defaultFilenameFor", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "isStreamLikeName", "stemOfFilename", "sanitizeFilenameStem", "isManifestUrl", "shortFailureReason"], 2)]
 );
 function clickSend(reply, dl) {
   nextReply = reply;
@@ -369,7 +369,7 @@ const ctx4 = makeContext(
     + "globalThis.__popupRows = function () { return popupRows; };\n"
     + "globalThis.__popupOpen = function () { return popupOpen; };\n"
     + "function pickAndSend(btn, dl, opts) { opts = opts || {}; if (!opts.filename) opts.filename = currentPopupFilename(); globalThis.__sendCalls.push({ btn: btn, dl: dl, opts: opts }); return Promise.resolve({ ok: true }); }\n",
-    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "configurePopupOptions", "currentPopupOptions", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename", "sortFormatsForPopup", "isDashUrl"], 2),
+    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "configurePopupOptions", "currentPopupOptions", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "isStreamLikeName", "stemOfFilename", "sortFormatsForPopup", "isDashUrl", "resolutionFromFormat", "singleFormatRowLabel", "legalAlternativeNote", "isAccessRestrictedReason", "setPopupNote"], 2),
   ]
 );
 ctx4.__sendCalls = sendCalls4;
@@ -392,8 +392,11 @@ test("Round 8: single-format response still shows the popup (no silent send)", a
   const { overlay } = await openFormats(dl, { ok: true, formats: [{ format_id: "v1", label: "1080p", height: 1080, kind: "combined" }], default_format_id: "v1" });
   assertEq(sendCalls4.length, 0, "no send before the user picks");
   assertEq(overlay.popup.style.display, "flex");
-  assertEq(overlay.popupBody.children.length, 1);
+  // Round 12, item 1: the single video row plus the synthesized
+  // "Audio only" row (the listing carried no audio format).
+  assertEq(overlay.popupBody.children.length, 2);
   assertEq(overlay.popupBody.children[0].textContent, "1080p");
+  assertEq(overlay.popupBody.children[1].textContent, "Audio only");
 });
 
 test("Fix 7: multi-format response shows rows with filename field", async () => {
@@ -580,7 +583,7 @@ const ctx6 = makeContext(
     + "globalThis.__popupRows = function () { return popupRows; };\n"
     + "function capturedTextFor(url) { return undefined; }\n"
     + "function pickAndSend(btn, dl, opts) { opts = opts || {}; if (!opts.filename) opts.filename = currentPopupFilename(); globalThis.__sendCalls.push({ btn: btn, dl: dl, opts: opts }); return Promise.resolve({ ok: true }); }\n",
-    extractMany(contentSrc, ["openHlsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "configurePopupOptions", "currentPopupOptions", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename"], 2),
+    extractMany(contentSrc, ["openHlsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "configurePopupOptions", "currentPopupOptions", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "isStreamLikeName", "stemOfFilename", "setPopupNote"], 2),
   ]
 );
 ctx6.__sendCalls = sendCalls6;

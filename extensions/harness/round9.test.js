@@ -28,7 +28,7 @@ const manifestFx = JSON.parse(readSource("extensions/firefox/manifest.json"));
 test("(a) hook-main.js exists, parses, and is wired as a MAIN-world content script", () => {
   new vm.Script(hookSrc, { filename: "hook-main.js" }); // parse check
   for (const [name, m] of [["chromium", manifestCr], ["firefox", manifestFx]]) {
-    assertEq(m.version, "0.2.10", name + " version");
+    assertEq(m.version, "0.2.11", name + " version");
     assert(m.permissions.includes("webRequest"), name + " must declare webRequest");
     assertEq(JSON.stringify(m.optional_host_permissions), JSON.stringify(["<all_urls>"]), name + " optional <all_urls>");
     const main = m.content_scripts.find((e) => e.world === "MAIN");

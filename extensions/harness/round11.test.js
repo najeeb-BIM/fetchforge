@@ -2,7 +2,7 @@
 // (items 2/13), visible-identity dedupe (item 3), same-directory
 // best-encode scan (item 4), formats referer (item 5), and the
 // desktop helpers fmtSpeed / displayTotal (items 8/10/11).
-// Extension version 0.2.10.
+// Extension version 0.2.11.
 "use strict";
 const vm = require("vm");
 const nodeCrypto = require("crypto");
@@ -75,14 +75,14 @@ const ctxB = makeContext(
       querySelector: function () { return null; },
     },
   },
-  [extractMany(contentSrc, ["isHashLikeTitle", "isJunkTitle", "stemOfFilename", "popupDefaultName", "pageTitleStem", "pageNameHint", "sanitizeFilenameStem"], 2)]
+  [extractMany(contentSrc, ["isHashLikeTitle", "isStreamLikeName", "isJunkTitle", "stemOfFilename", "popupDefaultName", "pageTitleStem", "pageNameHint", "sanitizeFilenameStem"], 2)]
 );
 
 test("Items 2/13: isHashLikeTitle spots URL tokens, not real titles", () => {
   assertEq(runIn(ctxB, "isHashLikeTitle('0BGHIHfw0FTI-dNbLxEad3TYSrs97iR2W7IUCXXIJQ55hG38')"), true, "novahd hash token");
   assertEq(runIn(ctxB, "isHashLikeTitle('The Odyssey')"), false, "real title has spaces");
   assertEq(runIn(ctxB, "isHashLikeTitle('Inception')"), false, "short single word");
-  assertEq(runIn(ctxB, "isHashLikeTitle('The.Odyssey.2026.1080p')"), false, "dotted release name");
+  assertEq(runIn(ctxB, "isHashLikeTitle('The.Odyssey.2026.1080p')"), true, "round 12: dots joined the hash class, so a dotted release name now reads as hash-like");
   assertEq(runIn(ctxB, "isHashLikeTitle('short-token')"), false, "under 20 chars");
   assertEq(runIn(ctxB, "isHashLikeTitle('')"), false);
 });
@@ -90,7 +90,7 @@ test("Items 2/13: isHashLikeTitle spots URL tokens, not real titles", () => {
 test("Items 2/13: a hash-like verdict stem falls through to 'download'", () => {
   assertEq(runIn(ctxB, "stemOfFilename('0BGHIHfw0FTI-dNbLxEad3TYSrs97iR2W7IUCXXIJQ55hG38')"), "", "hash stem is not a name");
   assertEq(runIn(ctxB, "stemOfFilename('movie.mp4')"), "movie");
-  assertEq(runIn(ctxB, "stemOfFilename('index_287.ts')"), "index_287");
+  assertEq(runIn(ctxB, "stemOfFilename('index_287.ts')"), "", "round 12, item 6: an index_NNN stem is a stream name, refused like a hash");
 });
 
 test("Item 2: popupDefaultName skips a hash-like server title for the page title", () => {
@@ -143,7 +143,7 @@ const ctxC = makeContext(
     + "globalThis.__popupRows = function () { return popupRows; };\n"
     + "globalThis.__popupOpen = function () { return popupOpen; };\n"
     + "function pickAndSend(btn, dl, opts) { opts = opts || {}; if (!opts.filename) opts.filename = currentPopupFilename(); globalThis.__sendCalls.push({ btn: btn, dl: dl, opts: opts }); return Promise.resolve({ ok: true }); }\n",
-    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "configurePopupOptions", "currentPopupOptions", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename", "sortFormatsForPopup", "isDashUrl"], 2),
+    extractMany(contentSrc, ["openFormatsPopup", "openQualityPopup", "closeQualityPopup", "addQualityRow", "configurePopupOptions", "currentPopupOptions", "popupDefaultName", "currentPopupFilename", "sanitizeFilenameStem", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "isStreamLikeName", "stemOfFilename", "sortFormatsForPopup", "isDashUrl", "resolutionFromFormat", "singleFormatRowLabel", "legalAlternativeNote", "isAccessRestrictedReason", "setPopupNote"], 2),
   ]
 );
 ctxC.__sendCalls = sendCallsC;

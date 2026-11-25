@@ -655,6 +655,15 @@ function bestDownloadSource(tabId, winner) {
     }
     for (const rec of observed.values()) {
       if (now - rec.at > OBSERVED_TTL_MS) continue;
+      // Round 12, item 9: an observed finding with NO initiator
+      // cannot be attributed to any page — it may be a stale
+      // entry from a previous navigation (or a previous tab, on
+      // tab-id reuse). Once frames have reported for the current
+      // page, the frame layers cover the stream, so an
+      // unattributable observation must not win the election and
+      // send a previous film's URL. Before any frame reports,
+      // observed findings are the only signal (round 9) and stay.
+      if (frameOrigins.size && !rec.initiator) continue;
       if (frameOrigins.size && rec.initiator) {
         let origin = "";
         try { origin = new URL(rec.initiator).origin; } catch (_) { origin = ""; }
@@ -726,7 +735,10 @@ function bestDownloadSource(tabId, winner) {
   // script can route an observed playlist to the formats popup
   // instead of one-click sending it (the kind was dropped here,
   // and the click handler could only guess from the URL).
-  return { url: s.url, filename: s.filename, audioUrl: s.audioUrl, referer: best.frameUrl, viaPage: !!s.viaPage, manifestText: s.manifestText, masterText: s.masterText, pageVideoDuration: pageVideoDuration, kind: s.kind || (isPlaylist(best) ? "playlist" : "file") };
+  // Round 12, item 10: carry noStream — a failed player the
+  // content script flagged, so the button can say "No stream
+  // found" instead of sending the page URL.
+  return { url: s.url, filename: s.filename, audioUrl: s.audioUrl, referer: best.frameUrl, viaPage: !!s.viaPage, manifestText: s.manifestText, masterText: s.masterText, pageVideoDuration: pageVideoDuration, kind: s.kind || (isPlaylist(best) ? "playlist" : "file"), noStream: !!s.noStream };
 }
 function electOverlay(tabId) {
   const frames = tabOverlayCandidates.get(tabId);
@@ -913,6 +925,27 @@ if (api.tabs && api.tabs.onRemoved) {
     if (tabPostTimers.has(tabId)) { clearTimeout(tabPostTimers.get(tabId)); tabPostTimers.delete(tabId); }
     delete mediaCounts[tabId];
     saveMediaCounts();
+  });
+}
+// Round 12, item 9 (LookMovie wrong-film send): the navigation
+// boundary for the election. Observed findings live 30 minutes
+// and candidate reports live 12 seconds — both outlive a
+// same-tab navigation, so a playlist observed on the previous
+// film's page could still win the election on the new film's
+// page and send the old film's URL (the MoviesJoy link
+// re-downloaded from the LookMovie page, 2026-11-25). Clearing
+// both maps when the tab commits to a new URL ends that: the new
+// page's frames re-report within a scan, and any observation
+// stored after the clear belongs to the new page. Frames that
+// report before the clear (same-document navigations do not fire
+// changeInfo.url) are unaffected.
+function clearTabElectionState(tabId) {
+  tabObserved.delete(tabId);
+  tabOverlayCandidates.delete(tabId);
+}
+if (api.tabs && api.tabs.onUpdated) {
+  api.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo && typeof changeInfo.url === "string") clearTabElectionState(tabId);
   });
 }
 api.contextMenus.onClicked.addListener((info) => {

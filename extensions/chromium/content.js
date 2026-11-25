@@ -380,6 +380,15 @@
       // direct file the player fetched.)
       const stream = findStreamUrlFromResources();
       if (stream) return { url: stream.url, viaPage: false, viaStream: true, audioUrl: stream.audioUrl, manifestText: stream.manifestText, masterText: stream.masterText };
+      // Round 12, item 10: the player FAILED — the element carries
+      // a media error ("Unable to play media" on PrimeWire) and no
+      // stream was ever observed. The page URL is not a download:
+      // report it flagged noStream instead of a usable viaPage
+      // source, so the button can say "No stream found" instead of
+      // sending the site's home address to the engine (which
+      // refuses it). A healthy blob player (YouTube) has no error
+      // and still returns the plain viaPage source below.
+      if (el.error) return { url: null, viaPage: true, noStream: true };
       return { url: null, viaPage: true };
     }
     return null;
@@ -627,6 +636,11 @@
       if (!isVisible(el)) return null;
       const src = mediaSource(el);
       if (!src) return null;
+      // Round 12, item 10: a failed player (noStream) is not a
+      // downloadable item — the Media Detector / toolbar popup
+      // must not list the bare page URL as a download, or its
+      // Download button would send the site's home address.
+      if (src.noStream) return null;
       const item = {
         kind: kind,
         url: src.viaPage ? window.location.href : src.url,
@@ -1083,17 +1097,39 @@
   // URL is the URL's hash segment (a 60-character alphanumeric
   // token), and it replaced the good pre-fill "The Odyssey · NOVA"
   // in the popup (2026-11-24). A single token of 20+ characters
-  // drawn from [A-Za-z0-9_-+=] with no spaces, dots or slashes:
-  // real titles always contain spaces or punctuation a token
-  // lacks, and the 20-character minimum keeps short single-word
-  // titles ("Dune", "Inception") safe. Dots are excluded so a
-  // dotted release name ("The.Odyssey.2026.1080p") is not
-  // mistaken for a hash.
+  // drawn from [A-Za-z0-9_-+=.] with no spaces or slashes:
+  // real titles always contain spaces, and the 20-character
+  // minimum keeps short single-word titles ("Dune", "Inception")
+  // safe. Round 12: dots JOINED the class — the real novahd title
+  // is "novahd-anon.0b8833fa881fe689.019314daf61830f3.1795600067"
+  // (dotted segments), which the dot-less class missed. Trade-off,
+  // accepted: a dotted release name with no spaces
+  // ("The.Odyssey.2026.1080p") now also reads as hash-like — the
+  // popup then falls back to the page title, which names the film
+  // better anyway.
   function isHashLikeTitle(title) {
     const t = String(title || "").trim();
     if (t.length < 20) return false;
     if (/\s/.test(t)) return false;
-    return /^[A-Za-z0-9_\-+=]+$/.test(t);
+    return /^[A-Za-z0-9_\-+=.]+$/.test(t);
+  }
+  // Round 12, item 6: a stream/manifest name names no film — it
+  // must never be the popup's filename pre-fill. The verdict
+  // filename is the stream's own name ("index_266" on ThugTV,
+  // "index-s1080p-v1-a1" on MoviesJoy, "index_web" on nime,
+  // "video.mp4" on Soap2Day), and a bare "download" is no name at
+  // all. A real title has spaces; a no-spaces token that is exactly
+  // a generic word, or starts with a manifest stem ("index_",
+  // "index-", "master_", "playlist_"), is a stream name. Used for
+  // filename stems AND server titles (a yt-dlp title can itself be
+  // the stream name, e.g. "index_web").
+  function isStreamLikeName(name) {
+    const t = String(name || "").trim().toLowerCase();
+    if (!t || /\s/.test(t)) return false;
+    if (t === "video" || t === "download" || t === "index" || t === "master" || t === "playlist" || t === "manifest") return true;
+    if (/^(index|master|playlist|manifest)[-_.]/.test(t)) return true;
+    if (/^(video|download)[-_.]?\d+$/.test(t)) return true;
+    return false;
   }
   function pageTitleStem() {
     let title = (document.title || "").trim();
@@ -1158,10 +1194,14 @@
     // carried as the filename, e.g. novahd's 60-character token)
     // names no film: return "" so the caller falls through to
     // "download" instead of saving the hash (round 11, item 13).
+    // Round 12, item 6: a stream/manifest stem ("index_266",
+    // "index_web", "index-s1080p-v1-a1", "video", "download") is
+    // refused the same way — the page title must win over it.
     const base = String(filename || "").split(/[/\\]/).pop() || "";
     const dot = base.lastIndexOf(".");
     const stem = dot > 0 ? base.slice(0, dot) : base;
     if (isHashLikeTitle(stem)) return "";
+    if (isStreamLikeName(stem)) return "";
     return sanitizeFilenameStem(stem);
   }
   function popupDefaultName(dl, serverTitle) {
@@ -1169,8 +1209,11 @@
     // title (the formats response carries yt-dlp's clean title),
     // then the page title, then the verdict filename's stem. A
     // hash-like server title is skipped (round 11, item 2) — it
-    // names no film and must not beat a real page title.
-    if (serverTitle && !isHashLikeTitle(serverTitle)) { const s = sanitizeFilenameStem(serverTitle); if (s) return s; }
+    // names no film and must not beat a real page title. Round 12,
+    // item 6: a stream-like server title ("index_web") is skipped
+    // the same way — the page title (video title / h1 / og:title)
+    // names the film, the stream name does not.
+    if (serverTitle && !isHashLikeTitle(serverTitle) && !isStreamLikeName(serverTitle)) { const s = sanitizeFilenameStem(serverTitle); if (s) return s; }
     const t = pageTitleStem();
     if (t) return t;
     const hint = pageNameHint();
@@ -1288,7 +1331,12 @@
     // keep their real filename.
     if (!dl) return undefined;
     if (dl.viaPage) return dl.filename;
-    if (isManifestUrl(dl.url)) return pageTitleStem() || pageNameHint() || dl.filename;
+    // Round 12, item 6: a manifest stream's own filename is a
+    // stream name ("index_266.ts"), never the file's name — route
+    // it through stemOfFilename so a stream-like stem falls
+    // through to undefined (the engine names it) instead of
+    // saving "index_266.ts". A real stem ("film") still passes.
+    if (isManifestUrl(dl.url)) return pageTitleStem() || pageNameHint() || stemOfFilename(dl.filename) || undefined;
     return dl.filename;
   }
   function currentPopupFilename() {
@@ -1377,6 +1425,29 @@
   // popup closes; on failure it stays open with the error.
   function pickAndSend(btn, dl, opts) {
     opts = opts || {};
+    // Round 12, item 9 (LookMovie wrong-film send): the popup's
+    // rows were built for the verdict captured when the popup
+    // opened, and the pick sends that verdict's URL. If the
+    // election has since moved on — a different stream, or no
+    // stream at all — the rows describe a stream this click must
+    // NOT send. The verdict-change handler normally closes the
+    // popup on a URL change, but a missed verdict message (or a
+    // stale verdict the background re-elected from an old
+    // observation) leaves the popup open on a dead verdict, so
+    // re-validate at pick time: refuse, close the popup, and tell
+    // the user to click again for the new stream. Nothing is
+    // sent on this path.
+    if (popupOpen && dl && dl.url && (!currentDownload || !currentDownload.url || dl.url !== currentDownload.url)) {
+      closeQualityPopup();
+      btn.textContent = "Stream changed — try again";
+      btn.title = "The stream changed while the popup was open. Click the button again to pick from the new stream.";
+      window.setTimeout(function () {
+        btn.disabled = false;
+        btn.textContent = "↓ FetchForge";
+        btn.title = "";
+      }, 5000);
+      return Promise.resolve({ ok: false, error: "Stream changed" });
+    }
     if (!("filename" in opts) || !opts.filename) opts.filename = currentPopupFilename();
     // Round 11 extension, features 2/4/13: the popup-chrome
     // option selects apply to every pick. A row's own audio
@@ -1402,6 +1473,9 @@
     floatOverlay.popupTitle.textContent = "Download failed";
     floatOverlay.popupSubtitle.textContent = reason ? String(reason) : "The app could not start this download.";
     floatOverlay.popupSubtitle.style.display = "block";
+    // Round 12, item 14: a DRM / access-restricted refusal also
+    // shows the legal-alternative note under the reason.
+    setPopupNote(legalAlternativeNote(reason));
     floatOverlay.popupBody.textContent = "";
     popupRows = [];
   }
@@ -1415,6 +1489,21 @@
     // closes it instead of sending.
     if (popupOpen) { closeQualityPopup(); return; }
     const dl = currentDownload;
+    // Round 12, item 10: the elected verdict is a FAILED player
+    // (PrimeWire: "Unable to play media", no stream ever loaded).
+    // Its URL is the bare page address — sending it would queue
+    // a download the engine refuses. Say so on the button instead
+    // of opening a popup that can only send the homepage.
+    if (dl.noStream) {
+      btn.textContent = "No stream found";
+      btn.title = "The player did not load a video on this page, so there is nothing to download.";
+      window.setTimeout(function () {
+        btn.disabled = false;
+        btn.textContent = "↓ FetchForge";
+        btn.title = "";
+      }, 5000);
+      return;
+    }
     // HLS master with choices: parse the captured master text
     // (from the verdict) into variant rows and let the user pick.
     // Round 8: a master with even ONE variant opens the popup —
@@ -1716,6 +1805,8 @@
     // the server's clean title once the response arrives, unless
     // the user already typed their own name (dirty flag).
     popupFilenameDirty = false;
+    // A new popup starts with no note (round 12, items 7/14).
+    setPopupNote("");
     if (floatOverlay.filenameInput) floatOverlay.filenameInput.value = defaultName || "download";
     // The option selects are hidden on every open; the opener
     // configures them (configurePopupOptions) once the choices
@@ -1876,6 +1967,78 @@
       }
     });
   }
+  // Round 12, item 7: a single bridge format with no height is
+  // labelled "Video · ts" by the engine (a media playlist declares
+  // no resolution — its format id IS the manifest URL, ext "ts").
+  // Prefer the resolution from the format's height, else from the
+  // variant name / manifest URL ("index-s1080p-v1-a1.m3u8" carries
+  // 1080p), else "" — genuinely unknown.
+  function resolutionFromFormat(f) {
+    if (f && f.height) return f.height + "p";
+    const hay = ((f && f.format_id) || "") + " " + ((f && f.label) || "");
+    let m = hay.match(/(\d{3,4})p\b/);
+    if (m) return m[1] + "p";
+    m = hay.match(/(\d{3,4})x(\d{3,4})/);
+    if (m) return m[2] + "p";
+    return "";
+  }
+  // The row label for a lone bridge format: the resolution replaces
+  // the bare "Video" lead ("Video · ts" -> "1080p · ts"), keeping
+  // the rest of the label (container, bitrate, size). When no
+  // resolution can be found anywhere, the label says so plainly
+  // ("Video · ts · quality unknown") and the caller adds the WHY
+  // as a popup note — the stream declares no resolution.
+  function singleFormatRowLabel(f) {
+    const base = (f && (f.label || f.format_id)) || "Video";
+    const res = resolutionFromFormat(f);
+    if (res) {
+      if (/^Video\b/.test(base)) return base.replace(/^Video\b/, res);
+      if (base.indexOf(res) === -1) return res + " · " + base;
+      return base;
+    }
+    if (base.indexOf("quality unknown") !== -1) return base;
+    return base + " · quality unknown";
+  }
+  // Round 12, item 14: the "authorized alternative" note. The
+  // bridge already refuses DRM / access-restricted streams with a
+  // plain error ("This video is DRM-protected. FetchForge does not
+  // bypass DRM or encryption."), which reaches the popup as the
+  // degraded-popup reason or the send error. When the reason names
+  // DRM or an access restriction (sign-in / private), the popup
+  // shows this note ALONGSIDE the refusal: a generic pointer to
+  // legal viewing, never a claim that a specific service carries
+  // this title (unverified), and no license-server or DRM-system
+  // integration (that needs official partnerships — out of scope).
+  // Returns "" for any other failure, so ordinary errors show no
+  // note. A 403 / access-denied fetch failure is NOT access
+  // restriction (the MoviesJoy 403 was a missing Referer), so it
+  // does not trigger the note.
+  function isAccessRestrictedReason(reason) {
+    const e = String(reason || "").toLowerCase();
+    return e.indexOf("drm") !== -1
+      || e.indexOf("sign-in") !== -1 || e.indexOf("sign in") !== -1
+      || e.indexOf("private") !== -1;
+  }
+  function legalAlternativeNote(reason) {
+    if (!isAccessRestrictedReason(reason)) return "";
+    if (String(reason || "").toLowerCase().indexOf("drm") !== -1) {
+      return "This video is DRM-protected, so FetchForge can't download it. You can still watch it on a legal streaming service or in the site's own player.";
+    }
+    return "This video needs a sign-in or is private, so FetchForge can't download it. You can still watch it on a legal streaming service or in the site's own player.";
+  }
+  // Show (or hide, with "") the popup's note line — the second line
+  // under the subtitle, used for the item-14 alternative note and
+  // the item-7 quality-unknown WHY. Guarded: older harness stubs
+  // (and any overlay built before this round) have no popupNote.
+  function setPopupNote(text) {
+    if (!floatOverlay || !floatOverlay.popupNote || !floatOverlay.popupNote.style) return;
+    if (text) {
+      floatOverlay.popupNote.textContent = text;
+      floatOverlay.popupNote.style.display = "block";
+    } else {
+      floatOverlay.popupNote.style.display = "none";
+    }
+  }
   // Sort bridge formats into the popup ladder (round 8): video
   // highest-first (height, then bitrate), audio-only rows last.
   // The server already sorts best-first; this is defence in depth
@@ -1888,23 +2051,40 @@
     // (and merged video rows twice, 144p three times). Keyed on
     // label + kind + bitrate + size; the first occurrence wins.
     // A format with NO measurement at all (no bitrate, no size)
-    // skips the visible dedupe: its identity is too thin to
-    // prove two entries are the same stream — YouTube's HLS
-    // audio entries 233/234 are both "Audio only · mp4" with no
-    // bitrate or size yet different qualities, and must both
-    // survive. The id dedupe stays as a first pass for every
-    // format: the same id is the same stream by definition.
+    // skips the visible dedupe ONLY when it is audio-only: its
+    // identity is too thin to prove two entries are the same
+    // stream — YouTube's HLS audio entries 233/234 are both
+    // "Audio only · mp4" with no bitrate or size yet different
+    // qualities, and must both survive. Round 12, item 3: a
+    // VIDEO entry without measurements dedupes on label + kind +
+    // height instead (see the loop below). The id dedupe stays
+    // as a first pass for every format: the same id is the same
+    // stream by definition.
     const seen = {};
     const list = [];
     for (const f of (formats || [])) {
       const idKey = (f && f.format_id) ? ("id:" + f.format_id) : "";
       if (idKey && seen[idKey]) continue;
       if (idKey) seen[idKey] = true;
+      // Round 12, item 3: the visible-identity dedupe now applies
+      // to VIDEO entries even without measurements — a merged
+      // video row listed twice with no bitrate/size is still the
+      // same stream when label + kind + height agree, and the
+      // 144p-triple case proved the listing duplicates them.
+      // The exemption stays for AUDIO only: YouTube's HLS audio
+      // entries 233/234 are both "Audio only · mp4" with no
+      // bitrate or size yet different qualities, and must both
+      // survive. A measured format (any kind) keeps the full
+      // label + kind + bitrate + size key.
       const hasMeasure = f && (f.abr != null || f.vbr != null || f.filesize != null);
-      if (hasMeasure) {
-        const visKey = "vis:" + ((f && f.label) || "") + "|" + ((f && f.kind) || "")
-          + "|" + ((f && f.abr != null) ? f.abr : "") + "|" + ((f && f.vbr != null) ? f.vbr : "")
-          + "|" + ((f && f.filesize != null) ? f.filesize : "");
+      const isAudio = f && f.kind === "audio_only";
+      if (hasMeasure || !isAudio) {
+        const visKey = hasMeasure
+          ? "vis:" + ((f && f.label) || "") + "|" + ((f && f.kind) || "")
+            + "|" + ((f && f.abr != null) ? f.abr : "") + "|" + ((f && f.vbr != null) ? f.vbr : "")
+            + "|" + ((f && f.filesize != null) ? f.filesize : "")
+          : "vis-nm:" + ((f && f.label) || "") + "|" + ((f && f.kind) || "")
+            + "|" + ((f && f.height != null) ? f.height : "");
         if (seen[visKey]) continue;
         seen[visKey] = true;
       }
@@ -1947,6 +2127,9 @@
       // unavailable".
       floatOverlay.popupSubtitle.textContent = reason ? String(reason) : "Quality info unavailable";
       floatOverlay.popupSubtitle.style.display = "block";
+      // Round 12, item 14: a DRM / access-restricted reason also
+      // shows the legal-alternative note under the reason.
+      setPopupNote(legalAlternativeNote(reason));
       floatOverlay.popupBody.textContent = "";
       popupRows = [];
       addQualityRow("Video · default quality", true, function () {
@@ -1998,8 +2181,9 @@
       // URL's hash segment) is not shown as the subtitle and
       // must not overwrite the filename field's good pre-fill —
       // the page title it was filled from names the film, the
-      // hash does not.
-      if (resp.title && !isHashLikeTitle(resp.title)) {
+      // hash does not. Round 12, item 6: a stream-like server
+      // title ("index_web") is refused the same way.
+      if (resp.title && !isHashLikeTitle(resp.title) && !isStreamLikeName(resp.title)) {
         floatOverlay.popupSubtitle.textContent = resp.title;
         floatOverlay.popupSubtitle.style.display = "block";
         // Upgrade the filename field to the server's clean title
@@ -2012,21 +2196,29 @@
       floatOverlay.popupBody.textContent = "";
       popupRows = [];
       let anySelected = false;
+      const sortedFormats = sortFormatsForPopup(resp.formats);
+      const hasAudioFormat = sortedFormats.some(function (f) { return f.kind === "audio_only"; });
       // Round 11 extension, features 2/4/13: the formats
       // response carries the page's audio languages and
       // subtitle languages; the audio-format select shows when
-      // any format is audio-only.
+      // any format is audio-only — or when the audio row below
+      // is synthesized (round 12, item 1), which is every
+      // formats popup that lists no audio format.
       configurePopupOptions({
         audioLanguages: resp.audio_languages || [],
         subtitleLanguages: resp.subtitle_langs || [],
-        showAudioFormat: resp.formats.some(function (f) { return f.kind === "audio_only"; }),
+        showAudioFormat: true,
       });
       // A single format ALSO shows the popup now (round 8): the
       // one row plus the filename field, no silent send.
-      sortFormatsForPopup(resp.formats).forEach(function (f) {
+      // Round 12, item 7: a lone format gets its resolution in
+      // the label ("Video · ts" -> "1080p · ts") instead of the
+      // bare container name.
+      sortedFormats.forEach(function (f) {
         const selected = !anySelected && f.format_id === resp.default_format_id;
         if (selected) anySelected = true;
-        addQualityRow(f.label || f.format_id, selected, function () {
+        const rowLabel = sortedFormats.length === 1 ? singleFormatRowLabel(f) : (f.label || f.format_id);
+        addQualityRow(rowLabel, selected, function () {
           // Pass captured manifest text along (a DASH .mpd the
           // hook captured from the player): signed links may fail
           // on a second fetch, so the engine uses this copy.
@@ -2037,6 +2229,26 @@
           pickAndSend(btn, dl, { formatId: f.format_id, audioUrl: undefined, manifestText: dl.manifestText || dl.masterText, audioOnly: f.kind === "audio_only" });
         });
       });
+      // Round 12, item 1: the listing may carry no audio-only
+      // format at all (novahd, NOXX, 123Movies, ThugTV and
+      // MoviesJoy all showed video rows only) — synthesize the
+      // "Audio only" row instead of offering no audio choice.
+      // The send is the same audio-only shape the
+      // extension-side popups already use (no format id, no
+      // variant URL): the engine extracts the audio from the
+      // stream (download_hls_audio_only for HLS manifests,
+      // yt-dlp audio extraction for pages).
+      if (!hasAudioFormat) {
+        addQualityRow("Audio only", false, function () {
+          pickAndSend(btn, dl, { audioOnly: true });
+        });
+      }
+      // Round 12, item 7: a lone format with no resolution
+      // anywhere says WHY in the note line — the stream declares
+      // no resolution, so the quality is genuinely unknown.
+      if (sortedFormats.length === 1 && !resolutionFromFormat(sortedFormats[0])) {
+        setPopupNote("Quality unknown: the stream declares no resolution, so FetchForge can't say which quality this is.");
+      }
       // No format matched default_format_id: highlight the first
       // row (the server lists its best first) instead of none.
       if (!anySelected && popupRows.length) {
@@ -2152,6 +2364,13 @@
     const popupSubtitle = document.createElement("div");
     popupSubtitle.style.cssText = "display:none;padding:8px 12px 0;font-size:12px;color:#9ca3af;"
       + "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:none;";
+    // Popup note line (round 12, items 7/14): a second, wrapping
+    // line under the subtitle for the DRM legal-alternative note
+    // and the single-format quality-unknown WHY. Hidden unless a
+    // note is set; openQualityPopup clears it on every open.
+    const popupNote = document.createElement("div");
+    popupNote.style.cssText = "display:none;padding:6px 12px 0;font-size:12px;color:#9ca3af;"
+      + "white-space:normal;flex:none;";
     // Filename field (round 6): part of the popup chrome, above the
     // rows, so a rows refresh (formats response) never wipes it. It
     // is ALWAYS shown — even when no title could be fetched, the
@@ -2222,6 +2441,7 @@
     popupBody.style.cssText = "overflow-y:auto;padding:6px;max-height:260px;";
     popup.appendChild(popupHeader);
     popup.appendChild(popupSubtitle);
+    popup.appendChild(popupNote);
     popup.appendChild(popupNameRow);
     popup.appendChild(popupNameNote);
     popup.appendChild(popupOptions);
@@ -2236,7 +2456,7 @@
     });
     shadow.appendChild(popup);
     (document.body || document.documentElement).appendChild(host);
-    return { host: host, button: btn, popover: isPopover, popup: popup, popupTitle: popupTitle, popupSubtitle: popupSubtitle, popupBody: popupBody, filenameInput: popupNameInput, langRow: popupLangRow, langSelect: popupLangSelect, subRow: popupSubRow, subList: popupSubList, fmtRow: popupFmtRow, fmtSelect: popupFmtSelect };
+    return { host: host, button: btn, popover: isPopover, popup: popup, popupTitle: popupTitle, popupSubtitle: popupSubtitle, popupNote: popupNote, popupBody: popupBody, filenameInput: popupNameInput, langRow: popupLangRow, langSelect: popupLangSelect, subRow: popupSubRow, subList: popupSubList, fmtRow: popupFmtRow, fmtSelect: popupFmtSelect };
   }
 
   // Show or hide the floating button from the current state.
@@ -2390,6 +2610,10 @@
           audioUrl: src.audioUrl,
           manifestText: src.manifestText,
           masterText: src.masterText,
+          // Round 12, item 10: a failed player rides the election
+          // so the button can say "No stream found" instead of
+          // sending the page URL.
+          noStream: !!src.noStream,
         };
       }
       cands.push(cand);

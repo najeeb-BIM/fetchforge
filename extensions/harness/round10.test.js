@@ -3,7 +3,7 @@
 // ranking (item 8), formats dedupe (item 10), junk-title
 // auto-fill (item 11), formats-failure reasons (item 12),
 // browser identity for the paired count (item 15), and the
-// 0.2.10 manifest + chromium/firefox byte-identity checks.
+// 0.2.11 manifest + chromium/firefox byte-identity checks.
 // Every function under test is the exact source extracted from
 // extensions/chromium/content.js / background.js — see extract.js.
 "use strict";
@@ -30,7 +30,7 @@ const ctxA = makeContext(
     + "function findPlaylistFromResources() { return null; }\n"
     + "function findStreamUrlFromResources() { return null; }\n",
     extractConst(contentSrc, "STREAM_EXT_RE", 2) + "\n",
-    extractMany(contentSrc, ["qualityHintScore", "mediaSource", "sameDirectoryEncodes", "resolveUrl", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "sanitizeFilenameStem", "popupDefaultName", "stemOfFilename", "sortFormatsForPopup"], 2),
+    extractMany(contentSrc, ["qualityHintScore", "mediaSource", "sameDirectoryEncodes", "resolveUrl", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "isStreamLikeName", "sanitizeFilenameStem", "popupDefaultName", "stemOfFilename", "sortFormatsForPopup"], 2),
   ]
 );
 function setDocA(title, qs) {
@@ -99,7 +99,10 @@ test("Item 11: popupDefaultName falls through junk title to the hint, then the v
   ctxA.dl = { filename: "index_287.ts" };
   assertEq(runIn(ctxA, "popupDefaultName(dl, null)"), "In the Lost Lands");
   setDocA("Movies Online for Free at Lookmovie2", {});
-  assertEq(runIn(ctxA, "popupDefaultName(dl, null)"), "index_287", "no hint: verdict stem");
+  // Round 12, item 6: an "index_NNN" verdict stem is a stream
+  // name, not a film name — it is refused now, so the field
+  // falls through to "download" instead of saving "index_287".
+  assertEq(runIn(ctxA, "popupDefaultName(dl, null)"), "download", "no hint: a stream-like stem is refused");
   setDocA("The Odyssey (2026) | NovaHD", { "h1": { textContent: "Wrong H1" } });
   assertEq(runIn(ctxA, "popupDefaultName(dl, null)"), "The Odyssey (2026)", "a good title still beats the hint");
 });
@@ -197,9 +200,9 @@ const ctxB = makeContext(
     sendRevertTimer: null,
   },
   [
-    "let popupOpen = false;\nlet popupRows = [];\nlet popupRequestId = 0;\nlet floatOverlay = null;\n"
+    "let popupOpen = false;\nlet popupRows = [];\nlet popupRequestId = 0;\nlet floatOverlay = null;\nlet currentDownload = null;\n"
     + "globalThis.__popupOpen = function () { return popupOpen; };\n",
-    extractMany(contentSrc, ["sendCurrentDownload", "pickAndSend", "showPopupSendError", "closeQualityPopup", "currentPopupOptions", "currentPopupFilename", "defaultFilenameFor", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "stemOfFilename", "sanitizeFilenameStem", "isManifestUrl", "shortFailureReason"], 2),
+    extractMany(contentSrc, ["sendCurrentDownload", "pickAndSend", "showPopupSendError", "closeQualityPopup", "currentPopupOptions", "currentPopupFilename", "defaultFilenameFor", "pageTitleStem", "pageNameHint", "isJunkTitle", "isHashLikeTitle", "isStreamLikeName", "stemOfFilename", "sanitizeFilenameStem", "isManifestUrl", "shortFailureReason", "setPopupNote", "legalAlternativeNote", "isAccessRestrictedReason"], 2),
   ]
 );
 function makeOverlayB(filename) {
@@ -220,7 +223,10 @@ function resetB(reply) {
   const btn = { disabled: false, textContent: "↓ FetchForge", title: "" };
   ctxB.btn = btn;
   ctxB.dl = { url: "https://example.com/v.mp4", filename: "v.mp4" };
-  runIn(ctxB, "popupOpen = false; popupRows = []; sendRevertTimer = null;");
+  // Round 12, item 9: the popup's dl IS the current verdict —
+  // the pick re-validates against it, so the harness must set it
+  // or every pick is refused as stale.
+  runIn(ctxB, "popupOpen = false; popupRows = []; sendRevertTimer = null; currentDownload = dl;");
   return btn;
 }
 
@@ -508,10 +514,10 @@ test("Item 15: getBrowserId is stable across calls and stored once", async () =>
 });
 
 // ---------- Manifests + byte identity ----------
-test("Manifests are at 0.2.10 in both browsers", () => {
+test("Manifests are at 0.2.11 in both browsers", () => {
   for (const name of ["chromium", "firefox"]) {
     const m = JSON.parse(readSource("extensions/" + name + "/manifest.json"));
-    assertEq(m.version, "0.2.10", name + " version");
+    assertEq(m.version, "0.2.11", name + " version");
   }
 });
 

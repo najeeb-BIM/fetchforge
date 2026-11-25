@@ -97,7 +97,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run tests (bisection: is this the step that kills the runner?)
+      - name: Run tests (bisection)
         run: cargo test
       - name: Release build with 10-minute timeout
         shell: pwsh

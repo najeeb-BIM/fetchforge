@@ -22,7 +22,7 @@ pub mod threed;
 pub mod token;
 pub mod validate;
 
-pub use category::category_for_filename;
+pub use category::{audio_destination_dir, category_for_download, category_for_filename};
 pub use download::{
     download, probe, stop_reason, DownloadOptions, Probe, Progress, SharedLimiter, StopReason,
 };
@@ -47,14 +47,16 @@ pub use image::{
     parse_srcset, pick_best_srcset_url, pick_srcset_url, url_path_extension, SrcsetCandidate,
 };
 pub use media::{
-    classify_stream_prefix, download_dash, download_dash_with, download_hls,
-    download_hls_audio_only, download_hls_audio_only_opts, download_hls_pair,
-    download_hls_pair_opts, download_hls_variant, download_hls_variant_opts, estimate_total_bytes,
-    is_manifest_url, list_dash_formats_with_proxy, list_hls_formats_with_proxy,
-    list_stream_formats, list_stream_formats_kind, list_stream_formats_kind_with_proxy,
-    list_stream_formats_with_proxy, sniff_stream_kind, sniff_stream_kind_with_proxy,
-    stream_kind_of_content_type, stream_kind_of_url, CapturedManifest, DashDownloadOptions,
-    SizeKind, StreamDownloadOptions, StreamKind, MAX_CAPTURED_MANIFEST_BYTES,
+    classify_stream_prefix, download_dash, download_dash_audio_only, download_dash_with,
+    download_dash_with_audio_only, download_hls, download_hls_audio_only,
+    download_hls_audio_only_opts, download_hls_pair, download_hls_pair_audio_only_opts,
+    download_hls_pair_opts, download_hls_variant, download_hls_variant_audio_only_opts,
+    download_hls_variant_opts, estimate_total_bytes, is_manifest_url, list_dash_formats_with_proxy,
+    list_hls_formats_with_proxy, list_stream_formats, list_stream_formats_kind,
+    list_stream_formats_kind_with_proxy, list_stream_formats_with_proxy, sniff_stream_kind,
+    sniff_stream_kind_with_proxy, stream_kind_of_content_type, stream_kind_of_url,
+    CapturedManifest, DashDownloadOptions, SizeKind, StreamDownloadOptions, StreamKind,
+    MAX_CAPTURED_MANIFEST_BYTES,
 };
 pub use state::{delete_download_files, DownloadRecord, Status, Store};
 pub use threed::{

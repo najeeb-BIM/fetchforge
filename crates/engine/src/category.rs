@@ -18,6 +18,69 @@ pub fn category_for_filename(filename: &str) -> &'static str {
     }
 }
 
+/// Category for a download whose final form is known: an
+/// audio-only download is Audio no matter what the intermediate
+/// filename says (round 13, item 6 — NOXX 2026-11-25: an
+/// audio-only `.m4a` landed in Video/ because the record still
+/// carried the video format's `.mp4` filename when the folder
+/// was chosen). Callers that know `audio_only` should use this
+/// instead of [`category_for_filename`].
+pub fn category_for_download(filename: &str, audio_only: bool) -> &'static str {
+    if audio_only {
+        "Audio"
+    } else {
+        category_for_filename(filename)
+    }
+}
+
+/// Is this folder name one of the category subfolders
+/// ([`category_for_filename`])? Used to recognise a
+/// caller-computed category dir (see
+/// [`audio_destination_dir`]).
+fn is_category_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "Video" | "Audio" | "Documents" | "Images" | "3D" | "Archives" | "Software" | "Other"
+    )
+}
+
+/// Re-route a caller-computed destination dir for an audio-only
+/// download: when the dir ends in a category subfolder (the
+/// caller organised by the intermediate filename — e.g. Video/
+/// for a `.mp4` name), swap it for Audio/, so both the
+/// intermediate file and the extracted audio land in Audio/.
+/// A dir that does not end in a category folder (organising
+/// off, or a user folder with another name) is returned
+/// unchanged.
+///
+/// Only a category folder NESTED inside another folder is
+/// swapped: a download root that itself is named like a
+/// category (e.g. `D:\Video` with organising off) has a single
+/// `Normal` path component and is left alone — the name alone
+/// cannot tell a user-chosen root from a folder FetchForge
+/// created while organising, and guessing wrong would move the
+/// file out of the folder the user chose. Callers that know
+/// whether organising is on should prefer
+/// [`category_for_download`], which never guesses from the dir
+/// name.
+pub fn audio_destination_dir(dir: &Path) -> std::path::PathBuf {
+    // A category folder FetchForge created while organising is
+    // always `<download root>/<Category>`, i.e. at least two
+    // Normal components; a bare root named like a category
+    // (`D:\Video`, `/Video`) has exactly one.
+    let nested = dir
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count()
+        >= 2;
+    match dir.file_name().and_then(|n| n.to_str()) {
+        Some(name) if nested && is_category_dir(name) && name != "Audio" => {
+            dir.with_file_name("Audio")
+        }
+        _ => dir.to_path_buf(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,5 +96,53 @@ mod tests {
         assert_eq!(category_for_filename("unknown.xyz"), "Other");
         assert_eq!(category_for_filename("no-extension"), "Other");
         assert_eq!(category_for_filename("CLIP.MP4"), "Video");
+    }
+
+    #[test]
+    fn audio_only_category_ignores_the_video_filename() {
+        // Round 13, item 6: an audio-only download is Audio even
+        // when the record still carries the video format's
+        // filename — the folder is decided by what the download
+        // IS, not by the intermediate name.
+        assert_eq!(category_for_download("film.mp4", true), "Audio");
+        assert_eq!(category_for_download("film.m4a", true), "Audio");
+        assert_eq!(category_for_download("film.mp4", false), "Video");
+        assert_eq!(category_for_download("song.mp3", false), "Audio");
+    }
+
+    #[test]
+    fn audio_destination_dir_swaps_only_category_folders() {
+        // A caller-computed Video/ (or any other category) dir
+        // becomes Audio/; an already-Audio dir and a plain user
+        // folder are left alone.
+        assert_eq!(
+            audio_destination_dir(Path::new("/dl/Video")),
+            Path::new("/dl/Audio")
+        );
+        assert_eq!(
+            audio_destination_dir(Path::new("/dl/Documents")),
+            Path::new("/dl/Audio")
+        );
+        assert_eq!(
+            audio_destination_dir(Path::new("/dl/Audio")),
+            Path::new("/dl/Audio")
+        );
+        assert_eq!(
+            audio_destination_dir(Path::new("/dl/Downloads")),
+            Path::new("/dl/Downloads")
+        );
+        assert_eq!(audio_destination_dir(Path::new("/dl")), Path::new("/dl"));
+        // Round 13 follow-up: a download ROOT literally named
+        // like a category (organising off, the user chose that
+        // folder) is left alone — only a category folder nested
+        // inside a download root is swapped.
+        assert_eq!(
+            audio_destination_dir(Path::new("/Video")),
+            Path::new("/Video")
+        );
+        assert_eq!(
+            audio_destination_dir(Path::new("/dl/Video")),
+            Path::new("/dl/Audio")
+        );
     }
 }

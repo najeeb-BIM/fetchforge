@@ -20,8 +20,9 @@
 //!   fetchforge-bridge print-token [--data-dir DIR]
 
 use fetchforge_engine::{
-    category_for_filename, download, download_dash, download_gltf_bundle,
-    download_hls_audio_only_opts, download_hls_pair_opts, download_hls_variant_opts,
+    category_for_download, category_for_filename, download, download_dash,
+    download_dash_audio_only, download_gltf_bundle, download_hls_audio_only_opts,
+    download_hls_pair_opts, download_hls_variant_audio_only_opts, download_hls_variant_opts,
     download_media, ensure_ffmpeg, ensure_image_extension, extract_audio_as,
     fetch_gltf_plan_with_proxy, find_ytdlp, generate_download_id, generate_secure_token,
     is_gltf_url, is_image_content_type, list_formats_with_referer_and_proxy,
@@ -1374,7 +1375,12 @@ impl App {
                 };
                 updated.url = record_url;
                 updated.filename = plan.filename.clone();
-                updated.category = category_for_filename(&plan.filename).to_string();
+                // Round 13 follow-up, item 6: the record's
+                // category matches the folder the file lands in —
+                // an audio-only record is Audio even when the
+                // plan still carries the video format's filename.
+                updated.category =
+                    category_for_download(&plan.filename, rec.audio_only).to_string();
                 updated.total_bytes = plan.total_bytes;
                 // Round 11, item 10: how the plan total was
                 // determined — the UI shows the marker.
@@ -2232,7 +2238,15 @@ impl App {
         self.set_status(&id, Status::Downloading, None);
         let mut dir = PathBuf::from(&settings.download_dir);
         if settings.organise_by_category {
-            dir = dir.join(category_for_filename(&rec.filename));
+            // Round 13 follow-up, item 6: the folder is decided
+            // by what the download IS — an audio-only record
+            // goes to Audio/ even when it still carries the
+            // video format's filename (the NOXX case: a combined
+            // format picked audio-only). category_for_download
+            // never guesses from the dir name, so a download
+            // root literally named Video is safe with organising
+            // off (the dir is then the root, unchanged).
+            dir = dir.join(category_for_download(&rec.filename, rec.audio_only));
         }
         let variant_uri = rec.format_id.clone().unwrap_or_else(|| rec.url.clone());
         let ffmpeg = if rec.needs_merge || rec.audio_only {
@@ -2297,7 +2311,13 @@ impl App {
         let captured = read_manifest_sidecar(&self.data_dir, &id, &rec.url);
         let result = if rec.audio_only {
             match &rec.audio_url {
-                Some(audio_uri) => download_hls_variant_opts(
+                // Round 13 follow-up, item 6: the paired audio
+                // sibling downloads alone through the audio-only
+                // variant entry point, so it lands in Audio/
+                // even when the caller computed Video/ — the
+                // plain variant entry point cannot tell this
+                // playlist from a video-only one.
+                Some(audio_uri) => download_hls_variant_audio_only_opts(
                     audio_uri,
                     audio_uri,
                     &dir,
@@ -2433,7 +2453,10 @@ impl App {
         self.set_status(&id, Status::Downloading, None);
         let mut dir = PathBuf::from(&settings.download_dir);
         if settings.organise_by_category {
-            dir = dir.join(category_for_filename(&rec.filename));
+            // Round 13 follow-up, item 6: see run_stream_hls —
+            // an audio-only record goes to Audio/ even when it
+            // still carries the video format's filename.
+            dir = dir.join(category_for_download(&rec.filename, rec.audio_only));
         }
         // "Audio only": resolve ffmpeg UPFRONT, so a missing ffmpeg
         // fails fast instead of after a full video download (same
@@ -2479,14 +2502,31 @@ impl App {
                 let _ = store.save();
             }
         };
-        match download_dash(
-            &self.data_dir,
-            &opts,
-            &progress,
-            &job.paused,
-            &job.cancelled,
-            read_manifest_sidecar(&self.data_dir, &id, &rec.url).as_ref(),
-        ) {
+        match if rec.audio_only {
+            // Round 13 follow-up, item 6: an audio-only DASH
+            // record whose chosen representation is video needs
+            // the audio-only entry point — the engine cannot
+            // tell it from a video download on its own. (When
+            // the chosen representation itself is audio, the
+            // plain entry point already re-routes.)
+            download_dash_audio_only(
+                &self.data_dir,
+                &opts,
+                &progress,
+                &job.paused,
+                &job.cancelled,
+                read_manifest_sidecar(&self.data_dir, &id, &rec.url).as_ref(),
+            )
+        } else {
+            download_dash(
+                &self.data_dir,
+                &opts,
+                &progress,
+                &job.paused,
+                &job.cancelled,
+                read_manifest_sidecar(&self.data_dir, &id, &rec.url).as_ref(),
+            )
+        } {
             Ok(final_path) => {
                 // "Audio only": extract the audio track BEFORE the
                 // record is marked Completed (see run_one). A DASH

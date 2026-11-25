@@ -3524,8 +3524,97 @@ pub fn download_hls_variant_opts(
     captured: Option<&CapturedManifest>,
     opts: &StreamDownloadOptions,
 ) -> Result<PathBuf, String> {
+    download_hls_variant_opts_inner(
+        manifest_url,
+        variant_uri,
+        destination_dir,
+        filename,
+        referer,
+        ffmpeg,
+        progress,
+        paused,
+        cancelled,
+        captured,
+        opts,
+        false,
+    )
+}
+
+/// [`download_hls_variant_opts`] for an audio-only download
+/// (round 13 follow-up, item 6): the same variant download,
+/// but the destination is re-routed to the Audio folder when
+/// the caller computed Video/ from the video format's
+/// filename. This is the entry point for the paired-audio case
+/// — the extension saw a video variant and its audio sibling,
+/// and the worker downloads the audio playlist alone
+/// (`variant_uri == manifest_uri == the audio playlist`) — the
+/// plain [`download_hls_variant_opts`] cannot tell that
+/// playlist from a video-only one, so the caller must say so.
+/// A video download must never use this function.
+#[allow(clippy::too_many_arguments)]
+pub fn download_hls_variant_audio_only_opts(
+    manifest_url: &str,
+    variant_uri: &str,
+    destination_dir: &Path,
+    filename: &str,
+    referer: &Option<String>,
+    ffmpeg: Option<&Path>,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
+    opts: &StreamDownloadOptions,
+) -> Result<PathBuf, String> {
+    download_hls_variant_opts_inner(
+        manifest_url,
+        variant_uri,
+        destination_dir,
+        filename,
+        referer,
+        ffmpeg,
+        progress,
+        paused,
+        cancelled,
+        captured,
+        opts,
+        true,
+    )
+}
+
+/// Shared implementation of [`download_hls_variant_opts`] and
+/// [`download_hls_variant_audio_only_opts`]: `audio_only`
+/// re-routes the destination through
+/// [`crate::category::audio_destination_dir`]; video downloads
+/// pass false and their destination is untouched.
+#[allow(clippy::too_many_arguments)]
+fn download_hls_variant_opts_inner(
+    manifest_url: &str,
+    variant_uri: &str,
+    destination_dir: &Path,
+    filename: &str,
+    referer: &Option<String>,
+    ffmpeg: Option<&Path>,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
+    opts: &StreamDownloadOptions,
+    audio_only: bool,
+) -> Result<PathBuf, String> {
     let manifest_url = validate_url(manifest_url)?;
     let variant_uri = validate_url(variant_uri)?;
+    // Round 13 follow-up, item 6: an audio-only download
+    // belongs in Audio/ even when the caller computed Video/
+    // from the video format's filename (the NOXX case: an
+    // audio-only pick of a combined format). The re-route is
+    // idempotent — an already-Audio dir, or a plain user folder
+    // (organising off), is returned unchanged.
+    let destination_dir_owned = if audio_only {
+        crate::category::audio_destination_dir(destination_dir)
+    } else {
+        destination_dir.to_path_buf()
+    };
+    let destination_dir = destination_dir_owned.as_path();
     let client = hls_client_with_timeout_and_proxy(REQUEST_TIMEOUT, opts.proxy_url.as_deref())?;
     let bandwidth = SharedLimiter::new(opts.bandwidth_kbps);
     // The master text tells us whether this variant's audio is a
@@ -3913,8 +4002,94 @@ pub fn download_hls_pair_opts(
     captured: Option<&CapturedManifest>,
     opts: &StreamDownloadOptions,
 ) -> Result<PathBuf, String> {
+    download_hls_pair_opts_inner(
+        video_uri,
+        audio_uri,
+        destination_dir,
+        filename,
+        referer,
+        ffmpeg,
+        progress,
+        paused,
+        cancelled,
+        captured,
+        opts,
+        false,
+    )
+}
+
+/// [`download_hls_pair_opts`] for an audio-only download
+/// (round 13 follow-up, item 6): the same paired download,
+/// but the destination is re-routed to the Audio folder when
+/// the caller computed Video/ from the video format's
+/// filename. The pair path is normally video (video + audio
+/// merged), so this entry exists for the record that is
+/// audio-only yet routed through the pair chain — the merged
+/// file lands in Audio/ and the caller's post-step extracts
+/// the audio from it there. A video download must never use
+/// this function.
+#[allow(clippy::too_many_arguments)]
+pub fn download_hls_pair_audio_only_opts(
+    video_uri: &str,
+    audio_uri: &str,
+    destination_dir: &Path,
+    filename: &str,
+    referer: &Option<String>,
+    ffmpeg: &Path,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
+    opts: &StreamDownloadOptions,
+) -> Result<PathBuf, String> {
+    download_hls_pair_opts_inner(
+        video_uri,
+        audio_uri,
+        destination_dir,
+        filename,
+        referer,
+        ffmpeg,
+        progress,
+        paused,
+        cancelled,
+        captured,
+        opts,
+        true,
+    )
+}
+
+/// Shared implementation of [`download_hls_pair_opts`] and
+/// [`download_hls_pair_audio_only_opts`]: `audio_only`
+/// re-routes the destination through
+/// [`crate::category::audio_destination_dir`]; video downloads
+/// pass false and their destination is untouched.
+#[allow(clippy::too_many_arguments)]
+fn download_hls_pair_opts_inner(
+    video_uri: &str,
+    audio_uri: &str,
+    destination_dir: &Path,
+    filename: &str,
+    referer: &Option<String>,
+    ffmpeg: &Path,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
+    opts: &StreamDownloadOptions,
+    audio_only: bool,
+) -> Result<PathBuf, String> {
     let video_uri = validate_url(video_uri)?;
     let audio_uri = validate_url(audio_uri)?;
+    // Round 13 follow-up, item 6: see
+    // [`download_hls_variant_opts_inner`] — an audio-only
+    // download belongs in Audio/; a video download's
+    // destination is untouched.
+    let destination_dir_owned = if audio_only {
+        crate::category::audio_destination_dir(destination_dir)
+    } else {
+        destination_dir.to_path_buf()
+    };
+    let destination_dir = destination_dir_owned.as_path();
     let client = hls_client_with_timeout_and_proxy(REQUEST_TIMEOUT, opts.proxy_url.as_deref())?;
     let bandwidth = SharedLimiter::new(opts.bandwidth_kbps);
     let video_text = manifest_text(&client, &video_uri, referer, captured)?;
@@ -5196,6 +5371,50 @@ pub fn download_dash(
     )
 }
 
+/// [`download_dash`] for an audio-only download (round 13
+/// follow-up, item 6): the same DASH download, but the
+/// destination is re-routed to the Audio folder when the caller
+/// computed Video/ from the video format's filename. This is
+/// the entry point for the record that is audio-only yet whose
+/// chosen representation is video — the popup's audio pick of
+/// a combined/video quality, whose audio the caller's
+/// post-step extracts. The engine cannot tell that download
+/// from a video download on its own (the manifest's chosen
+/// representation is video), so the caller must say so. When
+/// the chosen representation itself is audio, the plain
+/// [`download_dash_with`] already re-routes (see there). A
+/// video download must never use this function.
+pub fn download_dash_audio_only(
+    data_dir: &Path,
+    opts: &DashDownloadOptions,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
+) -> Result<PathBuf, String> {
+    let mut routed = opts.clone();
+    routed.destination_dir = crate::category::audio_destination_dir(&opts.destination_dir);
+    download_dash(data_dir, &routed, progress, paused, cancelled, captured)
+}
+
+/// [`download_dash_with`] for an audio-only download: the
+/// testable core of [`download_dash_audio_only`] — ffmpeg is
+/// explicit, so tests can substitute a stub or the system
+/// ffmpeg. Same routing rule as
+/// [`download_dash_audio_only`].
+pub fn download_dash_with_audio_only(
+    ffmpeg: Option<&Path>,
+    opts: &DashDownloadOptions,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    paused: &AtomicBool,
+    cancelled: &AtomicBool,
+    captured: Option<&CapturedManifest>,
+) -> Result<PathBuf, String> {
+    let mut routed = opts.clone();
+    routed.destination_dir = crate::category::audio_destination_dir(&opts.destination_dir);
+    download_dash_with(ffmpeg, &routed, progress, paused, cancelled, captured)
+}
+
 /// The testable core of [`download_dash`]: ffmpeg is explicit, so
 /// tests can substitute a stub or the system ffmpeg. Assembles the
 /// chosen representation (initialisation + media segments, in
@@ -5243,9 +5462,24 @@ pub fn download_dash_with(
                 .to_string(),
         );
     }
+    // Round 13 follow-up, item 6: when the chosen
+    // representation IS audio (the popup's audio format), the
+    // download is audio-only no matter what filename the caller
+    // computed the dir from — re-route a caller-computed Video/
+    // to Audio/. A video representation is untouched here; a
+    // video representation downloaded for an audio-only record
+    // needs the caller to say so (see
+    // [`download_dash_with_audio_only`]) — the manifest cannot
+    // tell it from a video download.
+    let destination_dir_owned = if chosen.is_audio() {
+        crate::category::audio_destination_dir(&opts.destination_dir)
+    } else {
+        opts.destination_dir.clone()
+    };
+    let destination_dir = destination_dir_owned.as_path();
     let clean = crate::filename::sanitize_filename(&opts.filename);
-    std::fs::create_dir_all(&opts.destination_dir).map_err(|e| e.to_string())?;
-    let final_path = crate::filename::unique_path(&opts.destination_dir, &clean);
+    std::fs::create_dir_all(destination_dir).map_err(|e| e.to_string())?;
+    let final_path = crate::filename::unique_path(destination_dir, &clean);
     let video_part = part_path_for(&final_path);
     let (init, mut segments) = dash_segments(chosen, &manifest_url, manifest.duration_secs)?;
     if let Some(init) = init {
@@ -6819,6 +7053,200 @@ mod tests {
     }
 
     #[test]
+    fn download_hls_variant_audio_only_routes_paired_audio_to_audio_folder() {
+        // Round 13 follow-up, item 6: the paired-audio case —
+        // the worker downloads the audio sibling playlist alone
+        // via download_hls_variant_opts(audio, audio), which the
+        // plain variant path cannot tell from a video-only
+        // playlist. The audio-only entry point re-routes the
+        // caller-computed Video/ dir to Audio/; the plain entry
+        // point with the same arguments leaves a video download
+        // in Video/ (control: the flag, not the filename,
+        // decides).
+        let audio_pl =
+            b"#EXTM3U\n#EXTINF:10,\na0.ts\n#EXTINF:10,\na1.ts\n#EXT-X-ENDLIST\n".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/audio.m3u8".to_string(), audio_pl);
+        files.insert("/a0.ts".to_string(), b"AUDIO-ZERO-".to_vec());
+        files.insert("/a1.ts".to_string(), b"AUDIO-ONE".to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let dir = unique_temp_dir("hls-paired-audio-folder");
+        let video_dir = dir.join("Video");
+        std::fs::create_dir_all(&video_dir).unwrap();
+        let audio_url = format!("http://127.0.0.1:{port}/audio.m3u8");
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let out = download_hls_variant_audio_only_opts(
+            &audio_url,
+            &audio_url,
+            &video_dir,
+            "film.mp4",
+            &None,
+            None,
+            &|_| {},
+            &paused,
+            &cancelled,
+            None,
+            &StreamDownloadOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"AUDIO-ZERO-AUDIO-ONE");
+        assert!(
+            out.starts_with(dir.join("Audio")),
+            "paired audio-only file must land in Audio/, got {}",
+            out.display()
+        );
+        // Control: the same playlist through the plain variant
+        // entry point stays in Video/ — a video download's
+        // destination is untouched.
+        let out = download_hls_variant_opts(
+            &audio_url,
+            &audio_url,
+            &video_dir,
+            "film.mp4",
+            &None,
+            None,
+            &|_| {},
+            &paused,
+            &cancelled,
+            None,
+            &StreamDownloadOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            out.starts_with(dir.join("Video")),
+            "plain variant download must stay in Video/, got {}",
+            out.display()
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_hls_pair_audio_only_routes_to_audio_folder() {
+        // Round 13 follow-up, item 6: an audio-only record
+        // routed through the pair chain (video + audio merged,
+        // the caller extracts the audio from the merged file)
+        // lands in Audio/, while the plain pair entry point
+        // keeps a video download in Video/.
+        let ffmpeg = match crate::ffmpeg::find_on_path("ffmpeg") {
+            Some(p) => p,
+            None => return,
+        };
+        let dir = unique_temp_dir("hls-pair-audio-folder");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |args: &[&str]| {
+            use std::process::{Command, Stdio};
+            Command::new(&ffmpeg)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let vts = dir.join("v.ts");
+        let ats = dir.join("a.ts");
+        assert!(mk(&[
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "mpegts",
+            vts.to_str().unwrap()
+        ]));
+        assert!(mk(&[
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:d=1",
+            "-c:a",
+            "aac",
+            "-f",
+            "mpegts",
+            ats.to_str().unwrap()
+        ]));
+        let vbytes = std::fs::read(&vts).unwrap();
+        let abytes = std::fs::read(&ats).unwrap();
+        let (v0, v1) = vbytes.split_at(vbytes.len() / 2);
+        let (a0, a1) = abytes.split_at(abytes.len() / 2);
+        let vplay = "#EXTM3U\n#EXTINF:1,\nv0.ts\n#EXTINF:1,\nv1.ts\n#EXT-X-ENDLIST\n";
+        let aplay = "#EXTM3U\n#EXTINF:1,\na0.ts\n#EXTINF:1,\na1.ts\n#EXT-X-ENDLIST\n";
+        let mut files = HashMap::new();
+        files.insert("/v0.m3u8".to_string(), vplay.as_bytes().to_vec());
+        files.insert("/audio_1.m3u8".to_string(), aplay.as_bytes().to_vec());
+        files.insert("/v0.ts".to_string(), v0.to_vec());
+        files.insert("/v1.ts".to_string(), v1.to_vec());
+        files.insert("/a0.ts".to_string(), a0.to_vec());
+        files.insert("/a1.ts".to_string(), a1.to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let video_dir = dir.join("Video");
+        std::fs::create_dir_all(&video_dir).unwrap();
+        let video_url = format!("http://127.0.0.1:{port}/v0.m3u8");
+        let audio_url = format!("http://127.0.0.1:{port}/audio_1.m3u8");
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let out = download_hls_pair_audio_only_opts(
+            &video_url,
+            &audio_url,
+            &video_dir,
+            "film.mp4",
+            &None,
+            &ffmpeg,
+            &|_| {},
+            &paused,
+            &cancelled,
+            None,
+            &StreamDownloadOptions::default(),
+        )
+        .unwrap();
+        assert!(out.is_file());
+        assert!(
+            out.starts_with(dir.join("Audio")),
+            "paired audio-only merge must land in Audio/, got {}",
+            out.display()
+        );
+        assert_eq!(out.extension().and_then(|e| e.to_str()), Some("mp4"));
+        // Control: the plain pair entry point keeps the video
+        // merge in Video/.
+        let out = download_hls_pair_opts(
+            &video_url,
+            &audio_url,
+            &video_dir,
+            "film.mp4",
+            &None,
+            &ffmpeg,
+            &|_| {},
+            &paused,
+            &cancelled,
+            None,
+            &StreamDownloadOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            out.starts_with(dir.join("Video")),
+            "plain pair download must stay in Video/, got {}",
+            out.display()
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn proxy_inner_manifest_url_detection() {
         // A workers.dev-style wrapper: the real manifest is the
         // `url` query parameter.
@@ -7611,6 +8039,115 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"INIT-SEG-ONE-SEG-TWO");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_dash_with_audio_only_routes_video_rep_to_audio_folder() {
+        // Round 13 follow-up, item 6: a DASH audio-only record
+        // whose chosen representation is video (the popup's
+        // audio pick of a video quality — the engine cannot tell
+        // it from a video download) lands in Audio/ through the
+        // audio-only entry point, while the plain entry point
+        // keeps the same video download in Video/.
+        let mut files = HashMap::new();
+        let mpd = r#"<MPD type="static" mediaPresentationDuration="PT8S" xmlns="urn:mpeg:dash:schema:mpd:2011">
+ <Period><AdaptationSet mimeType="video/mp4" contentType="video">
+  <SegmentTemplate duration="120" timescale="30" media="v_$Number$.m4v" startNumber="1" initialization="v_init.m4v"/>
+  <Representation id="v1" bandwidth="1000000" width="640" height="360"/>
+ </AdaptationSet></Period></MPD>"#;
+        files.insert("/v.mpd".to_string(), mpd.as_bytes().to_vec());
+        files.insert("/v_init.m4v".to_string(), b"INIT-".to_vec());
+        files.insert("/v_1.m4v".to_string(), b"SEG-ONE-".to_vec());
+        files.insert("/v_2.m4v".to_string(), b"SEG-TWO".to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let dir = unique_temp_dir("dash-audio-only-folder");
+        let video_dir = dir.join("Video");
+        std::fs::create_dir_all(&video_dir).unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let opts = DashDownloadOptions {
+            manifest_url: format!("http://127.0.0.1:{port}/v.mpd"),
+            representation_id: Some("v1".to_string()),
+            destination_dir: video_dir.clone(),
+            filename: "film.mp4".to_string(),
+            referer: None,
+            audio_language: None,
+            subtitle_language: None,
+            proxy_url: None,
+            bandwidth_kbps: None,
+            title: None,
+        };
+        let out =
+            download_dash_with_audio_only(None, &opts, &|_| {}, &paused, &cancelled, None).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"INIT-SEG-ONE-SEG-TWO");
+        assert!(
+            out.starts_with(dir.join("Audio")),
+            "DASH audio-only file must land in Audio/, got {}",
+            out.display()
+        );
+        // Control: the same video representation through the
+        // plain entry point stays in Video/.
+        let out = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled, None).unwrap();
+        assert!(
+            out.starts_with(dir.join("Video")),
+            "plain DASH video download must stay in Video/, got {}",
+            out.display()
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_dash_with_routes_audio_representation_to_audio_folder() {
+        // Round 13 follow-up, item 6: when the chosen DASH
+        // representation itself IS audio, the engine can tell —
+        // the plain entry point re-routes a caller-computed
+        // Video/ dir to Audio/ with no caller flag at all, even
+        // though the record still carries the video format's
+        // `.mp4` filename.
+        let mut files = HashMap::new();
+        let mpd = r#"<MPD type="static" mediaPresentationDuration="PT8S" xmlns="urn:mpeg:dash:schema:mpd:2011">
+ <Period><AdaptationSet mimeType="audio/mp4" contentType="audio">
+  <SegmentTemplate duration="120" timescale="30" media="a_$Number$.m4a" startNumber="1" initialization="a_init.m4a"/>
+  <Representation id="a1" bandwidth="128000"/>
+ </AdaptationSet></Period></MPD>"#;
+        files.insert("/a.mpd".to_string(), mpd.as_bytes().to_vec());
+        files.insert("/a_init.m4a".to_string(), b"AINIT-".to_vec());
+        files.insert("/a_1.m4a".to_string(), b"ASEG-ONE-".to_vec());
+        files.insert("/a_2.m4a".to_string(), b"ASEG-TWO".to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let dir = unique_temp_dir("dash-audio-rep-folder");
+        let video_dir = dir.join("Video");
+        std::fs::create_dir_all(&video_dir).unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let opts = DashDownloadOptions {
+            manifest_url: format!("http://127.0.0.1:{port}/a.mpd"),
+            representation_id: Some("a1".to_string()),
+            destination_dir: video_dir.clone(),
+            filename: "film.mp4".to_string(),
+            referer: None,
+            audio_language: None,
+            subtitle_language: None,
+            proxy_url: None,
+            bandwidth_kbps: None,
+            title: None,
+        };
+        let out = download_dash_with(None, &opts, &|_| {}, &paused, &cancelled, None).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"AINIT-ASEG-ONE-ASEG-TWO");
+        assert!(
+            out.starts_with(dir.join("Audio")),
+            "DASH audio-representation file must land in Audio/, got {}",
+            out.display()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

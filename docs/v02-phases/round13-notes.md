@@ -91,3 +91,45 @@ and lies about completion).
 - When a download completes, do NOT show a remarks line under it.
 - In the progress column of a completed download, show a dash (—) so it is
   immediately clear the download is complete.
+
+## Follow-up (2026-11-25): item 6 residual gap closed — paired / DASH audio-only routing
+
+The first item-6 fix covered only the direct HLS audio-only path
+(`download_hls_audio_only_opts`). The residual gap was the NOXX evidence
+case itself — record `audio_only=true, audio_format=m4a,
+format_kind=combined`, i.e. an audio-only pick that falls back to the
+muxed variant / paired path, not the direct audio-only path — plus DASH
+audio-only, whose caller-computed dir the engine never saw.
+
+Fix (no existing engine signature changed, so the desktop crate still
+compiles untouched — its struct literals for `StreamDownloadOptions` /
+`DashDownloadOptions` are exhaustive, so no field was added to either):
+- New engine entry points carrying the audio-only knowledge explicitly:
+  `download_hls_variant_audio_only_opts` (paired audio sibling downloaded
+  alone — the plain variant entry point cannot tell that playlist from a
+  video-only one), `download_hls_pair_audio_only_opts` (pair chain), and
+  `download_dash_audio_only` / `download_dash_with_audio_only` (a video
+  representation downloaded for an audio-only record — the manifest
+  cannot tell it from a video download). Each re-routes the destination
+  through `audio_destination_dir()`; video downloads never use them.
+- `download_dash_with` now also re-routes on its own when the chosen
+  representation IS audio (engine-detectable, no caller flag needed).
+- Bridge (`run_stream_hls` / `run_stream_dash`) computes the dir with
+  `category_for_download(&rec.filename, rec.audio_only)` and uses the new
+  audio-only entry points for audio-only records; the planned record's
+  category is set the same way, so it matches the folder the file lands in.
+- `audio_destination_dir` edge fixed: only a category folder NESTED
+  inside a download root is swapped (at least two Normal path
+  components). A download root literally named `Video` (`D:\Video`,
+  `/Video`, organising off) is left alone.
+
+Still open — desktop follow-up (NOT done here; `apps/desktop/` was out of
+scope for this change): `apps/desktop/src-tauri/src/main.rs`
+`run_stream_hls_download` must compute its dir with
+`category_for_download(&rec.filename, rec.audio_only)` and call
+`download_hls_variant_audio_only_opts` for the audio-only + audio-URL
+branch; `run_stream_dash_download` must do the same dir change and call
+`download_dash_audio_only` for audio-only records. Until then the desktop
+process still lands paired/DASH audio-only downloads in Video/; the
+bridge process is fixed, and the engine now provides the entry points
+either caller needs.

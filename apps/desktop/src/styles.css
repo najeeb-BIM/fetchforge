@@ -38,7 +38,7 @@ button:disabled{opacity:.55;cursor:wait}
 #pairCode{font-size:18px;font-weight:700;letter-spacing:2px;color:var(--accent-bright)}
 #pairCountdown{color:var(--warn);font-size:14px}
 .table-wrap{overflow-x:auto}
-table{width:100%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid var(--border);text-align:left;font-size:14px}
+table{width:100%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid var(--border);text-align:left;font-size:14px;vertical-align:middle}
 @media (max-width:600px){.add,.controls{flex-direction:column}#url{flex:1}main{padding:12px}th,td{font-size:13px}}
 progress{width:140px}.token-box{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px}
 .format-picker{background:var(--panel);border:1px solid var(--accent);border-radius:8px;padding:12px 16px;margin-bottom:12px}
@@ -74,8 +74,21 @@ progress{width:140px}.token-box{background:var(--panel);border:1px solid var(--b
 /* Round 11, item 9: Actions in ONE row, side by side — the
    pause/play toggle first, the delete icon second (reverses the
    round-10 vertical stack). The DOM order is already
-   toggle-then-delete, so this is CSS only. */
-.actions-cell{display:flex;flex-direction:row;align-items:center;gap:6px}
+   toggle-then-delete, so this is CSS only.
+   Round 13, item 9: the td itself must stay a real table cell.
+   The round-11 rule made it display:flex, which drops it out of
+   the table layout in WebView2 — that is what let a filename
+   wrapping to 2-3 lines break the Progress/Speed/Actions cells.
+   The buttons are inline-block, so one centred row needs no flex:
+   nowrap + centered text keeps them together, vertical-align
+   (on th,td above) centres every cell against the full row
+   height, and there is no fixed row height anywhere to clip
+   wrapped content. */
+/* Round 13, item 9: a long unbroken filename wraps instead of
+   blowing the row out — the other cells stay centred on it. */
+.file-cell{overflow-wrap:anywhere}
+.actions-cell{white-space:nowrap;text-align:center}
+.actions-cell .icon-btn{vertical-align:middle}
 /* Round 11, item 6: theme toggle is a pill/slider switch — moon
    for dark (left), bulb for light (right); the knob slides side
    to side. Position follows [data-theme] on <html> (dark is the

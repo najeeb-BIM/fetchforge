@@ -292,6 +292,17 @@ impl DownloadRecord {
         self.updated_unix = now_secs();
     }
 
+    /// Are all the segments this record knows about done?
+    /// Records without a segment total (plain downloads, yt-dlp)
+    /// always count as complete — only HLS/DASH plans carry a
+    /// segment total (see the plan step). Round 13, item 2: a
+    /// record must never be marked completed with segments
+    /// missing (MoviesJoy 2026-11-25: two partials marked
+    /// completed at 959/983 and 973/983 segments).
+    pub fn segments_complete(&self) -> bool {
+        self.segments_total.is_none_or(|t| self.segments_done >= t)
+    }
+
     /// Mark the record Completed for the finished file (round 10,
     /// item 2): the file on disk is the truth about its size. A
     /// plan total can be badly wrong (the novahd yt-dlp record
@@ -301,7 +312,23 @@ impl DownloadRecord {
     /// real file size instead of trusting the plan. When the file
     /// cannot be statted, the old behaviour stands (downloaded =
     /// planned total, or the last reported bytes).
-    pub fn complete_with_file(&mut self, final_path: &std::path::Path) {
+    ///
+    /// Returns false — and leaves the record Failed, not
+    /// Completed — when segments are still missing (see
+    /// [`segments_complete`](Self::segments_complete)): a short
+    /// file must never be marked complete. The caller keeps the
+    /// last reported progress, so the shortfall stays visible.
+    pub fn complete_with_file(&mut self, final_path: &std::path::Path) -> bool {
+        if !self.segments_complete() {
+            let total = self.segments_total.unwrap_or(0);
+            self.status = Status::Failed;
+            self.error = Some(format!(
+                "Download finished with only {} of {} segments; the file is incomplete and was not marked completed.",
+                self.segments_done, total
+            ));
+            self.updated_unix = now_secs();
+            return false;
+        }
         self.status = Status::Completed;
         self.destination = final_path.to_string_lossy().to_string();
         if let Some(name) = final_path.file_name() {
@@ -322,6 +349,7 @@ impl DownloadRecord {
         }
         self.error = None;
         self.updated_unix = now_secs();
+        true
     }
 
     /// Record the delivered stream's probed quality and, when it
@@ -1843,6 +1871,43 @@ mod tests {
         r2.complete_with_file(&dir.join("gone.mp4"));
         assert_eq!(r2.downloaded_bytes, 77);
         assert_eq!(r2.total_bytes, None);
+    }
+
+    #[test]
+    fn complete_with_file_refuses_short_segments() {
+        // Round 13, item 2 (MoviesJoy 2026-11-25: partials marked
+        // completed at 959/983 and 973/983 segments): completion
+        // requires segments_done == segments_total. A short
+        // record stays Failed with the shortfall named, and the
+        // file is not adopted as the completed download.
+        let dir = std::env::temp_dir().join("fetchforge-test-store-complete-short");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let file = dir.join("Movie.mp4");
+        fs::write(&file, vec![0u8; 12345]).unwrap();
+        let mut r = rec("short");
+        r.status = Status::Downloading;
+        r.segments_done = 959;
+        r.segments_total = Some(983);
+        assert!(!r.segments_complete());
+        assert!(!r.complete_with_file(&file));
+        assert_eq!(r.status, Status::Failed);
+        assert!(r.error.as_deref().unwrap().contains("959 of 983"));
+        assert_ne!(r.destination, file.to_string_lossy());
+        // All segments done: completes as before.
+        let mut r2 = rec("full");
+        r2.status = Status::Downloading;
+        r2.segments_done = 983;
+        r2.segments_total = Some(983);
+        assert!(r2.segments_complete());
+        assert!(r2.complete_with_file(&file));
+        assert_eq!(r2.status, Status::Completed);
+        // No segment total (plain / yt-dlp records): unaffected.
+        let mut r3 = rec("plain");
+        r3.status = Status::Downloading;
+        assert!(r3.segments_complete());
+        assert!(r3.complete_with_file(&file));
+        assert_eq!(r3.status, Status::Completed);
     }
 
     #[test]

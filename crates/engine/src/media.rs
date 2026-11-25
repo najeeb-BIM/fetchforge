@@ -2106,17 +2106,57 @@ fn looks_like_timeout(err: &str) -> bool {
 }
 
 /// Retry decision for a failed segment attempt (`attempt` is
-/// 0-based; 3 attempts total normally) — except a timeout before
-/// ANY byte has downloaded fails immediately. At 0 bytes a timeout
-/// means the stream endpoint is not answering at all (wrong URL,
-/// dead CDN); retrying just burns minutes of silence, and the user
-/// can resume. Mid-download timeouts keep all 3 attempts: a
-/// transient blip must not kill a movie that is already flowing.
+/// 0-based) — except a timeout before ANY byte has downloaded
+/// fails immediately. At 0 bytes a timeout means the stream
+/// endpoint is not answering at all (wrong URL, dead CDN);
+/// retrying just burns minutes of silence, and the user can
+/// resume. Mid-download timeouts get the extended budget (see
+/// [`SEGMENT_TIMEOUT_MAX_ATTEMPTS`]): a transient blip must not
+/// kill a movie that is already flowing — Atlantic 2026-11-25
+/// died on segment 229 of 1731 twice because the old 3-attempt
+/// cap ran out on one slow segment. Fast refusals (HTTP 4xx/5xx,
+/// DNS) keep 3 attempts: re-asking a server that already
+/// refused only wastes time.
 fn should_retry_segment(attempt: usize, downloaded_so_far: u64, err: &str) -> bool {
     if downloaded_so_far == 0 && looks_like_timeout(err) {
         return false;
     }
+    if looks_like_timeout(err) {
+        return attempt + 1 < SEGMENT_TIMEOUT_MAX_ATTEMPTS;
+    }
     attempt < 2
+}
+
+/// How many attempts one slow (timing-out) segment gets per pass
+/// before the run fails: 8, up from the old 3 for every error.
+/// A byterange segment on a throttling CDN can time out several
+/// times in a row and still land — the Atlantic evidence is
+/// segment 229 of 1731 timing out on two separate runs while
+/// hundreds of segments around it downloaded fine. The 0-byte
+/// fail-fast still applies (see [`should_retry_segment`]), so a
+/// dead endpoint fails after 1 try, and the stall watchdog
+/// still bounds the whole run. 429s keep their own 5-attempt
+/// budget (see the retry loop); fast refusals keep 3.
+const SEGMENT_TIMEOUT_MAX_ATTEMPTS: usize = 8;
+
+/// Longest a segment retry loop runs per pass (timeouts 8,
+/// 429s 5, anything else 3 — see [`should_retry_segment`]).
+/// The parallel retry loop is bounded by this; the per-error
+/// gates above break out earlier.
+const SEGMENT_MAX_ATTEMPTS: usize = SEGMENT_TIMEOUT_MAX_ATTEMPTS;
+
+/// Backoff between retries of one segment (`attempt` is
+/// 0-based). Timeouts back off exponentially (500 ms → 1 s →
+/// 2 s, capped at 2 s) so a struggling CDN is not hammered
+/// while the segment is retried; fast refusals keep the old
+/// linear 500 ms × (attempt + 1), so the 404 behaviour and its
+/// tests are unchanged.
+fn segment_retry_backoff(attempt: usize, err: &str) -> Duration {
+    if looks_like_timeout(err) {
+        Duration::from_millis(500 * 2u64.saturating_pow(attempt.min(2) as u32))
+    } else {
+        Duration::from_millis(500 * (attempt + 1) as u64)
+    }
 }
 
 /// Is this segment-fetch failure an HTTP 429 (rate limit)? The
@@ -2385,20 +2425,24 @@ fn seg_file_name(index: usize) -> String {
     format!("{index:06}.seg")
 }
 
-/// Meta file inside the segment dir, validating a resume: the
-/// manifest must still list the same number of segments with the
-/// same first segment, or the saved pieces belong to a different
-/// playlist and the download restarts cleanly instead of
-/// assembling a corrupt file. A ranged first segment also pins
-/// its range: the same URL re-sliced by the CDN (same sign, new
-/// byte ranges) must not resume against the old pieces.
-fn read_seg_meta(seg_dir: &Path, segments: &[Segment]) -> bool {
-    let Ok(saved) = std::fs::read_to_string(seg_dir.join("meta")) else {
-        return false;
-    };
+/// The segment-dir meta, parsed: what a previous run recorded
+/// about the playlist it was downloading. `total_bytes` is the
+/// exact byte total when every segment carries a byte range
+/// (HLS byteranges, DASH SegmentList); older metas have no such
+/// line, so it is `None` and the total check is skipped for them.
+struct SegMeta {
+    count: usize,
+    first_url: String,
+    first_range: Option<(u64, u64)>,
+    total_bytes: Option<u64>,
+}
+
+fn read_seg_meta_parsed(seg_dir: &Path) -> Option<SegMeta> {
+    let saved = std::fs::read_to_string(seg_dir.join("meta")).ok()?;
     let mut count: Option<usize> = None;
     let mut first: Option<String> = None;
     let mut first_range: Option<(u64, u64)> = None;
+    let mut total_bytes: Option<u64> = None;
     for line in saved.lines() {
         if let Some(v) = line.strip_prefix("count=") {
             count = v.parse().ok();
@@ -2410,16 +2454,125 @@ fn read_seg_meta(seg_dir: &Path, segments: &[Segment]) -> bool {
                     first_range = Some((s, e));
                 }
             }
+        } else if let Some(v) = line.strip_prefix("total_bytes=") {
+            total_bytes = v.parse().ok();
         }
     }
     match (count, first) {
-        (Some(n), Some(f)) => {
-            n == segments.len()
-                && segments.first().is_some_and(|s| s.url == f)
-                && first_range == segments.first().and_then(|s| s.range)
-        }
-        _ => false,
+        (Some(n), Some(f)) => Some(SegMeta {
+            count: n,
+            first_url: f,
+            first_range,
+            total_bytes,
+        }),
+        _ => None,
     }
+}
+
+/// Meta file inside the segment dir, validating a resume: the
+/// manifest must still list the same number of segments with the
+/// same first segment, or the saved pieces belong to a different
+/// playlist and the download restarts cleanly instead of
+/// assembling a corrupt file. A ranged first segment also pins
+/// its range: the same URL re-sliced by the CDN (same sign, new
+/// byte ranges) must not resume against the old pieces. A stored
+/// exact total (newer metas only) must agree with the fresh
+/// playlist's when both are known.
+fn read_seg_meta(seg_dir: &Path, segments: &[Segment]) -> bool {
+    let Some(meta) = read_seg_meta_parsed(seg_dir) else {
+        return false;
+    };
+    meta.count == segments.len()
+        && segments.first().is_some_and(|s| s.url == meta.first_url)
+        && meta.first_range == segments.first().and_then(|s| s.range)
+        && meta
+            .total_bytes
+            .is_none_or(|t| exact_total_bytes(segments).is_none_or(|e| e == t))
+}
+
+/// A URL with its query string and fragment stripped: signed
+/// playlists carry their auth in the query (`?sign=...`), so the
+/// same stream re-resolved after the signature expired has a
+/// different full URL but the same path. Comparing paths (not
+/// full URLs) tells a re-signed same stream from a different
+/// stream, which has a different path.
+fn url_without_query(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut u) => {
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string()
+        }
+        Err(_) => url.to_string(),
+    }
+}
+
+/// How many completed pieces a segment dir holds, by index:
+/// a file's existence means the segment is whole (the atomic
+/// rename rule), so this is the stored progress a fresh playlist
+/// must be validated against.
+fn count_seg_pieces(seg_dir: &Path, count: usize) -> u64 {
+    let mut done = 0u64;
+    for i in 0..count {
+        if seg_dir.join(seg_file_name(i)).is_file() {
+            done += 1;
+        }
+    }
+    done
+}
+
+/// Validate a fresh playlist against the stored progress in a
+/// segment dir, before anything is wiped or overwritten.
+/// Returns `Ok(true)` when the run may resume from the saved
+/// pieces, `Ok(false)` when it must start fresh (nothing worth
+/// keeping), and `Err` when the fresh playlist contradicts the
+/// stored progress — the caller must then fail the run WITHOUT
+/// discarding the saved pieces, so the record stays failed
+/// instead of completing a different, shorter download.
+///
+/// Contradiction (round 13, item 2 — Atlantic 2026-11-25: a
+/// failed 1.87 GB / 262-segment record resumed against a fresh
+/// playlist that estimated ~976 KB, downloaded 232 KB, and was
+/// marked "completed" as a 64-second stub; the same class
+/// marked two MoviesJoy partials completed at 959/983 and
+/// 973/983 segments): a fresh playlist with fewer segments
+/// than the pieces already saved, a different segment count, a
+/// different first segment, or a different exact total.
+///
+/// Not a contradiction: the same stream re-signed. A fresh
+/// signature changes the first segment's query string but not
+/// its path, count, byte ranges or total — resuming against it
+/// reuses the saved pieces and fetches only the missing
+/// segments from the new URLs. (Before this fix every re-sign
+/// wiped the pieces and restarted from zero.)
+fn validate_resume(seg_dir: &Path, segments: &[Segment]) -> Result<bool, String> {
+    let Some(stored) = read_seg_meta_parsed(seg_dir) else {
+        return Ok(false);
+    };
+    if read_seg_meta(seg_dir, segments) {
+        return Ok(true);
+    }
+    let done = count_seg_pieces(seg_dir, stored.count);
+    if done == 0 {
+        return Ok(false);
+    }
+    let same_stream_resigned = segments.len() == stored.count
+        && segments
+            .first()
+            .is_some_and(|s| url_without_query(&s.url) == url_without_query(&stored.first_url))
+        && stored.first_range == segments.first().and_then(|s| s.range)
+        && stored
+            .total_bytes
+            .is_none_or(|t| exact_total_bytes(segments).is_none_or(|e| e == t));
+    if same_stream_resigned {
+        return Ok(true);
+    }
+    Err(format!(
+        "The stream changed since this download started: the new playlist lists {} segments but {} of the original {}-segment download are already saved. The saved pieces were kept, so this download stays failed instead of completing a different file — resume the original stream to continue, or delete the partial download to start over.",
+        segments.len(),
+        done,
+        stored.count
+    ))
 }
 
 fn write_seg_meta(seg_dir: &Path, segments: &[Segment]) {
@@ -2427,6 +2580,9 @@ fn write_seg_meta(seg_dir: &Path, segments: &[Segment]) {
     let mut meta = format!("count={}\nfirst={}\n", segments.len(), first);
     if let Some((s, e)) = segments.first().and_then(|s| s.range) {
         meta.push_str(&format!("first_range={s}-{e}\n"));
+    }
+    if let Some(total) = exact_total_bytes(segments) {
+        meta.push_str(&format!("total_bytes={total}\n"));
     }
     let _ = std::fs::write(seg_dir.join("meta"), meta);
 }
@@ -2436,12 +2592,12 @@ fn write_seg_meta(seg_dir: &Path, segments: &[Segment]) {
 ///
 /// Parallelism (study §A5): `workers` workers pull
 /// segment indices from a shared counter, each fetching its
-/// segment with the same 3-attempt retry rule as the old
-/// sequential engine (5 attempts for HTTP 429, with backoff —
-/// see [`RateLimiter`]), writing it to its own file in the segment
-/// dir (`<part>.seg/NNNNNN.seg`, via a `.tmp` + atomic rename, so
-/// a file's existence means the segment is complete). When every
-/// segment is on disk the files are concatenated in playlist
+/// segment with the per-error retry budget (8 attempts for a
+/// mid-download timeout, 5 for HTTP 429 with backoff — see
+/// [`RateLimiter`], 3 for fast refusals), writing it to its own
+/// file in the segment dir (`<part>.seg/NNNNNN.seg`, via a `.tmp`
+/// + atomic rename, so a file's existence means the segment is
+/// complete). When every segment is on disk the files are concatenated in playlist
 /// order into the `.part` file — the output is byte-identical to
 /// the sequential engine's, verified by test. Progress reports
 /// carry the segment counts and the running size estimate (see
@@ -2452,8 +2608,12 @@ fn write_seg_meta(seg_dir: &Path, segments: &[Segment]) {
 ///
 /// Resume: a segment dir whose meta still matches the manifest
 /// (same count, same first segment) keeps its completed pieces;
-/// only missing segments are fetched. A stale dir is wiped and
-/// the download restarts.
+/// only missing segments are fetched. A stale dir with nothing
+/// saved is wiped and the download restarts. A stale dir WITH
+/// saved pieces is never wiped: if the fresh playlist
+/// contradicts the stored progress (fewer segments, a different
+/// stream or total) the run fails and the pieces are kept (see
+/// [`validate_resume`]); a re-signed same stream resumes.
 ///
 /// Legacy resume: a download started by an older build (a
 /// `<part>.segments` sidecar FILE next to an existing `.part`
@@ -2536,6 +2696,14 @@ fn download_segments_with_bandwidth(
     bandwidth: &SharedLimiter,
 ) -> Result<u64, String> {
     if segments.is_empty() {
+        // An empty fresh playlist over a partial download is a
+        // contradiction, not a completion (round 13, item 2):
+        // refuse it and keep the saved pieces instead of
+        // producing an empty file marked complete.
+        let seg_dir = seg_dir_for(part_path);
+        if seg_dir.exists() {
+            validate_resume(&seg_dir, segments)?;
+        }
         std::fs::File::create(part_path).map_err(|e| e.to_string())?;
         return Ok(0);
     }
@@ -2693,10 +2861,21 @@ fn download_segments_parallel(
 ) -> Result<u64, String> {
     let total = segments.len() as u64;
     let seg_dir = seg_dir_for(part_path);
-    // Resume validation: a stale dir (different manifest) is
-    // wiped; a matching one keeps its completed pieces.
-    if seg_dir.exists() && !read_seg_meta(&seg_dir, segments) {
-        let _ = std::fs::remove_dir_all(&seg_dir);
+    // Resume validation: a stale dir with nothing saved is
+    // wiped and the download restarts; a dir whose fresh
+    // playlist contradicts the saved pieces REFUSES the run
+    // (see validate_resume) — the pieces are kept and the
+    // record stays failed instead of completing a different,
+    // shorter download. A matching dir, or the same stream
+    // re-signed, keeps its completed pieces.
+    if seg_dir.exists() {
+        match validate_resume(&seg_dir, segments) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = std::fs::remove_dir_all(&seg_dir);
+            }
+            Err(e) => return Err(e),
+        }
     }
     if seg_dir.is_file() {
         let _ = std::fs::remove_file(&seg_dir);
@@ -2819,12 +2998,14 @@ fn download_segments_parallel(
                 // fails fast (see should_retry_segment) — the
                 // shared counter is what "0 bytes" means here.
                 // 429s get 5 attempts (the rate-limit budget —
-                // see RateLimiter); everything else keeps 3 (the
-                // retry gate below breaks earlier for non-429s).
+                // see RateLimiter); a mid-download timeout gets
+                // 8 (SEGMENT_TIMEOUT_MAX_ATTEMPTS — one slow
+                // segment must not kill the download); fast
+                // refusals keep 3.
                 let mut bytes = None;
                 let mut last_err = String::new();
                 let mut attempts = 0;
-                for attempt in 0..5 {
+                for attempt in 0..SEGMENT_MAX_ATTEMPTS {
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
@@ -2927,8 +3108,8 @@ fn download_segments_parallel(
                                 ) {
                                     break;
                                 }
-                                std::thread::sleep(Duration::from_millis(
-                                    500 * (attempt + 1) as u64,
+                                std::thread::sleep(segment_retry_backoff(
+                                    attempt, &last_err,
                                 ));
                             }
                         }
@@ -3130,11 +3311,13 @@ fn download_segments_sequential(
         // Retry transient failures (a dropped segment must not fail
         // a whole stream); a persistent failure keeps the .part and
         // sidecar so a later resume continues from here. A timeout
-        // at 0 bytes fails fast (see should_retry_segment).
+        // at 0 bytes fails fast (see should_retry_segment); a
+        // mid-download timeout gets the extended 8-attempt budget
+        // with backoff (see SEGMENT_TIMEOUT_MAX_ATTEMPTS).
         let mut bytes = None;
         let mut last_err = String::new();
         let mut attempts = 0;
-        for attempt in 0..3 {
+        for attempt in 0..SEGMENT_MAX_ATTEMPTS {
             check_stall(last_progress, stall_timeout)?;
             attempts = attempt + 1;
             match fetch_bytes_range(client, &seg.url, seg.range, referer) {
@@ -3166,7 +3349,7 @@ fn download_segments_sequential(
                     if !should_retry_segment(attempt, downloaded, &last_err) {
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(500 * (attempt + 1) as u64));
+                    std::thread::sleep(segment_retry_backoff(attempt, &last_err));
                 }
             }
         }
@@ -3603,6 +3786,15 @@ pub fn download_hls_audio_only_opts(
 ) -> Result<PathBuf, String> {
     let manifest_url = validate_url(manifest_url)?;
     let variant_uri = validate_url(variant_uri)?;
+    // Round 13, item 6: this whole function is audio-only, so
+    // the file belongs in Audio/ even when the caller computed
+    // the dir from the video format's filename (Video/ — the
+    // NOXX case: "The Odyssey (1).m4a" landed in Video/). The
+    // re-route covers both branches below (the separate audio
+    // playlist, and the muxed variant the caller extracts the
+    // audio from in the same dir).
+    let destination_dir = crate::category::audio_destination_dir(destination_dir);
+    let destination_dir = destination_dir.as_path();
     // Resolve the variant's audio group from the master (skip the
     // fetch when the "variant" is the manifest itself — a plain
     // media playlist, whose audio is muxed by definition).
@@ -6525,6 +6717,108 @@ mod tests {
     }
 
     #[test]
+    fn download_hls_audio_only_routes_to_audio_folder() {
+        // Round 13, item 6 (NOXX 2026-11-25: "The Odyssey
+        // (1).m4a" landed in Video/): an audio-only download
+        // goes to Audio/ even when the caller computed the dir
+        // from the video format's filename — both when the audio
+        // lives on its own playlist and when it is muxed into
+        // the variant.
+        let master = b"#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\",URI=\"audio.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720,AUDIO=\"aac\"\nvideo.m3u8\n#EXT-X-ENDLIST\n".to_vec();
+        let video_pl = b"#EXTM3U\n#EXTINF:10,\nv0.ts\n#EXT-X-ENDLIST\n".to_vec();
+        let audio_pl =
+            b"#EXTM3U\n#EXTINF:10,\na0.ts\n#EXTINF:10,\na1.ts\n#EXT-X-ENDLIST\n".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/master.m3u8".to_string(), master);
+        files.insert("/video.m3u8".to_string(), video_pl);
+        files.insert("/audio.m3u8".to_string(), audio_pl);
+        files.insert("/v0.ts".to_string(), b"VIDEO-BYTES".to_vec());
+        files.insert("/a0.ts".to_string(), b"AUDIO-ZERO-".to_vec());
+        files.insert("/a1.ts".to_string(), b"AUDIO-ONE".to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits.clone(), stop.clone());
+        let dir = unique_temp_dir("hls-audio-only-folder");
+        // The caller organised by the video filename: Video/.
+        let video_dir = dir.join("Video");
+        std::fs::create_dir_all(&video_dir).unwrap();
+        let master_url = format!("http://127.0.0.1:{port}/master.m3u8");
+        let video_url = format!("http://127.0.0.1:{port}/video.m3u8");
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let out = download_hls_audio_only(
+            &master_url,
+            &video_url,
+            &video_dir,
+            "film.mp4",
+            &None,
+            &|_| {},
+            &paused,
+            &cancelled,
+            None,
+        )
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"AUDIO-ZERO-AUDIO-ONE");
+        assert!(
+            out.starts_with(dir.join("Audio")),
+            "audio-only file must land in Audio/, got {}",
+            out.display()
+        );
+        assert!(
+            !out.starts_with(dir.join("Video")),
+            "audio-only file must not land in Video/, got {}",
+            out.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_hls_audio_only_muxed_routes_to_audio_folder() {
+        // Same as above for the muxed fallback: the full variant
+        // (which the caller extracts the audio from) also lands
+        // in Audio/, not Video/.
+        let master = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720\nvideo.m3u8\n#EXT-X-ENDLIST\n".to_vec();
+        let video_pl = b"#EXTM3U\n#EXTINF:10,\nv0.ts\n#EXT-X-ENDLIST\n".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/master.m3u8".to_string(), master);
+        files.insert("/video.m3u8".to_string(), video_pl);
+        files.insert("/v0.ts".to_string(), b"MUXED-BYTES".to_vec());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits, stop.clone());
+        let dir = unique_temp_dir("hls-audio-muxed-folder");
+        let video_dir = dir.join("Video");
+        std::fs::create_dir_all(&video_dir).unwrap();
+        let master_url = format!("http://127.0.0.1:{port}/master.m3u8");
+        let video_url = format!("http://127.0.0.1:{port}/video.m3u8");
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let out = download_hls_audio_only(
+            &master_url,
+            &video_url,
+            &video_dir,
+            "film.mp4",
+            &None,
+            &|_| {},
+            &paused,
+            &cancelled,
+            None,
+        )
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"MUXED-BYTES");
+        assert!(
+            out.starts_with(dir.join("Audio")),
+            "muxed audio-only file must land in Audio/, got {}",
+            out.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn proxy_inner_manifest_url_detection() {
         // A workers.dev-style wrapper: the real manifest is the
         // `url` query parameter.
@@ -6747,6 +7041,35 @@ mod tests {
         // mid-download and for fast refusals.
         assert!(!should_retry_segment(0, 0, "operation timed out"));
         assert!(should_retry_segment(0, 1024, "operation timed out"));
+        // Round 13, item 1: a mid-download timeout gets 8
+        // attempts, not 3 — attempts 0..6 retry, attempt 7 is
+        // the last try. Fast refusals still stop after 3.
+        assert!(should_retry_segment(2, 1024, "operation timed out"));
+        assert!(should_retry_segment(6, 1024, "operation timed out"));
+        assert!(!should_retry_segment(7, 1024, "operation timed out"));
+        assert!(!should_retry_segment(7, 0, "operation timed out"));
+        // Timeout backoff grows (500 ms → 1 s → 2 s, capped);
+        // fast refusals keep the old linear 500 ms steps.
+        assert_eq!(
+            segment_retry_backoff(0, "operation timed out"),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            segment_retry_backoff(1, "operation timed out"),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            segment_retry_backoff(2, "operation timed out"),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            segment_retry_backoff(7, "operation timed out"),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            segment_retry_backoff(1, "Segment request failed: HTTP 404"),
+            Duration::from_millis(1000)
+        );
         assert!(should_retry_segment(
             0,
             0,
@@ -8251,6 +8574,153 @@ mod tests {
     }
 
     #[test]
+    fn segment_timeout_retries_then_succeeds() {
+        // Round 13, item 1 (Atlantic 2026-11-25: segment 229 of
+        // 1731 timed out twice and killed the download after 3
+        // tries): a segment that times out twice, then serves,
+        // must complete — the mid-download timeout budget is 8
+        // attempts with backoff, not 3.
+        let bodies: Vec<Vec<u8>> = (0..2)
+            .map(|i| format!("SEGMENT-{i}-").repeat(3).into_bytes())
+            .collect();
+        let mut files = HashMap::new();
+        for (i, b) in bodies.iter().enumerate() {
+            files.insert(format!("/seg{i}.ts"), b.clone());
+        }
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        // The first 2 requests stall past the 300 ms client
+        // timeout; later requests serve.
+        let (port, server) =
+            serve_stall_first_n(files, 2, Duration::from_secs(2), hits.clone(), stop.clone());
+        let segments: Vec<Segment> = (0..2)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
+                range: None,
+                key: None,
+            })
+            .collect();
+        let dir = unique_temp_dir("seg-timeout-retry-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        // Pre-seed piece 0: the download is already flowing, so
+        // the timeout fail-fast (0 bytes) never applies to
+        // segment 1's retries.
+        let seg_dir = seg_dir_for(&part);
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        write_seg_meta(&seg_dir, &segments);
+        std::fs::write(seg_dir.join(seg_file_name(0)), &bodies[0]).unwrap();
+        let client = hls_client_with_timeout(Duration::from_millis(300)).unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let expected: Vec<u8> = bodies.concat();
+        let n = download_segments(
+            &client,
+            &segments,
+            &part,
+            &None,
+            0,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .expect("a segment timing out twice must still complete");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(n as usize, expected.len());
+        assert_eq!(std::fs::read(&part).unwrap(), expected);
+        // Piece 0 was pre-seeded (never fetched); segment 1 took
+        // 3 attempts — 2 timeouts, then the serve.
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.len(), 3, "hits: {hits:?}");
+        assert!(hits.iter().all(|h| h == "/seg1.ts"), "hits: {hits:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_timeout_persistent_fails_after_extended_budget() {
+        // Round 13, item 1: a segment that never stops timing
+        // out still fails — but only after the extended 8-attempt
+        // budget with backoff, not after 3. The parallel pass is
+        // called directly (1 worker): the full download_segments
+        // path would run the sequential rescue too, doubling the
+        // wait for no extra signal.
+        let bodies: Vec<Vec<u8>> = (0..2)
+            .map(|i| format!("SEGMENT-{i}-").repeat(3).into_bytes())
+            .collect();
+        let mut files = HashMap::new();
+        for (i, b) in bodies.iter().enumerate() {
+            files.insert(format!("/seg{i}.ts"), b.clone());
+        }
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_stall_first_n(
+            files,
+            usize::MAX,
+            Duration::from_secs(2),
+            hits.clone(),
+            stop.clone(),
+        );
+        let segments: Vec<Segment> = (0..2)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
+                range: None,
+                key: None,
+            })
+            .collect();
+        let dir = unique_temp_dir("seg-timeout-budget");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let seg_dir = seg_dir_for(&part);
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        write_seg_meta(&seg_dir, &segments);
+        std::fs::write(seg_dir.join(seg_file_name(0)), &bodies[0]).unwrap();
+        let client = hls_client_with_timeout(Duration::from_millis(300)).unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let limiter = RateLimiter::new();
+        let bandwidth = SharedLimiter::new(None);
+        let start = Instant::now();
+        let err = download_segments_parallel(
+            &client,
+            &segments,
+            &part,
+            &None,
+            0,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+            1,
+            &limiter,
+            &bandwidth,
+        )
+        .unwrap_err();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(err.contains("timed out"), "error: {err}");
+        assert!(err.contains("after 8 tries"), "error: {err}");
+        // 8 attempts on the one missing segment; piece 0 was
+        // pre-seeded, never fetched.
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.len(), 8, "hits: {hits:?}");
+        // The backoff was real (0.5 + 1 + 2 + 2 + 2 + 2 + 2 s
+        // between the 8 attempts): without it the run would
+        // finish in ~2.4 s of timeouts alone.
+        assert!(
+            start.elapsed() >= Duration::from_secs(10),
+            "no timeout backoff visible: {:?}",
+            start.elapsed()
+        );
+        // The saved piece survives the failure, for resume.
+        assert!(seg_dir.join(seg_file_name(0)).is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn should_fallback_sequential_gates_on_segment_timeouts() {
         let paused = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
@@ -8895,6 +9365,217 @@ mod tests {
         assert_eq!(got, vec!["/seg1.ts".to_string(), "/seg3.ts".to_string()]);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_against_shorter_playlist_keeps_pieces_and_fails() {
+        // Round 13, item 2 (Atlantic 2026-11-25: a failed 1.87 GB
+        // / 262-segment record resumed against a fresh playlist
+        // that estimated ~976 KB, downloaded 232 KB, and was
+        // marked "completed" as a 64-second stub): a fresh
+        // playlist with fewer segments than the pieces already
+        // saved must fail the run WITHOUT discarding the pieces.
+        let bodies: Vec<Vec<u8>> = (0..4)
+            .map(|i| format!("PIECE-{i}-").repeat(3).into_bytes())
+            .collect();
+        let mut files = HashMap::new();
+        for (i, b) in bodies.iter().enumerate() {
+            files.insert(format!("/seg{i}.ts"), b.clone());
+        }
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits.clone(), stop.clone());
+        // The stored run: 4 segments, pieces 0-2 on disk.
+        let stored: Vec<Segment> = (0..4)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
+                range: None,
+                key: None,
+            })
+            .collect();
+        let dir = unique_temp_dir("seg-resume-shorter");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let seg_dir = seg_dir_for(&part);
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        write_seg_meta(&seg_dir, &stored);
+        for i in 0..3 {
+            std::fs::write(seg_dir.join(seg_file_name(i)), &bodies[i]).unwrap();
+        }
+        // The fresh playlist: a different, shorter stream.
+        let fresh: Vec<Segment> = (0..2)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/other{i}.ts"),
+                range: None,
+                key: None,
+            })
+            .collect();
+        let client = hls_client().unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let err = download_segments(
+            &client,
+            &fresh,
+            &part,
+            &None,
+            0,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .unwrap_err();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(err.contains("stream changed"), "error: {err}");
+        assert!(err.contains("2 segments"), "error: {err}");
+        assert!(err.contains("3 of the original 4"), "error: {err}");
+        // Nothing was fetched, nothing was discarded: the pieces
+        // and the meta still describe the original download.
+        assert!(hits.lock().unwrap().is_empty(), "hits must be empty");
+        assert!(!part.is_file(), "no part file may be produced");
+        for i in 0..3 {
+            assert!(seg_dir.join(seg_file_name(i)).is_file(), "piece {i} kept");
+        }
+        assert!(
+            std::fs::read_to_string(seg_dir.join("meta"))
+                .unwrap()
+                .contains("count=4"),
+            "meta must still pin the original playlist"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_with_resigned_playlist_keeps_pieces() {
+        // Round 13, item 2, the other side: the same stream
+        // re-signed (same paths, new query string) is NOT a
+        // contradiction — the saved pieces are reused and only
+        // the missing segments are fetched from the new URLs.
+        // Before this fix every re-sign wiped the pieces and
+        // restarted from zero.
+        let bodies: Vec<Vec<u8>> = (0..2)
+            .map(|i| format!("PIECE-{i}-").repeat(3).into_bytes())
+            .collect();
+        let mut files = HashMap::new();
+        files.insert("/seg0.ts?sign=new".to_string(), bodies[0].clone());
+        files.insert("/seg1.ts?sign=new".to_string(), bodies[1].clone());
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits.clone(), stop.clone());
+        let old: Vec<Segment> = (0..2)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/seg{i}.ts?sign=old"),
+                range: None,
+                key: None,
+            })
+            .collect();
+        let fresh: Vec<Segment> = (0..2)
+            .map(|i| Segment {
+                url: format!("http://127.0.0.1:{port}/seg{i}.ts?sign=new"),
+                range: None,
+                key: None,
+            })
+            .collect();
+        let dir = unique_temp_dir("seg-resume-resign");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let seg_dir = seg_dir_for(&part);
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        write_seg_meta(&seg_dir, &old);
+        std::fs::write(seg_dir.join(seg_file_name(0)), &bodies[0]).unwrap();
+        let client = hls_client().unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let expected: Vec<u8> = bodies.concat();
+        let n = download_segments(
+            &client,
+            &fresh,
+            &part,
+            &None,
+            0,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .expect("a re-signed same stream must resume");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(n as usize, expected.len());
+        assert_eq!(std::fs::read(&part).unwrap(), expected);
+        // Only the missing piece was fetched, from the new URL.
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0], "/seg1.ts?sign=new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_against_resliced_ranges_keeps_pieces_and_fails() {
+        // Round 13, item 2: the same segment count and the same
+        // first URL, but re-sliced byte ranges (and a different
+        // exact total), is still a contradiction — the saved
+        // pieces are slices of a different layout.
+        let dir = unique_temp_dir("seg-resume-reslice");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("movie.ts.part");
+        let seg_dir = seg_dir_for(&part);
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        let stored = vec![
+            Segment {
+                url: "http://127.0.0.1:9/file.mp4".to_string(),
+                range: Some((0, 99)),
+                key: None,
+            },
+            Segment {
+                url: "http://127.0.0.1:9/file.mp4".to_string(),
+                range: Some((100, 199)),
+                key: None,
+            },
+        ];
+        write_seg_meta(&seg_dir, &stored);
+        std::fs::write(seg_dir.join(seg_file_name(0)), b"PIECE-ZERO").unwrap();
+        // Same count, same first URL, new ranges/total.
+        let fresh = vec![
+            Segment {
+                url: "http://127.0.0.1:9/file.mp4".to_string(),
+                range: Some((0, 49)),
+                key: None,
+            },
+            Segment {
+                url: "http://127.0.0.1:9/file.mp4".to_string(),
+                range: Some((50, 99)),
+                key: None,
+            },
+        ];
+        let client = hls_client().unwrap();
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let err = download_segments(
+            &client,
+            &fresh,
+            &part,
+            &None,
+            0,
+            0,
+            &|_| {},
+            &paused,
+            &cancelled,
+            DOWNLOAD_STALL_TIMEOUT,
+        )
+        .unwrap_err();
+        assert!(err.contains("stream changed"), "error: {err}");
+        assert!(seg_dir.join(seg_file_name(0)).is_file(), "piece kept");
+        assert!(
+            std::fs::read_to_string(seg_dir.join("meta"))
+                .unwrap()
+                .contains("count=2"),
+            "meta must still pin the original playlist"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

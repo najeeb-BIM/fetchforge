@@ -22,7 +22,7 @@ pub mod threed;
 pub mod token;
 pub mod validate;
 
-pub use category::category_for_filename;
+pub use category::{audio_destination_dir, category_for_download, category_for_filename};
 pub use download::{
     download, probe, stop_reason, DownloadOptions, Probe, Progress, SharedLimiter, StopReason,
 };

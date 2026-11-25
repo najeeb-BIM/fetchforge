@@ -123,13 +123,37 @@ compiles untouched — its struct literals for `StreamDownloadOptions` /
   components). A download root literally named `Video` (`D:\Video`,
   `/Video`, organising off) is left alone.
 
-Still open — desktop follow-up (NOT done here; `apps/desktop/` was out of
-scope for this change): `apps/desktop/src-tauri/src/main.rs`
-`run_stream_hls_download` must compute its dir with
-`category_for_download(&rec.filename, rec.audio_only)` and call
+Still open — desktop follow-up (DONE 2026-11-25, commit `e452351` on
+`r13-desktop`, merged into `audit-round`): `apps/desktop/src-tauri/src/main.rs`
+`run_stream_hls_download` now computes its dir with
+`category_for_download(&rec.filename, rec.audio_only)` and calls
 `download_hls_variant_audio_only_opts` for the audio-only + audio-URL
-branch; `run_stream_dash_download` must do the same dir change and call
-`download_dash_audio_only` for audio-only records. Until then the desktop
-process still lands paired/DASH audio-only downloads in Video/; the
-bridge process is fixed, and the engine now provides the entry points
-either caller needs.
+branch; `run_stream_dash_download` does the same dir change and calls
+`download_dash_audio_only` for audio-only records. Both the bridge and the
+desktop processes now route paired/DASH audio-only downloads to Audio/.
+No engine signature changed (new pub items only, plus `complete_with_file`
+now returns `bool` — all 5 desktop + 5 bridge call sites use it in
+statement position, so it is source-compatible; the desktop crate itself
+is only type-checked by Windows CI).
+
+## Verification (coordinator, run on the merged tree)
+
+- `cargo test --workspace`: **253 passed, 0 failed** (round-12 baseline
+  239; +10 engine tests in `70d8d23`, +4 in `ee7dc80`). `cargo fmt --check`
+  clean on the touched Rust files.
+- Extension harness `node extensions/harness/run-all.js`: **174 passed,
+  0 failed** across 9 files (baseline 146; +28 new in `round13.test.js`).
+  `node --check` clean on every touched extension JS file.
+- Both manifests 0.2.12; chromium/firefox byte-identical on all 6 shared
+  files (content.js, background.js, popup.js, popup.html, hook-main.js,
+  rules/ads.json). `offscreen.js` is chromium-only by design (round 11).
+- No Tauri command was added or changed (`git diff` confirms — only the
+  two desktop functions' internals + imports). One engine signature
+  changed: `complete_with_file() -> bool` (see above); all other changes
+  are new pub items. No workflow YAML touched. No new dependencies.
+- **Not run:** no laptop retest (the parent runs those after install);
+  the desktop crate cannot be type-checked on this VM (no GTK/WebKit dev
+  libs) — Windows CI is the compile gate, as always. The Atlantic
+  segment-229 timeout fix, the resume validation, and the audio-folder
+  routing are verified by loopback-server / unit tests only, not by a
+  live CDN run.

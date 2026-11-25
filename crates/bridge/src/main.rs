@@ -10,7 +10,9 @@
 //!   extension ID registered in the host manifest can invoke it.
 //!   Chrome launches the host with NO arguments and a pipe on stdin,
 //!   so a piped stdin with no mode argument also enters native-host
-//!   mode (see main).
+//!   mode (see main). When a download starts while the desktop app
+//!   is off, the native host spawns a detached bridge AND wakes the
+//!   app (round 12, item 12 — see `wake_desktop_app`).
 //!
 //! Usage:
 //!   fetchforge-bridge serve [--port 18443] [--data-dir DIR]
@@ -3816,6 +3818,86 @@ fn forward_add_to_bridge(
     serde_json::from_str(&resp).map_err(|e| format!("Bridge returned bad JSON ({e})"))
 }
 
+/// Where the desktop app (FetchForge.exe) lives, for the
+/// auto-wake (round 12, item 12): `FETCHFORGE_APP_PATH` wins
+/// when it names an existing file (dev/test override, mirroring
+/// `FETCHFORGE_FFMPEG_PATH`), else the app binary next to this
+/// one — the installer puts FetchForge.exe and
+/// fetchforge-bridge.exe in the same folder. None when neither
+/// exists (a bridge-only install, or a dev layout): the wake is
+/// best-effort and the download still proceeds.
+fn desktop_app_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("FETCHFORGE_APP_PATH") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))?;
+    ["FetchForge.exe", "FetchForge"]
+        .iter()
+        .map(|n| exe_dir.join(n))
+        .find(|c| c.is_file())
+}
+
+/// Open the desktop app (round 12, item 12 — user order
+/// 2026-11-25): when a download is started while the app is off,
+/// the extension/native host must trigger the app to open
+/// automatically instead of falling back to a typical browser
+/// download. The native host already spawns a detached bridge so
+/// the download itself survives; this opens the UI on top of it,
+/// so the user sees the download in the app instead of wondering
+/// where it went. Detached, no wait, no console: the host must
+/// never block on the app. Returns true when the app was
+/// launched; false (never an error) when no app binary was found
+/// or the spawn failed — the download is unaffected either way.
+///
+/// NEVER spawns from a test binary (`cfg!(test)` guard, the
+/// round-11 shutdown-test lesson): a test that woke a real app
+/// would open windows on the CI runner. The release binary is
+/// compiled without cfg(test), so production is unaffected.
+///
+/// LIMITATION, stated honestly: this fires only when the bridge
+/// itself had to be started (the signal the app is off — the app
+/// always spawns a bridge on launch, so a running bridge means
+/// the app is open). It does not wake the app when a bridge was
+/// already running without the app (possible after a detached
+/// bridge outlives an app close), and there is no single-instance
+/// plugin in the Tauri app, so a wake in a stale state could open
+/// a second window — the laptop retest must check the app-off
+/// case end to end.
+fn wake_desktop_app() -> bool {
+    // Never run a real app launch from a test binary (see above).
+    if cfg!(test) {
+        return false;
+    }
+    let Some(path) = desktop_app_path() else {
+        eprintln!("FetchForge: desktop app not found next to the bridge; not waking it.");
+        return false;
+    };
+    let mut cmd = std::process::Command::new(&path);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW (0x08000000) + DETACHED_PROCESS
+        // (0x00000008): no console flash, and the app outlives
+        // this short-lived host process.
+        cmd.creation_flags(0x08000000 | 0x00000008);
+    }
+    match cmd.spawn() {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("FetchForge: could not open the desktop app ({e}).");
+            false
+        }
+    }
+}
+
 /// Start the bridge (this same binary, `serve` mode) as a detached
 /// background process and wait until it answers /health (up to ~5 s).
 /// Detached so it survives this host process exiting: on Windows the
@@ -4001,7 +4083,15 @@ fn native_host(app: &Arc<App>) {
                             )
                         }) {
                             Ok(rec) => {
-                                serde_json::json!({"type": "added", "download": rec, "via": "bridge", "bridge_started": true})
+                                // Round 12, item 12 (auto-wake):
+                                // the bridge was not running, so the
+                                // app is off — open it, so the user
+                                // sees this download in the app
+                                // instead of a silent background
+                                // job. Best-effort: a failed wake
+                                // never fails the download.
+                                let app_woken = wake_desktop_app();
+                                serde_json::json!({"type": "added", "download": rec, "via": "bridge", "bridge_started": true, "app_woken": app_woken})
                             }
                             Err(_second_err) => match app.add_download(
                                 url,
@@ -5150,6 +5240,35 @@ mod tests {
         if let Some(job) = job {
             job.cancelled.store(true, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn auto_wake_finds_app_by_override_and_never_spawns_from_tests() {
+        // Round 12, item 12: the finder prefers
+        // FETCHFORGE_APP_PATH when it names a real file, and
+        // yields None for a missing override when no app sits
+        // next to the test binary (there is none in target/).
+        // The wake itself NEVER spawns from a test binary — even
+        // with the override pointing at a real executable — so
+        // this test asserts the guard, not a launched app.
+        let dir = test_data_dir("fetchforge-test-auto-wake");
+        let fake_app = dir.join("FetchForge.exe");
+        std::fs::write(&fake_app, b"fake").unwrap();
+        std::env::set_var("FETCHFORGE_APP_PATH", &fake_app);
+        assert_eq!(desktop_app_path(), Some(fake_app.clone()));
+        assert!(
+            !wake_desktop_app(),
+            "a test binary must never launch the app"
+        );
+        std::env::set_var("FETCHFORGE_APP_PATH", dir.join("does-not-exist"));
+        assert_eq!(
+            desktop_app_path(),
+            None,
+            "a missing override falls through to no sibling app"
+        );
+        assert!(!wake_desktop_app());
+        std::env::remove_var("FETCHFORGE_APP_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

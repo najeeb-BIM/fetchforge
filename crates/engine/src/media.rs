@@ -3,10 +3,15 @@
 //! HLSParser, DASHParser in the spec §11 module map).
 //!
 //! Supported ONLY when the manifest and segments are openly
-//! accessible and unencrypted. Anything with DRM, an EXT-X-KEY,
-//! ContentProtection, expiring signed segments the caller cannot
-//! legally fetch, or authentication the user has not supplied is
-//! refused with a plain explanation. No DRM is bypassed, ever.
+//! accessible. Anything with DRM, a non-AES-128 EXT-X-KEY method
+//! (SAMPLE-AES / FairPlay), ContentProtection, expiring signed
+//! segments the caller cannot legally fetch, or authentication the
+//! user has not supplied is refused with a plain explanation. No
+//! DRM is bypassed, ever. Standard HLS AES-128 (round 12, item
+//! 5) is the one exception: its key is served openly at the URI
+//! the playlist itself declares, ffmpeg handles it natively, and
+//! the native path decrypts it the same way — that is not a DRM
+//! bypass, it is the documented HLS encryption.
 //!
 //! Live (unbounded) streams are not recorded: an HLS playlist is
 //! fetched once and only the segments listed at that moment are
@@ -1012,6 +1017,28 @@ pub fn parse_hls_master(text: &str, base_url: &str) -> HlsMaster {
     master
 }
 
+/// One `#EXT-X-KEY` declaration (round 12, item 5): the key's URI
+/// (resolved against the playlist URL) and its IV, when the
+/// playlist declares one. Only METHOD=AES-128 is ever stored —
+/// any other method is refused at parse time (see
+/// [`parse_hls_segments`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HlsKey {
+    pub uri: String,
+    pub iv: Option<[u8; 16]>,
+}
+
+/// A resolved decryption key for one downloaded segment: the
+/// 16 key bytes (fetched once per distinct URI) and the IV that
+/// segment actually decrypts with — the playlist's IV, or the
+/// segment's sequence number as a 128-bit big-endian integer
+/// when the playlist declares none (RFC 8216 §4.3.2.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentKey {
+    pub key: [u8; 16],
+    pub iv: [u8; 16],
+}
+
 /// One HLS media segment: a URL plus the byte range of it the
 /// playlist assigns (`#EXT-X-BYTERANGE`), if any. A range means
 /// the segment is a SLICE of the URL's file, not the whole file:
@@ -1024,6 +1051,16 @@ pub struct HlsSegment {
     /// Inclusive byte range `(start, end)`, or None for a
     /// whole-file segment.
     pub range: Option<(u64, u64)>,
+    /// The `#EXT-X-KEY` in force for this segment (round 12,
+    /// item 5): None for a plain segment, Some for an AES-128
+    /// segment. A later KEY line replaces it; METHOD=NONE clears
+    /// it (a playlist may mix plain and encrypted segments).
+    pub key: Option<HlsKey>,
+    /// The segment's sequence number: `#EXT-X-MEDIA-SEQUENCE`
+    /// plus its index in the playlist (0 when the playlist
+    /// declares no sequence). It is the default IV when the KEY
+    /// declares none.
+    pub sequence: u64,
 }
 
 /// A parsed HLS media playlist: its segments plus the optional
@@ -1047,21 +1084,219 @@ impl HlsMediaPlaylist {
 
     /// Segments for the downloader: the init segment first (when
     /// present — same shape as DASH, where the init is piece 0),
-    /// then the media segments in playlist order.
+    /// then the media segments in playlist order. Keys are left
+    /// unresolved here (None): the listing path uses this for
+    /// counts and byte-range totals only, and never downloads.
+    /// Downloaders use [`HlsMediaPlaylist::resolve_keys`] so the
+    /// segments they fetch carry their decryption keys.
     fn into_segments(self) -> Vec<Segment> {
         let mut out: Vec<Segment> = Vec::with_capacity(self.piece_count());
         if let Some(init) = self.init {
             out.push(Segment {
                 url: init.url,
                 range: init.range,
+                key: None,
             });
         }
         out.extend(self.segments.into_iter().map(|s| Segment {
             url: s.url,
             range: s.range,
+            key: None,
         }));
         out
     }
+
+    /// Segments for the downloader with their AES-128 keys
+    /// resolved (round 12, item 5): each distinct key URI is
+    /// fetched ONCE from the playlist's declared URI (the key is
+    /// served openly — this is standard HLS, not a DRM bypass)
+    /// and must be exactly 16 bytes. A segment whose KEY declares
+    /// no IV decrypts with its sequence number as the IV
+    /// (RFC 8216 §4.3.2.4). Plain segments keep `key: None`.
+    /// The init segment is never encrypted (an `#EXT-X-MAP` has
+    /// no KEY), so it stays keyless like [`into_segments`].
+    fn resolve_keys(
+        &self,
+        client: &reqwest::blocking::Client,
+        referer: &Option<String>,
+    ) -> Result<Vec<Segment>, String> {
+        let mut keys: HashMap<String, [u8; 16]> = HashMap::new();
+        for seg in &self.segments {
+            if let Some(k) = &seg.key {
+                if !keys.contains_key(&k.uri) {
+                    let bytes = fetch_key(client, &k.uri, referer)?;
+                    keys.insert(k.uri.clone(), bytes);
+                }
+            }
+        }
+        let mut out: Vec<Segment> = Vec::with_capacity(self.piece_count());
+        if let Some(init) = &self.init {
+            out.push(Segment {
+                url: init.url.clone(),
+                range: init.range,
+                key: None,
+            });
+        }
+        for seg in &self.segments {
+            let key = seg.key.as_ref().map(|k| SegmentKey {
+                key: keys[&k.uri],
+                iv: k.iv.unwrap_or_else(|| sequence_iv(seg.sequence)),
+            });
+            out.push(Segment {
+                url: seg.url.clone(),
+                range: seg.range,
+                key,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Fetch one HLS AES-128 key (round 12, item 5): a plain GET of
+/// the playlist's declared URI, with the same client (and
+/// referer) as the segments — a signed playlist's key needs the
+/// same headers its segments do. The key must be exactly 16
+/// bytes; anything else is an error, never a truncated key.
+fn fetch_key(
+    client: &reqwest::blocking::Client,
+    uri: &str,
+    referer: &Option<String>,
+) -> Result<[u8; 16], String> {
+    let req = browser_headers(client.get(uri), referer);
+    let resp = req.send().map_err(|e| {
+        format!(
+            "The stream's decryption key could not be fetched ({})",
+            reqwest_error(&e)
+        )
+    })?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "The stream's decryption key could not be fetched (HTTP {}).",
+            resp.status()
+        ));
+    }
+    let bytes = resp.bytes().map_err(|e| reqwest_error(&e))?;
+    let key: [u8; 16] = bytes.as_ref().try_into().map_err(|_| {
+        "The stream's decryption key is not 16 bytes long, so the stream cannot be decrypted."
+            .to_string()
+    })?;
+    Ok(key)
+}
+
+/// The default IV for an AES-128 segment with no declared IV:
+/// its sequence number as a 128-bit big-endian integer
+/// (RFC 8216 §4.3.2.4).
+fn sequence_iv(sequence: u64) -> [u8; 16] {
+    let mut iv = [0u8; 16];
+    iv[8..16].copy_from_slice(&sequence.to_be_bytes());
+    iv
+}
+
+/// Parse one `#EXT-X-KEY` IV value (`0x...`, up to 32 hex digits)
+/// into 16 bytes, left-padded with zeros when shorter. None for
+/// anything malformed — a bad IV is an error at parse time, never
+/// a silently wrong decryption.
+fn parse_key_iv(value: &str) -> Option<[u8; 16]> {
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))?;
+    if hex.is_empty() || hex.len() > 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    // Left-pad an odd-length value with one zero nibble, then
+    // decode two hex digits per byte.
+    let padded;
+    let hex = if hex.len() % 2 == 1 {
+        padded = format!("0{hex}");
+        padded.as_str()
+    } else {
+        hex
+    };
+    let bytes: Vec<u8> = hex
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let s = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(s, 16).ok()
+        })
+        .collect::<Option<Vec<u8>>>()?;
+    let mut out = [0u8; 16];
+    let start = 16 - bytes.len();
+    out[start..].copy_from_slice(&bytes);
+    Some(out)
+}
+
+/// Decrypt AES-128-CBC ciphertext (round 12, item 5) with the
+/// `aes` crate's block cipher and a hand-rolled CBC layer (no
+/// separate `cbc` crate needed). The ciphertext must be a whole
+/// number of 16-byte blocks — HLS AES-128 segments are
+/// PKCS#7-padded to a block boundary. Valid PKCS#7 padding is
+/// stripped; a last byte that is not valid padding leaves the
+/// plaintext untouched (some packagers emit unpadded TS, whose
+/// length is a block multiple by construction, and stripping a
+/// genuine trailing byte would corrupt the stream).
+fn decrypt_aes128_cbc(ciphertext: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Result<Vec<u8>, String> {
+    use aes::cipher::{BlockDecrypt, KeyInit};
+    use aes::Aes128;
+    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+        return Err(
+            "An encrypted segment is not a whole number of AES blocks, so it cannot be decrypted."
+                .to_string(),
+        );
+    }
+    let cipher = Aes128::new_from_slice(key).map_err(|e| e.to_string())?;
+    let mut out = ciphertext.to_vec();
+    let mut prev = *iv;
+    for block in out.chunks_exact_mut(16) {
+        let ciphertext_block: [u8; 16] = block.try_into().unwrap();
+        let mut block_arr = aes::cipher::generic_array::GenericArray::from_mut_slice(block);
+        cipher.decrypt_block(&mut block_arr);
+        for i in 0..16 {
+            block[i] ^= prev[i];
+        }
+        prev = ciphertext_block;
+    }
+    if let Some(&pad) = out.last() {
+        let pad = pad as usize;
+        if pad >= 1
+            && pad <= 16
+            && out.len() >= pad
+            && out[out.len() - pad..].iter().all(|&b| b as usize == pad)
+        {
+            out.truncate(out.len() - pad);
+        }
+    }
+    Ok(out)
+}
+
+/// Refuse an HLS playlist whose `#EXT-X-KEY` method is not
+/// standard AES-128 (round 12, item 5): METHOD=NONE (plain) and
+/// METHOD=AES-128 pass; anything else — SAMPLE-AES, SAMPLE-AES-CTR
+/// (FairPlay DRM) or an unknown method — is refused with the DRM
+/// explanation. Used for master playlists and anywhere else the
+/// text is checked before parsing, so a DRM stream is refused
+/// before any segment is fetched.
+fn check_hls_encryption_method(text: &str) -> Result<(), String> {
+    for line in text.lines().map(str::trim) {
+        if let Some(attrs) = line.strip_prefix("#EXT-X-KEY:") {
+            let map: HashMap<&str, &str> = split_attrs(attrs).into_iter().collect();
+            match map.get("METHOD").map(|m| m.to_ascii_uppercase()) {
+                Some(m) if m == "AES-128" || m == "NONE" => {}
+                Some(m) => {
+                    return Err(format!(
+                        "This stream is encrypted with {m}, which FetchForge does not bypass. Only standard HLS AES-128 is supported."
+                    ));
+                }
+                None => {
+                    return Err(
+                        "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parse one `#EXT-X-BYTERANGE` value (`n[@offset]`) into an
@@ -1095,28 +1330,73 @@ fn parse_byterange(value: &str, default_offset: u64) -> Result<(u64, u64), Strin
 
 /// Parse an HLS media playlist into its segments (resolved
 /// against `base_url`), with byte ranges (`#EXT-X-BYTERANGE`)
-/// and the init segment (`#EXT-X-MAP`) when present. Refuses
-/// encrypted playlists (EXT-X-KEY) and playlists with no
-/// segments. A `#EXT-X-BYTERANGE` applies to the NEXT segment
-/// URI; an omitted offset continues from the previous segment's
-/// end (or 0 for the first ranged segment). Only the first
-/// `#EXT-X-MAP` is kept: a mid-playlist map change (ad insertion)
-/// cannot be represented in one assembled file.
+/// and the init segment (`#EXT-X-MAP`) when present. Standard
+/// AES-128 encryption (round 12, item 5) is PARSED, not refused:
+/// each segment records the `#EXT-X-KEY` in force for it (its
+/// URI, resolved, and its IV when declared), so the downloader
+/// can fetch the openly served key and decrypt. Any other KEY
+/// method (SAMPLE-AES and friends — DRM) is refused, as is a
+/// KEY line with no METHOD or (for AES-128) no URI. A playlist
+/// with no segments is an error. A `#EXT-X-BYTERANGE` applies to
+/// the NEXT segment URI; an omitted offset continues from the
+/// previous segment's end (or 0 for the first ranged segment).
+/// Only the first `#EXT-X-MAP` is kept: a mid-playlist map change
+/// (ad insertion) cannot be represented in one assembled file.
 pub fn parse_hls_segments(text: &str, base_url: &str) -> Result<HlsMediaPlaylist, String> {
-    if text.contains("#EXT-X-KEY") {
-        return Err(
-            "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
-                .to_string(),
-        );
-    }
     let mut playlist = HlsMediaPlaylist::default();
     let mut pending_range: Option<(u64, u64)> = None;
     // End of the last sub-range consumed (for omitted offsets);
     // only ranged segments move it — a whole-file segment in
     // between does not define a sub-range to continue from.
     let mut next_offset: u64 = 0;
+    // The KEY in force for the next segment, and the sequence
+    // number the next segment carries.
+    let mut current_key: Option<HlsKey> = None;
+    let mut media_sequence: u64 = 0;
+    let mut index: u64 = 0;
     for line in text.lines().map(str::trim) {
         if line.is_empty() {
+            continue;
+        }
+        if let Some(attrs) = line.strip_prefix("#EXT-X-KEY:") {
+            let map: HashMap<&str, &str> = split_attrs(attrs).into_iter().collect();
+            match map.get("METHOD").map(|m| m.to_ascii_uppercase()) {
+                Some(m) if m == "NONE" => current_key = None,
+                Some(m) if m == "AES-128" => {
+                    let uri = map.get("URI").ok_or_else(|| {
+                        "This stream's EXT-X-KEY declares AES-128 but no key URI, so it cannot be decrypted."
+                            .to_string()
+                    })?;
+                    let iv = match map.get("IV") {
+                        Some(v) => Some(parse_key_iv(v).ok_or_else(|| {
+                            format!("This stream's EXT-X-KEY has a malformed IV ('{v}').")
+                        })?),
+                        None => None,
+                    };
+                    current_key = Some(HlsKey {
+                        uri: resolve(base_url, uri),
+                        iv,
+                    });
+                }
+                Some(m) => {
+                    return Err(format!(
+                        "This stream is encrypted with {m}, which FetchForge does not bypass. Only standard HLS AES-128 is supported."
+                    ));
+                }
+                None => {
+                    return Err(
+                        "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
+                            .to_string(),
+                    );
+                }
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            media_sequence = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("Bad #EXT-X-MEDIA-SEQUENCE value in '{value}'"))?;
             continue;
         }
         if let Some(attrs) = line.strip_prefix("#EXT-X-MAP:") {
@@ -1132,6 +1412,8 @@ pub fn parse_hls_segments(text: &str, base_url: &str) -> Result<HlsMediaPlaylist
                     playlist.init = Some(HlsSegment {
                         url: resolve(base_url, uri),
                         range,
+                        key: None,
+                        sequence: media_sequence,
                     });
                 }
             }
@@ -1149,7 +1431,13 @@ pub fn parse_hls_segments(text: &str, base_url: &str) -> Result<HlsMediaPlaylist
         if let Some((_, end)) = range {
             next_offset = end.saturating_add(1);
         }
-        playlist.segments.push(HlsSegment { url, range });
+        playlist.segments.push(HlsSegment {
+            url,
+            range,
+            key: current_key.clone(),
+            sequence: media_sequence + index,
+        });
+        index += 1;
     }
     if playlist.segments.is_empty() {
         return Err("Playlist contains no media segments".to_string());
@@ -1627,12 +1915,7 @@ pub fn list_hls_formats_with_proxy(
     let manifest_url = validate_url(manifest_url)?;
     let client = hls_client_with_timeout_and_proxy(REQUEST_TIMEOUT, proxy)?;
     let text = manifest_text(&client, &manifest_url, referer, captured)?;
-    if text.contains("#EXT-X-KEY") {
-        return Err(
-            "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
-                .to_string(),
-        );
-    }
+    check_hls_encryption_method(&text)?;
     let master = parse_hls_master(&text, &manifest_base_url(&manifest_url));
     let title = title_from_manifest_url(&manifest_url);
     if master.variants.is_empty() {
@@ -1787,6 +2070,12 @@ fn variant_size_estimate(
 struct Segment {
     url: String,
     range: Option<(u64, u64)>,
+    /// The resolved AES-128 key for this segment (round 12,
+    /// item 5): None for a plain segment (and for every DASH
+    /// segment — DASH encryption is still refused outright).
+    /// The fetcher decrypts with it before writing the piece,
+    /// so resumed pieces on disk are always plaintext.
+    key: Option<SegmentKey>,
 }
 
 /// Download `segments` in order, appending them to `part_path`.
@@ -2567,6 +2856,32 @@ fn download_segments_parallel(
                     attempts = attempt + 1;
                     match fetch_segment(&client, &seg.url, seg.range, referer) {
                         Ok(b) => {
+                            // AES-128 (round 12, item 5): decrypt
+                            // the fetched bytes with the segment's
+                            // resolved key before writing the piece
+                            // — resumed pieces on disk are always
+                            // plaintext. A decryption failure is
+                            // fatal, not retryable: re-fetching the
+                            // same ciphertext with the same key
+                            // fails the same way.
+                            let b = match &seg.key {
+                                Some(k) => match decrypt_aes128_cbc(&b, &k.key, &k.iv) {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        let mut slot = first_error.lock().unwrap();
+                                        if slot.is_none() {
+                                            *slot = Some(format!(
+                                                "Segment {} of {} could not be decrypted. ({e})",
+                                                i + 1,
+                                                segments.len()
+                                            ));
+                                        }
+                                        stop.store(true, Ordering::Relaxed);
+                                        return;
+                                    }
+                                },
+                                None => b,
+                            };
                             limiter.note_success();
                             // Speed limit (feature 3): account
                             // this segment's bytes against the
@@ -2824,6 +3139,22 @@ fn download_segments_sequential(
             attempts = attempt + 1;
             match fetch_bytes_range(client, &seg.url, seg.range, referer) {
                 Ok(b) => {
+                    // AES-128 (round 12, item 5): decrypt before
+                    // appending — see the parallel path. A
+                    // decryption failure aborts the run outright.
+                    let b = match &seg.key {
+                        Some(k) => match decrypt_aes128_cbc(&b, &k.key, &k.iv) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                return Err(format!(
+                                    "Segment {} of {} could not be decrypted. ({e})",
+                                    i + 1,
+                                    segments.len()
+                                ));
+                            }
+                        },
+                        None => b,
+                    };
                     // Speed limit (feature 3): same accounting
                     // as the parallel path.
                     bandwidth.account(b.len());
@@ -2921,12 +3252,7 @@ pub fn download_hls(
     let manifest_url = validate_url(manifest_url)?;
     let client = hls_client()?;
     let text = manifest_text(&client, &manifest_url, referer, captured)?;
-    if text.contains("#EXT-X-KEY") {
-        return Err(
-            "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
-                .to_string(),
-        );
-    }
+    check_hls_encryption_method(&text)?;
     let master = parse_hls_master(&text, &manifest_base_url(&manifest_url));
     let variant_uri = match pick_default_variant(&master.variants) {
         Some(v) => v.uri.clone(),
@@ -3024,12 +3350,7 @@ pub fn download_hls_variant_opts(
     // manifest itself — a plain media playlist).
     let (audio_uri, subtitle_uri) = if variant_uri != manifest_url {
         let master_text = manifest_text(&client, &manifest_url, referer, captured)?;
-        if master_text.contains("#EXT-X-KEY") {
-            return Err(
-                "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
-                    .to_string(),
-            );
-        }
+        check_hls_encryption_method(&master_text)?;
         let master = parse_hls_master(&master_text, &manifest_base_url(&manifest_url));
         let variant = master.variants.iter().find(|v| v.uri == variant_uri);
         let audio_uri = variant
@@ -3082,12 +3403,12 @@ pub fn download_hls_variant_opts(
     // Byte ranges ride along (see parse_hls_segments): a
     // byterange playlist's segments are slices of one file, and
     // fetching them without Range would stream the whole file.
-    let video_segments =
-        parse_hls_segments(&variant_text, &manifest_base_url(&variant_uri))?.into_segments();
+    let video_segments = parse_hls_segments(&variant_text, &manifest_base_url(&variant_uri))?
+        .resolve_keys(&client, referer)?;
     let audio_segments = match &audio_uri {
         Some(uri) => {
             let audio_text = fetch_text(&client, uri, referer)?;
-            Some(parse_hls_segments(&audio_text, uri)?.into_segments())
+            Some(parse_hls_segments(&audio_text, uri)?.resolve_keys(&client, referer)?)
         }
         None => None,
     };
@@ -3288,12 +3609,7 @@ pub fn download_hls_audio_only_opts(
     let audio_uri = if variant_uri != manifest_url {
         let client = hls_client_with_timeout_and_proxy(REQUEST_TIMEOUT, opts.proxy_url.as_deref())?;
         let master_text = manifest_text(&client, &manifest_url, referer, captured)?;
-        if master_text.contains("#EXT-X-KEY") {
-            return Err(
-                "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
-                    .to_string(),
-            );
-        }
+        check_hls_encryption_method(&master_text)?;
         let master = parse_hls_master(&master_text, &manifest_base_url(&manifest_url));
         master
             .variants
@@ -3410,23 +3726,13 @@ pub fn download_hls_pair_opts(
     let client = hls_client_with_timeout_and_proxy(REQUEST_TIMEOUT, opts.proxy_url.as_deref())?;
     let bandwidth = SharedLimiter::new(opts.bandwidth_kbps);
     let video_text = manifest_text(&client, &video_uri, referer, captured)?;
-    if video_text.contains("#EXT-X-KEY") {
-        return Err(
-            "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
-                .to_string(),
-        );
-    }
+    check_hls_encryption_method(&video_text)?;
     let audio_text = fetch_text(&client, &audio_uri, referer)?;
-    if audio_text.contains("#EXT-X-KEY") {
-        return Err(
-            "This stream is encrypted (EXT-X-KEY). FetchForge does not bypass DRM or encryption."
-                .to_string(),
-        );
-    }
-    let video_segments =
-        parse_hls_segments(&video_text, &manifest_base_url(&video_uri))?.into_segments();
-    let audio_segments =
-        parse_hls_segments(&audio_text, &manifest_base_url(&audio_uri))?.into_segments();
+    check_hls_encryption_method(&audio_text)?;
+    let video_segments = parse_hls_segments(&video_text, &manifest_base_url(&video_uri))?
+        .resolve_keys(&client, referer)?;
+    let audio_segments = parse_hls_segments(&audio_text, &manifest_base_url(&audio_uri))?
+        .resolve_keys(&client, referer)?;
     let clean = crate::filename::sanitize_filename(filename);
     std::fs::create_dir_all(destination_dir).map_err(|e| e.to_string())?;
     let final_path = crate::filename::unique_path(destination_dir, &clean);
@@ -4218,6 +4524,7 @@ fn template_segments_with_times(
             Some(Segment {
                 url: resolve(base, &url),
                 range: None,
+                key: None,
             })
         }
         None => None,
@@ -4252,6 +4559,7 @@ fn template_segments_with_times(
                     Segment {
                         url: resolve(base, &url),
                         range: None,
+                        key: None,
                     },
                     time as f64 / timescale,
                 ));
@@ -4288,6 +4596,7 @@ fn template_segments_with_times(
                 Segment {
                     url: resolve(base, &url),
                     range: None,
+                    key: None,
                 },
                 n as f64 * seg_secs,
             ));
@@ -4311,6 +4620,7 @@ fn list_segments(
             None => base.to_string(),
         },
         range: i.range,
+        key: None,
     });
     let mut segments = Vec::new();
     for s in &list.segments {
@@ -4318,10 +4628,12 @@ fn list_segments(
             (Some(m), _) => segments.push(Segment {
                 url: resolve(base, m),
                 range: None,
+                key: None,
             }),
             (None, Some(r)) => segments.push(Segment {
                 url: base.to_string(),
                 range: Some(r),
+                key: None,
             }),
             (None, None) => {
                 return Err(
@@ -4963,17 +5275,123 @@ mod tests {
     }
 
     #[test]
-    fn parse_hls_segments_resolves_relative_urls_and_refuses_key() {
+    fn parse_hls_segments_resolves_relative_urls_and_parses_aes128_key() {
         let pl = parse_hls_segments(MEDIA_PLAYLIST, "https://example.com/v/play.m3u8").unwrap();
         assert!(pl.init.is_none(), "a plain playlist has no init segment");
         assert_eq!(pl.segments.len(), 3);
         assert_eq!(pl.segments[0].url, "https://example.com/v/seg0.ts");
         assert_eq!(pl.segments[0].range, None, "a plain segment has no range");
         assert_eq!(pl.segments[2].url, "https://example.com/v/sub/seg2.ts");
-        let enc = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:10,\nseg0.ts\n";
-        let err = parse_hls_segments(enc, "https://example.com/v/play.m3u8").unwrap_err();
-        assert!(err.contains("encrypted"), "error: {err}");
+        assert!(pl.segments[0].key.is_none(), "a plain segment has no key");
+        // Round 12, item 5: AES-128 is PARSED, not refused. The
+        // key rides on the segments in force when each appears:
+        // seg0/seg1 share the first KEY (explicit IV), seg2
+        // follows METHOD=NONE (plain again), and the sequence
+        // numbers honour #EXT-X-MEDIA-SEQUENCE.
+        let enc = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:7\n\
+             #EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x00000000000000000000000000000001\n\
+             #EXTINF:10,\nseg0.ts\n#EXTINF:10,\nseg1.ts\n\
+             #EXT-X-KEY:METHOD=NONE\n#EXTINF:10,\nseg2.ts\n";
+        let pl = parse_hls_segments(enc, "https://example.com/v/play.m3u8").unwrap();
+        assert_eq!(pl.segments.len(), 3);
+        let k0 = pl.segments[0].key.as_ref().expect("seg0 carries the KEY");
+        assert_eq!(k0.uri, "https://example.com/v/key.bin");
+        assert_eq!(
+            k0.iv,
+            Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+        );
+        assert_eq!(pl.segments[0].sequence, 7);
+        assert_eq!(pl.segments[1].sequence, 8);
+        assert_eq!(pl.segments[1].key, pl.segments[0].key, "KEY stays in force");
+        assert!(pl.segments[2].key.is_none(), "METHOD=NONE clears the key");
+        assert_eq!(pl.segments[2].sequence, 9);
+        // A KEY with no URI, a malformed IV, and any non-AES-128
+        // method (SAMPLE-AES is DRM) are all refused.
+        let no_uri = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128\n#EXTINF:10,\nseg0.ts\n";
+        assert!(parse_hls_segments(no_uri, "https://example.com/v/play.m3u8").is_err());
+        let bad_iv = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\",IV=0xZZ\n#EXTINF:10,\nseg0.ts\n";
+        assert!(parse_hls_segments(bad_iv, "https://example.com/v/play.m3u8").is_err());
+        let sample_aes =
+            "#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://x\"\n#EXTINF:10,\nseg0.ts\n";
+        let err = parse_hls_segments(sample_aes, "https://example.com/v/play.m3u8").unwrap_err();
+        assert!(err.contains("SAMPLE-AES"), "error: {err}");
         assert!(parse_hls_segments("#EXTM3U\n#EXT-X-ENDLIST\n", "https://example.com/x").is_err());
+    }
+
+    /// AES-128-CBC encrypt with PKCS#7 padding (test fixture
+    /// only): the mirror of [`decrypt_aes128_cbc`], so the
+    /// download test serves genuinely encrypted segments.
+    fn aes128_cbc_encrypt(plain: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
+        use aes::cipher::{BlockEncrypt, KeyInit};
+        use aes::Aes128;
+        let mut padded = plain.to_vec();
+        let pad = 16 - (plain.len() % 16);
+        padded.extend(std::iter::repeat(pad as u8).take(pad));
+        let cipher = Aes128::new_from_slice(key).unwrap();
+        let mut prev = *iv;
+        let mut out = Vec::with_capacity(padded.len());
+        for block in padded.chunks_exact(16) {
+            let mut b = [0u8; 16];
+            for i in 0..16 {
+                b[i] = block[i] ^ prev[i];
+            }
+            let mut ga = aes::cipher::generic_array::GenericArray::from_mut_slice(&mut b);
+            cipher.encrypt_block(&mut ga);
+            out.extend_from_slice(&b);
+            prev = b;
+        }
+        out
+    }
+
+    #[test]
+    fn decrypt_aes128_cbc_round_trips_and_strips_pkcs7() {
+        // Round 12, item 5: encrypt with the same crate the
+        // engine decrypts with, so the test proves the CBC layer
+        // (not just a constant). PKCS#7 padding is stripped;
+        // unpadded block-aligned plaintext passes through.
+        use aes::cipher::{BlockEncrypt, KeyInit};
+        use aes::Aes128;
+        let key: [u8; 16] = *b"0123456789abcdef";
+        let iv: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let plain = b"SEGMENT-ZERO-SEGMENT-ONE";
+        let ct = aes128_cbc_encrypt(plain, &key, &iv);
+        assert_eq!(decrypt_aes128_cbc(&ct, &key, &iv).unwrap(), plain);
+        // Block-aligned plaintext with no padding survives intact:
+        // encrypt without padding and decrypt must return it whole.
+        let cipher = Aes128::new_from_slice(&key).unwrap();
+        let mut raw = b"0123456789abcdef0123456789abcdef".to_vec();
+        let mut prev = iv;
+        for block in raw.chunks_exact_mut(16) {
+            let mut b = [0u8; 16];
+            for i in 0..16 {
+                b[i] = block[i] ^ prev[i];
+            }
+            let mut ga = aes::cipher::generic_array::GenericArray::from_mut_slice(&mut b);
+            cipher.encrypt_block(&mut ga);
+            block.copy_from_slice(&b);
+            prev = b;
+        }
+        assert_eq!(
+            decrypt_aes128_cbc(&raw, &key, &iv).unwrap(),
+            b"0123456789abcdef0123456789abcdef"
+        );
+        // A ciphertext that is not a whole number of blocks, and
+        // a wrong-length key, are errors, never silent garbage.
+        assert!(decrypt_aes128_cbc(&ct[..ct.len() - 1], &key, &iv).is_err());
+        assert!(decrypt_aes128_cbc(&[], &key, &iv).is_err());
+        // IV parsing: full, short (left-padded) and malformed.
+        assert_eq!(
+            parse_key_iv("0x00000000000000000000000000000001"),
+            Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+        );
+        assert_eq!(
+            parse_key_iv("0x01"),
+            Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+        );
+        assert_eq!(parse_key_iv("0xZZ"), None);
+        assert_eq!(parse_key_iv("01"), None, "the 0x prefix is required");
+        assert_eq!(sequence_iv(7)[15], 7);
+        assert_eq!(sequence_iv(7)[..8], [0; 8]);
     }
 
     #[test]
@@ -5575,18 +5993,82 @@ mod tests {
     }
 
     #[test]
-    fn download_hls_refuses_encrypted_playlist() {
+    fn download_hls_decrypts_aes128_playlist() {
+        // Round 12, item 5: the fixture serves a keyed playlist
+        // the way existing HLS tests stub their servers
+        // (serve_map): the key at k.bin, two encrypted segments.
+        // seg0 uses an explicit IV; seg1's KEY declares no IV,
+        // so it decrypts with its sequence number (1) as the IV.
+        // The assembled file must be the PLAINTEXT segments, and
+        // the key must have been fetched exactly once (two
+        // segments, one distinct URI).
+        let key: [u8; 16] = *b"0123456789abcdef";
+        let iv0: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let iv1 = sequence_iv(1);
         let mut files = HashMap::new();
         files.insert(
             "/enc.m3u8".to_string(),
-            b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k.bin\"\n#EXTINF:10,\ns.ts\n".to_vec(),
+            b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k.bin\",IV=0x00000000000000000000000000000001\n#EXTINF:10,\ns0.ts\n#EXT-X-KEY:METHOD=AES-128,URI=\"k.bin\"\n#EXTINF:10,\ns1.ts\n".to_vec(),
+        );
+        files.insert("/k.bin".to_string(), key.to_vec());
+        files.insert(
+            "/s0.ts".to_string(),
+            aes128_cbc_encrypt(b"SEGMENT-ZERO", &key, &iv0),
+        );
+        files.insert(
+            "/s1.ts".to_string(),
+            aes128_cbc_encrypt(b"SEGMENT-ONE!", &key, &iv1),
+        );
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, server) = serve_map(files, hits.clone(), stop.clone());
+        let dir = unique_temp_dir("hls-aes128");
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("http://127.0.0.1:{port}/enc.m3u8");
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let out = download_hls(
+            &url,
+            &dir,
+            "x.ts",
+            &None,
+            &|_| {},
+            &paused,
+            &cancelled,
+            None,
+        )
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"SEGMENT-ZEROSEGMENT-ONE!");
+        let hits = hits.lock().unwrap();
+        assert_eq!(
+            hits.iter().filter(|h| *h == "/k.bin").count(),
+            1,
+            "one distinct key URI is fetched once: {hits:?}"
+        );
+        assert!(hits.contains(&"/s0.ts".to_string()));
+        assert!(hits.contains(&"/s1.ts".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_hls_still_refuses_sample_aes_playlist() {
+        // Round 12, item 5: SAMPLE-AES (FairPlay DRM) is still
+        // refused — only standard AES-128 was opened up. The
+        // Widevine/DRM refusal tests elsewhere are untouched.
+        let mut files = HashMap::new();
+        files.insert(
+            "/drm.m3u8".to_string(),
+            b"#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://example\"\n#EXTINF:10,\ns.ts\n"
+                .to_vec(),
         );
         let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (port, server) = serve_map(files, hits, stop.clone());
-        let dir = unique_temp_dir("hls-enc");
+        let dir = unique_temp_dir("hls-sample-aes");
         std::fs::create_dir_all(&dir).unwrap();
-        let url = format!("http://127.0.0.1:{port}/enc.m3u8");
+        let url = format!("http://127.0.0.1:{port}/drm.m3u8");
         let paused = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
         let err = download_hls(
@@ -5600,7 +6082,10 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("encrypted"), "error: {err}");
+        assert!(
+            err.contains("SAMPLE-AES") || err.contains("encrypted"),
+            "error: {err}"
+        );
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -6331,6 +6816,7 @@ mod tests {
         let segments = vec![Segment {
             url: format!("http://127.0.0.1:{port}/seg0.ts"),
             range: None,
+            key: None,
         }];
         let paused = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
@@ -6375,6 +6861,7 @@ mod tests {
         let segments = vec![Segment {
             url: format!("http://127.0.0.1:{port}/missing.ts"),
             range: None,
+            key: None,
         }];
         let paused = AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
@@ -7291,6 +7778,7 @@ mod tests {
             .map(|i| Segment {
                 url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
                 range: None,
+                key: None,
             })
             .collect();
         let expected: Vec<u8> = bodies.concat();
@@ -7413,6 +7901,7 @@ mod tests {
             .map(|i| Segment {
                 url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
                 range: None,
+                key: None,
             })
             .collect();
         let client = hls_client().unwrap();
@@ -7503,6 +7992,7 @@ mod tests {
         let segments = vec![Segment {
             url: format!("http://127.0.0.1:{port}/seg0.ts"),
             range: None,
+            key: None,
         }];
         let client = hls_client().unwrap();
         let paused = AtomicBool::new(false);
@@ -7542,6 +8032,7 @@ mod tests {
         let segments = vec![Segment {
             url: format!("http://127.0.0.1:{port}/seg0.ts"),
             range: None,
+            key: None,
         }];
         let client = hls_client_with_timeout(Duration::from_secs(1)).unwrap();
         let paused = AtomicBool::new(false);
@@ -7656,6 +8147,7 @@ mod tests {
             .map(|i| Segment {
                 url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
                 range: None,
+                key: None,
             })
             .collect();
         let expected: Vec<u8> = bodies.concat();
@@ -7717,6 +8209,7 @@ mod tests {
         let segments = vec![Segment {
             url: format!("http://127.0.0.1:{port}/seg0.ts"),
             range: None,
+            key: None,
         }];
         let client = hls_client_with_timeout(Duration::from_millis(300)).unwrap();
         let paused = AtomicBool::new(false);
@@ -8017,6 +8510,7 @@ mod tests {
             .map(|i| Segment {
                 url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
                 range: None,
+                key: None,
             })
             .collect();
         let expected: Vec<u8> = bodies.concat();
@@ -8087,6 +8581,7 @@ mod tests {
             .map(|i| Segment {
                 url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
                 range: None,
+                key: None,
             })
             .collect();
         let expected: Vec<u8> = bodies.concat();
@@ -8226,6 +8721,7 @@ mod tests {
             .map(|i| Segment {
                 url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
                 range: None,
+                key: None,
             })
             .collect();
         let expected: Vec<u8> = bodies.concat();
@@ -8304,6 +8800,7 @@ mod tests {
         let segments = vec![Segment {
             url: format!("http://127.0.0.1:{port}/seg0.ts"),
             range: None,
+            key: None,
         }];
         let client = hls_client().unwrap();
         let paused = AtomicBool::new(false);
@@ -8362,6 +8859,7 @@ mod tests {
             .map(|i| Segment {
                 url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
                 range: None,
+                key: None,
             })
             .collect();
         let dir = unique_temp_dir("seg-resume");
@@ -8510,6 +9008,7 @@ mod tests {
             .map(|i| Segment {
                 url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
                 range: None,
+                key: None,
             })
             .collect();
         let expected: Vec<u8> = bodies.concat();
@@ -8577,6 +9076,7 @@ mod tests {
             .map(|i| Segment {
                 url: format!("http://127.0.0.1:{port}/seg{i}.ts"),
                 range: None,
+                key: None,
             })
             .collect();
         let client = hls_client().unwrap();

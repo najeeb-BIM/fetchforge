@@ -85,20 +85,20 @@ jobs:
             installer/FetchForge-Setup-0.2.0-x64.exe
             dist/FetchForge-portable-x64.zip
   # TEMPORARY DIAGNOSTIC (2026-11-25): nine main-workflow runs died with
-  # the Engine step stuck and zero logs. This job isolates the release
-  # build from every other step (no tests, no Tauri CLI, no NSIS, no
-  # free-disk step) and wraps it in a 10-minute timeout so a hang
-  # produces logs instead of a stuck step. Run with
-  # diagnostic_only=true. Outcomes: job succeeds -> the release build
-  # is fine standalone; job fails WITH logs -> cargo hangs, tail shows
-  # where; job stuck, no logs -> the runner itself dies. Remove after
-  # the cause is found.
+  # the Engine step stuck and zero logs, but the isolated release build
+  # (run 45509381392) PASSED in under 6 min — so an earlier main-workflow
+  # step is the cause. This job bisects: it currently runs checkout +
+  # toolchain + cargo test + the release build (10-min timeout). If it
+  # fails, the tests step is implicated; if it passes, the next suspect
+  # is the tauri-cli install. Remove after the cause is found.
   diag:
     if: ${{ inputs.diagnostic_only }}
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Run tests (bisection: is this the step that kills the runner?)
+        run: cargo test
       - name: Release build with 10-minute timeout
         shell: pwsh
         run: |

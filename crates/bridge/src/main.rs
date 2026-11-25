@@ -1834,9 +1834,21 @@ impl App {
             eprintln!(
                 "FetchForge: all downloads finished; shutting down in 60 seconds (shutdown /s /t 60)."
             );
-            let _ = std::process::Command::new("shutdown")
-                .args(["/s", "/t", "60"])
-                .spawn();
+            // NEVER run a real shutdown from a test binary: the
+            // shutdown-guard test calls this function with the
+            // setting on and nothing remaining, and on a CI runner
+            // (or a developer machine) it would schedule a real
+            // system shutdown 60 seconds later, killing the runner
+            // mid-build. The one-shot guard above still fires, so
+            // the test's assertions are unaffected. (Round 11 CI
+            // failure, 2026-11-25: ten consecutive Windows builds
+            // died this way; the release binary is compiled
+            // without cfg(test), so production is unaffected.)
+            if !cfg!(test) {
+                let _ = std::process::Command::new("shutdown")
+                    .args(["/s", "/t", "60"])
+                    .spawn();
+            }
         }
         #[cfg(not(windows))]
         {
